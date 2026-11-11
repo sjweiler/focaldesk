@@ -5,6 +5,7 @@ use crate::core::layout::LayoutSnapshot;
 use crate::core::output::OutputState; // if still needed (ideally not)
 use crate::core::ui_state::UiState;
 use crate::core::wayland::trusted_shell::InternalChromeVisibility;
+use focaldesk_config::RailBackdrop;
 use focaldesk_ui::chrome::ChromeMetrics;
 use focaldesk_ui::types::{ElementId, UiElementKind};
 use image::GenericImageView;
@@ -43,10 +44,13 @@ use smithay::backend::renderer::element::{Element, Id, Kind};
 use smithay::backend::renderer::utils::draw_render_elements;
 use wayland_server::protocol::wl_surface::WlSurface;
 //use focaldesk_ui::atlas::render_atlas_icon_with_alpha;
-use crate::core::color::{srgb_to_linear, SurfaceColorRenderState};
+use crate::core::color::{
+    gamut_matrix_linear_rgb, scene_working_primaries, srgb_to_linear, ColorPrimaries,
+    RenderingIntent, SurfaceColorRenderState,
+};
 use crate::core::desktop::DesktopState;
 use crate::core::desktop::{
-    ClockPulseFrame, SidebarPulseFrame, TopbarPulseFrame, TopbarPulseTarget,
+    ClockPulseFrame, SidebarPulseFrame, TopbarPulseFrame, TopbarPulseTarget, WorkspaceRenderView,
 };
 use crate::core::fonts::style_for;
 use crate::core::fonts::FontRole;
@@ -209,6 +213,8 @@ pub struct RenderState {
     // wallpaper texture, damage tracking, etc
     pub wallpaper_texture: Option<GlesTexture>,
     pub wallpaper_path: Option<String>,
+    /// EXR and HDR PNG wallpapers are scene-linear; ordinary assets are sRGB.
+    pub wallpaper_is_linear: bool,
     /// Software cursor: GPU texture + layout (physical pixels), when not on the DRM cursor plane.
     pub sw_cursor_texture: Option<GlesTexture>,
     pub sw_cursor_surface: Option<WlSurface>,
@@ -263,6 +269,8 @@ pub struct RenderInputs<'a> {
     pub split_resize_percent: Option<u8>,
     /// Output-local target shown while a moved window is inside a snap zone.
     pub snap_preview: Option<Rectangle<i32, Logical>>,
+    /// Output-local rectangle currently being selected for a screenshot.
+    pub screenshot_selection: Option<Rectangle<i32, Logical>>,
     /// When true, composite the cursor from [`RenderState::sw_cursor_texture`] after chrome.
     pub draw_software_cursor: bool,
     /// Focus is retained by the accessibility model, while chrome rendering
@@ -286,6 +294,10 @@ pub struct RenderInputs<'a> {
     pub flip_egui_y: bool,
     pub client_compositing: ClientCompositingMode,
     pub chrome_glass_pass: ChromeGlassPass,
+    /// Compositor-owned backing beneath an external system rail.
+    pub rail_backdrop: RailBackdrop,
+    /// Optional user override for the theme's rail backing opacity.
+    pub panel_darkness: Option<f64>,
     /// When true, egui/cursor are drawn in a follow-up SDR pass (egui_glow outputs sRGB).
     pub defer_egui_to_sdr: bool,
     pub surface_colors: &'a std::collections::HashMap<Id, SurfaceColorRenderState>,
@@ -1045,6 +1057,143 @@ impl Default for RenderState {
     }
 }
 
+struct HdrWallpaper {
+    width: u32,
+    height: u32,
+    /// Native-endian IEEE 754 binary16 RGBA pixels in scene-linear Rec.709.
+    pixels: Vec<u8>,
+}
+
+/// Decode a standards-tagged HDR PNG directly rather than letting a generic
+/// image loader discard the cICP metadata and quantize it to eight-bit sRGB.
+///
+/// PNG HDR is defined by 16-bit RGB/RGBA samples and cICP PQ or HLG transfer
+/// characteristics. Other PNGs deliberately return `None` so their mature SDR
+/// path remains unchanged.
+fn decode_hdr_wallpaper(path: &str) -> Option<HdrWallpaper> {
+    decode_hdr_png(path)
+}
+
+fn decode_hdr_png(path: &str) -> Option<HdrWallpaper> {
+    use png::{BitDepth, ColorType};
+    use std::fs::File;
+
+    let extension_is_png = std::path::Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"));
+    if !extension_is_png {
+        return None;
+    }
+
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            error!(target: "focaldesk", path, ?error, "load_wallpaper: cannot open PNG");
+            return None;
+        }
+    };
+    let decoder = png::Decoder::new(std::io::BufReader::new(file));
+    let mut reader = match decoder.read_info() {
+        Ok(reader) => reader,
+        Err(error) => {
+            error!(target: "focaldesk", path, ?error, "load_wallpaper: PNG header decode failed");
+            return None;
+        }
+    };
+    let info = reader.info();
+    let cicp = info.coding_independent_code_points?;
+    if info.bit_depth != BitDepth::Sixteen
+        || !matches!(info.color_type, ColorType::Rgb | ColorType::Rgba)
+        || cicp.color_primaries != 9
+        || cicp.matrix_coefficients != 0
+        || !matches!(cicp.transfer_function, 16 | 18)
+    {
+        return None;
+    }
+
+    let mut encoded = vec![0; reader.output_buffer_size()?];
+    let output = match reader.next_frame(&mut encoded) {
+        Ok(output) => output,
+        Err(error) => {
+            error!(target: "focaldesk", path, ?error, "load_wallpaper: HDR PNG pixel decode failed");
+            return None;
+        }
+    };
+    if output.bit_depth != BitDepth::Sixteen
+        || !matches!(output.color_type, ColorType::Rgb | ColorType::Rgba)
+    {
+        return None;
+    }
+
+    let samples = output.color_type.samples();
+    let to_scene = gamut_matrix_linear_rgb(
+        ColorPrimaries::Bt2020,
+        scene_working_primaries(),
+        RenderingIntent::Relative,
+    );
+    let mut pixels = Vec::with_capacity((output.width * output.height * 8) as usize);
+    for pixel in encoded[..output.buffer_size()].chunks_exact(samples * 2) {
+        let sample = |channel: usize| {
+            u16::from_be_bytes([pixel[channel * 2], pixel[channel * 2 + 1]]) as f32 / 65535.0
+        };
+        let decode = match cicp.transfer_function {
+            16 => pq_to_scene_linear,
+            18 => hlg_to_scene_linear,
+            _ => unreachable!("validated cICP transfer"),
+        };
+        let linear = [decode(sample(0)), decode(sample(1)), decode(sample(2))];
+        let scene = multiply_rgb(to_scene, linear);
+        for value in [
+            scene[0],
+            scene[1],
+            scene[2],
+            if samples == 4 { sample(3) } else { 1.0 },
+        ] {
+            pixels.extend_from_slice(&half::f16::from_f32(value.max(0.0)).to_bits().to_ne_bytes());
+        }
+    }
+
+    Some(HdrWallpaper {
+        width: output.width,
+        height: output.height,
+        pixels,
+    })
+}
+
+/// SMPTE ST 2084 maps code values to absolute luminance; the compositor's
+/// scene unit is its 203-nit HDR reference white.
+fn pq_to_scene_linear(value: f32) -> f32 {
+    let m1 = 2610.0 / 16384.0;
+    let m2 = 2523.0 / 32.0;
+    let c1 = 3424.0 / 4096.0;
+    let c2 = 2413.0 / 128.0;
+    let c3 = 2392.0 / 128.0;
+    let p = value.clamp(0.0, 1.0).powf(1.0 / m2);
+    let relative_to_10k = ((p - c1).max(0.0) / (c2 - c3 * p).max(0.000_001)).powf(1.0 / m1);
+    relative_to_10k * 10_000.0 / crate::core::color::HDR_REFERENCE_WHITE_NITS
+}
+
+/// ARIB STD-B67 has no absolute peak in the file. Match the compositor's HLG
+/// shader convention so code value 0.75 is the HDR reference white.
+fn hlg_to_scene_linear(value: f32) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    let scene = if value < 0.5 {
+        value * value / 3.0
+    } else {
+        (((value - 0.559_910_7) / 0.178_832_77).exp() + 0.284_668_92) / 12.0
+    };
+    let reference = (((0.75_f32 - 0.559_910_7) / 0.178_832_77).exp() + 0.284_668_92) / 12.0;
+    (scene.max(0.0) / reference).powf(1.2)
+}
+
+fn multiply_rgb(matrix: [[f32; 3]; 3], rgb: [f32; 3]) -> [f32; 3] {
+    [
+        matrix[0][0] * rgb[0] + matrix[0][1] * rgb[1] + matrix[0][2] * rgb[2],
+        matrix[1][0] * rgb[0] + matrix[1][1] * rgb[1] + matrix[1][2] * rgb[2],
+        matrix[2][0] * rgb[0] + matrix[2][1] * rgb[1] + matrix[2][2] * rgb[2],
+    ]
+}
+
 impl RenderState {
     pub fn new() -> Self {
         let zero: Rectangle<i32, Physical> = Rectangle::from_size(Size::from((0, 0)));
@@ -1055,6 +1204,7 @@ impl RenderState {
             scratch_damage_len: 0,
             wallpaper_texture: None,
             wallpaper_path: None,
+            wallpaper_is_linear: false,
             sw_cursor_texture: None,
             sw_cursor_surface: None,
             sw_cursor_surface_elements: Vec::new(),
@@ -1938,6 +2088,7 @@ impl RenderState {
         self.glass_control_background_linear = false;
         self.glass_control_background_disabled = false;
         self.wallpaper_texture = None;
+        self.wallpaper_is_linear = false;
         // ensure_wallpaper_loaded uses the cached path as its load-generation
         // key.  Clearing only the texture makes it incorrectly treat the dead
         // post-resume GPU cache as current and skip re-uploading the wallpaper.
@@ -2083,16 +2234,39 @@ impl RenderState {
             "ensure_wallpaper_loaded: load result"
         );
 
-        self.wallpaper_texture = tex;
+        self.wallpaper_is_linear = tex.as_ref().is_some_and(|(_, linear)| *linear);
+        self.wallpaper_texture = tex.map(|(texture, _)| texture);
     }
 
-    pub fn load_wallpaper(renderer: &mut GlesRenderer, path: &str) -> Option<GlesTexture> {
+    pub fn load_wallpaper(renderer: &mut GlesRenderer, path: &str) -> Option<(GlesTexture, bool)> {
         info!(
             target: "focaldesk",
             session_id = session_id(),
             path = %path,
             "load_wallpaper: opening"
         );
+
+        if let Some(decoded) = decode_hdr_wallpaper(path) {
+            info!(
+                target: "focaldesk",
+                session_id = session_id(),
+                width = decoded.width,
+                height = decoded.height,
+                "load_wallpaper: decoded HDR wallpaper into scene-linear FP16"
+            );
+            return renderer
+                .import_memory(
+                    &decoded.pixels,
+                    Fourcc::Abgr16161616f,
+                    (decoded.width as i32, decoded.height as i32).into(),
+                    false,
+                )
+                .map(|texture| (texture, true))
+                .map_err(|error| {
+                    flog_error!("load_wallpaper: HDR wallpaper import failed: {error:?}")
+                })
+                .ok();
+        }
 
         let img = match image::open(path) {
             Ok(i) => i,
@@ -2117,7 +2291,27 @@ impl RenderState {
             "load_wallpaper: decoded"
         );
 
-        //let rgba = img.to_rgba8();
+        let is_linear_exr = std::path::Path::new(path)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exr"));
+        if is_linear_exr {
+            let rgba = img.to_rgba32f();
+            let mut pixels = Vec::with_capacity(rgba.len() * 2);
+            for value in rgba.as_raw() {
+                pixels.extend_from_slice(&half::f16::from_f32(*value).to_bits().to_ne_bytes());
+            }
+            return renderer
+                .import_memory(
+                    &pixels,
+                    Fourcc::Abgr16161616f,
+                    (w as i32, h as i32).into(),
+                    false,
+                )
+                .map(|texture| (texture, true))
+                .map_err(|error| flog_error!("load_wallpaper: HDR EXR import failed: {error:?}"))
+                .ok();
+        }
+
         let mut rgba = img.to_rgba8();
 
         for px in rgba.as_chunks_mut::<4>().0 {
@@ -2148,7 +2342,7 @@ impl RenderState {
                     session_id = session_id(),
                     "load_wallpaper: import_memory OK"
                 );
-                Some(tex)
+                Some((tex, false))
             }
             Err(e) => {
                 error!(
@@ -2419,10 +2613,27 @@ impl RenderState {
                     );
                 }
 
-                self.draw_wallpaper_in_rect(
+                let output_rect = Rectangle::<i32, Logical>::from_size(Size::from((
+                    (f64::from(inputs.ctx.output_size.0) / inputs.ctx.output_scale.x).round()
+                        as i32,
+                    (f64::from(inputs.ctx.output_size.1) / inputs.ctx.output_scale.y).round()
+                        as i32,
+                )));
+                // A smoked rail must share the work area's wallpaper mapping;
+                // otherwise each rectangle centers and crops the image independently.
+                let wallpaper_reference = if inputs.rail_backdrop == RailBackdrop::SmokedGlass {
+                    output_rect
+                } else {
+                    inputs.layout.work_area.recess
+                };
+
+                self.draw_external_rail_backdrop(frame, &inputs, theme, wallpaper_reference);
+
+                self.draw_wallpaper_in_rect_aligned(
                     frame,
                     inputs.ctx,
                     inputs.layout.work_area.recess,
+                    wallpaper_reference,
                     inputs.ctx.output_scale,
                     theme.wallpaper.clone(),
                     &inputs.client_compositing,
@@ -2573,6 +2784,110 @@ impl RenderState {
                     hud.loc.x + 26,
                     hud.loc.y + 37,
                     style_for(FontRole::Title, 22, theme_id),
+                    theme.dialog.title_color,
+                    inputs.ctx.output_scale,
+                )?;
+            }
+        }
+
+        if matches!(stage, OutputRenderStage::All | OutputRenderStage::Overlay) {
+            if let Some(selection) = inputs.screenshot_selection {
+                let output = Rectangle::<i32, Logical>::from_size(
+                    (
+                        (f64::from(inputs.ctx.output_size.0) / inputs.ctx.output_scale.x).round()
+                            as i32,
+                        (f64::from(inputs.ctx.output_size.1) / inputs.ctx.output_scale.y).round()
+                            as i32,
+                    )
+                        .into(),
+                );
+                let dim = [0.0, 0.0, 0.0, 0.55];
+                for strip in [
+                    Rectangle::from_loc_and_size(output.loc, (output.size.w, selection.loc.y)),
+                    Rectangle::from_loc_and_size(
+                        (0, selection.loc.y),
+                        (selection.loc.x, selection.size.h),
+                    ),
+                    Rectangle::from_loc_and_size(
+                        (selection.loc.x + selection.size.w, selection.loc.y),
+                        (
+                            output.size.w - selection.loc.x - selection.size.w,
+                            selection.size.h,
+                        ),
+                    ),
+                    Rectangle::from_loc_and_size(
+                        (0, selection.loc.y + selection.size.h),
+                        (
+                            output.size.w,
+                            output.size.h - selection.loc.y - selection.size.h,
+                        ),
+                    ),
+                ] {
+                    if strip.size.w > 0 && strip.size.h > 0 {
+                        Self::draw_solid_rect(
+                            frame,
+                            strip.to_physical_precise_round::<f64, i32>(inputs.ctx.output_scale),
+                            &inputs.ctx.damage,
+                            dim,
+                        )?;
+                    }
+                }
+                let mut border = theme.chrome.accent_color;
+                border[3] = 1.0;
+                for edge in [
+                    Rectangle::from_loc_and_size(selection.loc, (selection.size.w, 2)),
+                    Rectangle::from_loc_and_size(
+                        (selection.loc.x, selection.loc.y + selection.size.h - 2),
+                        (selection.size.w, 2),
+                    ),
+                    Rectangle::from_loc_and_size(selection.loc, (2, selection.size.h)),
+                    Rectangle::from_loc_and_size(
+                        (selection.loc.x + selection.size.w - 2, selection.loc.y),
+                        (2, selection.size.h),
+                    ),
+                ] {
+                    if edge.size.w > 0 && edge.size.h > 0 {
+                        self.draw_rounded_rect(frame, edge, inputs.ctx.output_scale, 0.0, border)?;
+                    }
+                }
+
+                // A region capture is a modal compositor action. Give it an
+                // unmistakable explanation before the user starts dragging;
+                // an empty rectangle alone is too easy to mistake for a
+                // shortcut that did nothing.
+                let hint_text = if selection.size.w >= 2 && selection.size.h >= 2 {
+                    format!(
+                        "{} × {}  •  Release to capture  •  Esc to cancel",
+                        selection.size.w, selection.size.h
+                    )
+                } else {
+                    "Drag to select an area  •  Esc to cancel".to_string()
+                };
+                let hint_width = 340;
+                let hint_rect = Rectangle::from_loc_and_size(
+                    (
+                        output.loc.x + (output.size.w - hint_width) / 2,
+                        output.loc.y + 32,
+                    ),
+                    (hint_width, 44),
+                );
+                let mut hint_background = theme.chrome.panel_color;
+                hint_background[3] = 0.96;
+                self.draw_rounded_rect(
+                    frame,
+                    hint_rect,
+                    inputs.ctx.output_scale,
+                    10.0,
+                    hint_background,
+                )?;
+                let theme_id = theme.id.builtin_id().unwrap_or(BuiltInThemeId::Eagle);
+                self.draw_text_cached(
+                    frame,
+                    inputs.fonts,
+                    &hint_text,
+                    hint_rect.loc.x + 16,
+                    hint_rect.loc.y + 28,
+                    style_for(FontRole::Title, 14, theme_id),
                     theme.dialog.title_color,
                     inputs.ctx.output_scale,
                 )?;
@@ -3346,6 +3661,70 @@ impl RenderState {
         )
     }
 
+    /// Paint the compositor-owned reserved strip before the external rail
+    /// client. The solid mode intentionally performs no draw: the output
+    /// background therefore remains exactly as it was before this option.
+    fn draw_external_rail_backdrop(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        inputs: &RenderInputs<'_>,
+        theme: &FlowTheme,
+        wallpaper_reference: Rectangle<i32, Logical>,
+    ) {
+        if inputs.rail_backdrop != RailBackdrop::SmokedGlass {
+            return;
+        }
+
+        let output = Rectangle::<i32, Logical>::from_size(Size::from((
+            (f64::from(inputs.ctx.output_size.0) / inputs.ctx.output_scale.x).round() as i32,
+            (f64::from(inputs.ctx.output_size.1) / inputs.ctx.output_scale.y).round() as i32,
+        )));
+        let work = inputs.layout.work_area.recess;
+        let right_width = output.loc.x + output.size.w - (work.loc.x + work.size.w);
+        if right_width <= 0 {
+            return;
+        }
+        let rail = Rectangle::from_loc_and_size(
+            (work.loc.x + work.size.w, output.loc.y),
+            (right_width, output.size.h),
+        );
+
+        // Give the translucent tint real wallpaper to reveal. This intentionally
+        // affects only the reserved rail strip; normal work-area wallpaper
+        // rendering and solid-mode output stay unchanged.
+        self.draw_wallpaper_in_rect_aligned(
+            frame,
+            inputs.ctx,
+            rail,
+            wallpaper_reference,
+            inputs.ctx.output_scale,
+            theme.wallpaper.clone(),
+            &inputs.client_compositing,
+        );
+
+        let rail_physical = to_physical_rect(rail, inputs.ctx.output_scale);
+        let damage: Vec<_> = inputs
+            .ctx
+            .damage
+            .iter()
+            .filter_map(|rect| rect.intersection(rail_physical))
+            .collect();
+        let _ = Self::draw_solid_rect(
+            frame,
+            Rectangle::from_size(Size::from(inputs.ctx.output_size)),
+            &damage,
+            [
+                0.025,
+                0.035,
+                0.055,
+                inputs
+                    .panel_darkness
+                    .map(|value| value.clamp(0.0, 1.0) as f32)
+                    .unwrap_or_else(|| theme.backing.rail_opacity.clamp(0.0, 1.0)),
+            ],
+        );
+    }
+
     fn draw_workarea_glass(
         &self,
         frame: &mut GlesFrame<'_, '_>,
@@ -3634,6 +4013,30 @@ impl RenderState {
         theme: WallpaperTheme,
         client_compositing: &ClientCompositingMode,
     ) {
+        self.draw_wallpaper_in_rect_aligned(
+            frame,
+            ctx,
+            target_logical,
+            target_logical,
+            scale,
+            theme,
+            client_compositing,
+        );
+    }
+
+    /// Draw `target_logical` using wallpaper coordinates established by
+    /// `reference_logical`. This lets disjoint output regions share one
+    /// continuous wallpaper image instead of independently centered crops.
+    fn draw_wallpaper_in_rect_aligned(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        ctx: &FrameCtx,
+        target_logical: Rectangle<i32, Logical>,
+        reference_logical: Rectangle<i32, Logical>,
+        scale: Scale<f64>,
+        theme: WallpaperTheme,
+        client_compositing: &ClientCompositingMode,
+    ) {
         use smithay::backend::renderer::gles::{GlesTexProgram, Uniform};
         use smithay::utils::{Buffer, Physical, Rectangle, Transform};
 
@@ -3643,12 +4046,12 @@ impl RenderState {
             return;
         };
         let target_physical = to_physical_rect(target_logical, scale);
-
-        let out = RectI {
-            x: target_physical.loc.x,
-            y: target_physical.loc.y,
-            w: target_physical.size.w,
-            h: target_physical.size.h,
+        let reference_physical = to_physical_rect(reference_logical, scale);
+        let reference = RectI {
+            x: reference_physical.loc.x,
+            y: reference_physical.loc.y,
+            w: reference_physical.size.w,
+            h: reference_physical.size.h,
         };
 
         let sz = tex.size();
@@ -3661,7 +4064,7 @@ impl RenderState {
             focaldesk_themes::ThemeWallpaperFit::Center => WallpaperMode::Center,
             focaldesk_themes::ThemeWallpaperFit::Tile => WallpaperMode::Tile,
         };
-        let blits = compute_wallpaper_blits(src, out, mode);
+        let blits = compute_wallpaper_blits(src, reference, mode);
         if blits.is_empty() {
             return;
         }
@@ -3689,10 +4092,10 @@ impl RenderState {
             Uniform::new("u_tint", tint),
             Uniform::new(
                 "u_decode_srgb",
-                if client_compositing.ui_textures_linear() {
-                    1.0f32
-                } else {
+                if self.wallpaper_is_linear {
                     0.0f32
+                } else {
+                    1.0f32
                 },
             ),
             Uniform::new(
@@ -3712,19 +4115,40 @@ impl RenderState {
         let tw = src.w as f64;
         let th = src.h as f64;
         for blit in blits {
+            let clipped_x = blit.dst.x.max(target_physical.loc.x);
+            let clipped_y = blit.dst.y.max(target_physical.loc.y);
+            let clipped_right =
+                (blit.dst.x + blit.dst.w).min(target_physical.loc.x + target_physical.size.w);
+            let clipped_bottom =
+                (blit.dst.y + blit.dst.h).min(target_physical.loc.y + target_physical.size.h);
+            if clipped_right <= clipped_x || clipped_bottom <= clipped_y {
+                continue;
+            }
+            let x_fraction = (clipped_x - blit.dst.x) as f32 / blit.dst.w as f32;
+            let y_fraction = (clipped_y - blit.dst.y) as f32 / blit.dst.h as f32;
+            let width_fraction = (clipped_right - clipped_x) as f32 / blit.dst.w as f32;
+            let height_fraction = (clipped_bottom - clipped_y) as f32 / blit.dst.h as f32;
+            let uv_width = blit.uv.u1 - blit.uv.u0;
+            let uv_height = blit.uv.v1 - blit.uv.v0;
+            let uv = crate::core::wallpaper::Uv {
+                u0: blit.uv.u0 + uv_width * x_fraction,
+                v0: blit.uv.v0 + uv_height * y_fraction,
+                u1: blit.uv.u0 + uv_width * (x_fraction + width_fraction),
+                v1: blit.uv.v0 + uv_height * (y_fraction + height_fraction),
+            };
             let dst: Rectangle<i32, Physical> = Rectangle::new(
-                (blit.dst.x, blit.dst.y).into(),
-                (blit.dst.w, blit.dst.h).into(),
+                (clipped_x, clipped_y).into(),
+                (clipped_right - clipped_x, clipped_bottom - clipped_y).into(),
             );
             let damage_local = clipped_dest_local_damage(dst, &ctx.damage);
             if damage_local.is_empty() {
                 continue;
             }
             let src_rect: Rectangle<f64, Buffer> = Rectangle::new(
-                (blit.uv.u0 as f64 * tw, blit.uv.v0 as f64 * th).into(),
+                (uv.u0 as f64 * tw, uv.v0 as f64 * th).into(),
                 (
-                    (blit.uv.u1 as f64 - blit.uv.u0 as f64) * tw,
-                    (blit.uv.v1 as f64 - blit.uv.v0 as f64) * th,
+                    (uv.u1 as f64 - uv.u0 as f64) * tw,
+                    (uv.v1 as f64 - uv.v0 as f64) * th,
                 )
                     .into(),
             );
@@ -3773,6 +4197,9 @@ impl RenderState {
         };
 
         if grade_mode < 0.5 {
+            return;
+        }
+        if self.wallpaper_is_linear {
             return;
         }
 
@@ -3846,11 +4273,11 @@ impl RenderState {
     ///
     /// Must run while the GLES renderer is current (during an active `GlesFrame`), so dmabuf
     /// textures are imported at draw time rather than during Wayland dispatch.
-    pub fn build_client_elements_for_output(
+    pub(crate) fn build_client_elements_for_output(
         &mut self,
         space: &Space<Window>,
         windows: &[ManagedWindow],
-        active_workspace: WorkspaceId,
+        workspace_views: &[WorkspaceRenderView],
         output: &Output,
         layers_on: Option<&Output>,
         renderer: &mut GlesRenderer,
@@ -3866,84 +4293,90 @@ impl RenderState {
         let scale = output.current_scale().fractional_scale();
         let mut out = Vec::new();
 
-        let on_workspace: std::collections::HashSet<_> = windows
-            .iter()
-            .filter(|mw| managed_window_is_visible_on_output(space, mw, active_workspace, output))
-            .map(|mw| &mw.window)
-            .collect();
+        for view in workspace_views {
+            let on_workspace: std::collections::HashSet<_> = windows
+                .iter()
+                .filter(|mw| managed_window_is_visible_on_output(space, mw, view.workspace, output))
+                .map(|mw| &mw.window)
+                .collect();
 
-        // `Space::elements()` is back-to-front. `draw_render_elements` expects
-        // front-to-back input so opaque-region culling cannot hide top windows
-        // behind older mapped windows.
-        for window in space.elements().rev() {
-            if !on_workspace.contains(window) {
-                continue;
-            }
+            // `Space::elements()` is back-to-front. `draw_render_elements` expects
+            // front-to-back input so opaque-region culling cannot hide top windows
+            // behind older mapped windows.
+            for window in space.elements().rev() {
+                if !on_workspace.contains(window) {
+                    continue;
+                }
 
-            let popup_bbox = space.element_location(window).map(|element_loc| {
-                let mut bbox = window.bbox_with_popups();
-                bbox.loc += element_loc - window.geometry().loc;
-                bbox
-            });
-            let bbox = match (space.element_bbox(window), popup_bbox) {
-                (Some(space_bbox), Some(popup_bbox)) => space_bbox.merge(popup_bbox),
-                (Some(space_bbox), None) => space_bbox,
-                (None, Some(popup_bbox)) => popup_bbox,
-                (None, None) => continue,
-            };
-            if !region.overlaps(bbox) {
-                continue;
-            }
+                let popup_bbox = space.element_location(window).map(|element_loc| {
+                    let mut bbox = window.bbox_with_popups();
+                    bbox.loc += element_loc - window.geometry().loc;
+                    bbox
+                });
+                let mut bbox = match (space.element_bbox(window), popup_bbox) {
+                    (Some(space_bbox), Some(popup_bbox)) => space_bbox.merge(popup_bbox),
+                    (Some(space_bbox), None) => space_bbox,
+                    (None, Some(popup_bbox)) => popup_bbox,
+                    (None, None) => continue,
+                };
+                bbox.loc.x += view.offset_x;
+                bbox.loc.y += view.offset_y;
+                if !region.overlaps(bbox) {
+                    continue;
+                }
 
-            window.on_commit();
+                window.on_commit();
 
-            let render_loc = space
-                .element_location(window)
-                .map(|element_loc| {
-                    let geo = window.geometry();
-                    Point::<i32, Logical>::from((
-                        element_loc.x - geo.loc.x,
-                        element_loc.y - geo.loc.y,
-                    ))
-                })
-                .unwrap_or(Point::from((0, 0)));
+                let mut render_loc = space
+                    .element_location(window)
+                    .map(|element_loc| {
+                        let geo = window.geometry();
+                        Point::<i32, Logical>::from((
+                            element_loc.x - geo.loc.x,
+                            element_loc.y - geo.loc.y,
+                        ))
+                    })
+                    .unwrap_or(Point::from((0, 0)));
+                render_loc.x += view.offset_x;
+                render_loc.y += view.offset_y;
 
-            let location = render_loc - region.loc;
-            let render_pos = location.to_physical_precise_round(scale);
+                let location = render_loc - region.loc;
+                let render_pos = location.to_physical_precise_round(scale);
 
-            // Render the window surface tree here, but keep xdg popups out of this pass.
-            // Popups are composited separately below so they can sit above the compositor chrome
-            // without being drawn twice.
-            let Some(surface) = window.wl_surface() else {
-                continue;
-            };
-            let elems = render_elements_from_surface_tree::<_, FlowRenderElement>(
-                renderer,
-                &surface,
-                render_pos,
-                Scale::from(scale),
-                1.0,
-                Kind::Unspecified,
-            );
+                // Render the window surface tree here, but keep xdg popups out of this pass.
+                // Popups are composited separately below so they can sit above the compositor chrome
+                // without being drawn twice.
+                let Some(surface) = window.wl_surface() else {
+                    continue;
+                };
+                let elems = render_elements_from_surface_tree::<_, FlowRenderElement>(
+                    renderer,
+                    &surface,
+                    render_pos,
+                    Scale::from(scale),
+                    view.opacity,
+                    Kind::Unspecified,
+                );
 
-            #[cfg(feature = "xwayland")]
-            if window.x11_surface().is_some() {
-                if let Some(managed) = windows.iter().find(|mw| &mw.window == window) {
-                    let seq = XWAYLAND_RENDER_LOGS.fetch_add(1, Ordering::Relaxed);
-                    if seq < 300 {
-                        flog(&format!(
-                            "XWayland render id={:?} title={:?} region={:?} render_pos={:?} elems={}",
-                            managed.id,
-                            managed.title(),
-                            region,
-                            render_pos,
-                            elems.len()
-                        ));
+                #[cfg(feature = "xwayland")]
+                if window.x11_surface().is_some() {
+                    if let Some(managed) = windows.iter().find(|mw| &mw.window == window) {
+                        let seq = XWAYLAND_RENDER_LOGS.fetch_add(1, Ordering::Relaxed);
+                        if seq < 300 {
+                            flog(&format!(
+                                "XWayland render id={:?} title={:?} region={:?} render_pos={:?} elems={}",
+                                managed.id,
+                                managed.title(),
+                                region,
+                                render_pos,
+                                elems.len()
+                            ));
+                        }
                     }
                 }
-            }
 
-            out.extend(elems);
+                out.extend(elems);
+            }
         }
 
         if let Some(out_handle) = layers_on {
@@ -3964,11 +4397,11 @@ impl RenderState {
     /// `Window::render_elements` includes popups in the client layer, but FocalDesk draws shell
     /// chrome after that layer. Menus need a second top pass so browser/app popups are not covered
     /// by compositor trim and icons.
-    pub fn build_popup_elements_for_output(
+    pub(crate) fn build_popup_elements_for_output(
         &mut self,
         space: &Space<Window>,
         windows: &[ManagedWindow],
-        active_workspace: WorkspaceId,
+        workspace_views: &[WorkspaceRenderView],
         output: &Output,
         renderer: &mut GlesRenderer,
     ) -> Vec<FlowRenderElement> {
@@ -3979,47 +4412,52 @@ impl RenderState {
         let scale = output.current_scale().fractional_scale();
         let mut out = Vec::new();
 
-        let on_workspace: std::collections::HashSet<_> = windows
-            .iter()
-            .filter(|mw| managed_window_is_visible_on_output(space, mw, active_workspace, output))
-            .map(|mw| &mw.window)
-            .collect();
+        for view in workspace_views {
+            let on_workspace: std::collections::HashSet<_> = windows
+                .iter()
+                .filter(|mw| managed_window_is_visible_on_output(space, mw, view.workspace, output))
+                .map(|mw| &mw.window)
+                .collect();
 
-        for window in space.elements().rev() {
-            if !on_workspace.contains(window) {
-                continue;
-            }
-
-            let Some(window_loc) = space.element_location(window) else {
-                continue;
-            };
-            let Some(surface) = window.wl_surface() else {
-                continue;
-            };
-
-            for (popup, popup_offset) in PopupManager::popups_for_surface(&surface) {
-                let geo = window.geometry();
-
-                let popup_loc = window_loc - geo.loc + popup_offset - popup.geometry().loc;
-
-                let mut popup_bbox = popup.geometry();
-                popup_bbox.loc += popup_loc;
-
-                if !region.overlaps(popup_bbox) {
+            for window in space.elements().rev() {
+                if !on_workspace.contains(window) {
                     continue;
                 }
 
-                let output_loc = popup_loc - region.loc;
-                let render_pos = output_loc.to_physical_precise_round(scale);
+                let Some(window_loc) = space.element_location(window) else {
+                    continue;
+                };
+                let Some(surface) = window.wl_surface() else {
+                    continue;
+                };
 
-                out.extend(render_elements_from_surface_tree::<_, FlowRenderElement>(
-                    renderer,
-                    popup.wl_surface(),
-                    render_pos,
-                    Scale::from(scale),
-                    1.0,
-                    Kind::Unspecified,
-                ));
+                for (popup, popup_offset) in PopupManager::popups_for_surface(&surface) {
+                    let geo = window.geometry();
+
+                    let popup_loc = window_loc - geo.loc + popup_offset - popup.geometry().loc;
+
+                    let mut popup_bbox = popup.geometry();
+                    popup_bbox.loc += popup_loc;
+                    popup_bbox.loc.x += view.offset_x;
+                    popup_bbox.loc.y += view.offset_y;
+
+                    if !region.overlaps(popup_bbox) {
+                        continue;
+                    }
+
+                    let output_loc =
+                        popup_loc - region.loc + Point::from((view.offset_x, view.offset_y));
+                    let render_pos = output_loc.to_physical_precise_round(scale);
+
+                    out.extend(render_elements_from_surface_tree::<_, FlowRenderElement>(
+                        renderer,
+                        popup.wl_surface(),
+                        render_pos,
+                        Scale::from(scale),
+                        view.opacity,
+                        Kind::Unspecified,
+                    ));
+                }
             }
         }
 

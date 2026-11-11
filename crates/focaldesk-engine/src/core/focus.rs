@@ -29,6 +29,7 @@ fn x11_surface(window: &Window) -> Option<&smithay::xwayland::X11Surface> {
 #[derive(Clone, PartialEq)]
 pub enum KeyboardFocusTarget {
     Window(Window),
+    Layer(WlSurface),
     Popup(PopupKind),
 }
 
@@ -36,6 +37,7 @@ impl fmt::Debug for KeyboardFocusTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             KeyboardFocusTarget::Window(w) => f.debug_tuple("Window").field(w).finish(),
+            KeyboardFocusTarget::Layer(s) => f.debug_tuple("Layer").field(s).finish(),
             KeyboardFocusTarget::Popup(p) => f.debug_tuple("Popup").field(p).finish(),
         }
     }
@@ -45,6 +47,7 @@ impl IsAlive for KeyboardFocusTarget {
     fn alive(&self) -> bool {
         match self {
             KeyboardFocusTarget::Window(w) => w.alive(),
+            KeyboardFocusTarget::Layer(s) => s.alive(),
             KeyboardFocusTarget::Popup(p) => p.alive(),
         }
     }
@@ -70,6 +73,7 @@ impl KeyboardTarget<DesktopState> for KeyboardFocusTarget {
                 }
                 warn!(?w, "keyboard focus enter skipped: window has no wl_surface");
             }
+            KeyboardFocusTarget::Layer(s) => KeyboardTarget::enter(s, seat, data, keys, serial),
             KeyboardFocusTarget::Popup(p) => {
                 KeyboardTarget::enter(p.wl_surface(), seat, data, keys, serial)
             }
@@ -89,6 +93,7 @@ impl KeyboardTarget<DesktopState> for KeyboardFocusTarget {
                 }
                 warn!(?w, "keyboard focus leave skipped: window has no wl_surface");
             }
+            KeyboardFocusTarget::Layer(s) => KeyboardTarget::leave(s, seat, data, serial),
             KeyboardFocusTarget::Popup(p) => {
                 KeyboardTarget::leave(p.wl_surface(), seat, data, serial)
             }
@@ -115,6 +120,9 @@ impl KeyboardTarget<DesktopState> for KeyboardFocusTarget {
                     return;
                 }
                 warn!(?w, "keyboard focus key skipped: window has no wl_surface");
+            }
+            KeyboardFocusTarget::Layer(s) => {
+                KeyboardTarget::key(s, seat, data, key, state, serial, time)
             }
             KeyboardFocusTarget::Popup(p) => {
                 KeyboardTarget::key(p.wl_surface(), seat, data, key, state, serial, time)
@@ -144,6 +152,9 @@ impl KeyboardTarget<DesktopState> for KeyboardFocusTarget {
                     "keyboard focus modifiers skipped: window has no wl_surface"
                 );
             }
+            KeyboardFocusTarget::Layer(s) => {
+                KeyboardTarget::modifiers(s, seat, data, modifiers, serial)
+            }
             KeyboardFocusTarget::Popup(p) => {
                 KeyboardTarget::modifiers(p.wl_surface(), seat, data, modifiers, serial)
             }
@@ -155,6 +166,7 @@ impl WaylandFocus for KeyboardFocusTarget {
     fn wl_surface(&self) -> Option<Cow<'_, WlSurface>> {
         match self {
             KeyboardFocusTarget::Window(w) => w.wl_surface(),
+            KeyboardFocusTarget::Layer(s) => Some(Cow::Borrowed(s)),
             KeyboardFocusTarget::Popup(p) => Some(Cow::Borrowed(p.wl_surface())),
         }
     }
@@ -179,6 +191,7 @@ impl From<KeyboardFocusTarget> for WlSurface {
                 .wl_surface()
                 .expect("keyboard focus: wayland window")
                 .into_owned(),
+            KeyboardFocusTarget::Layer(s) => s,
             KeyboardFocusTarget::Popup(p) => p.into(),
         }
     }
@@ -606,6 +619,7 @@ impl From<KeyboardFocusTarget> for PointerFocusTarget {
                         .into_owned(),
                 )
             }
+            KeyboardFocusTarget::Layer(s) => PointerFocusTarget::Wayland(s),
             KeyboardFocusTarget::Popup(popup) => {
                 PointerFocusTarget::Wayland(popup.wl_surface().clone())
             }

@@ -11,6 +11,7 @@
 755 usr/bin/focaldesk-ai-registry
 755 usr/bin/focal-server
 755 usr/bin/focaldesk-remoted
+755 usr/bin/focaldesk-recorder
 755 usr/bin/focaldesk-system-rail
 755 usr/bin/focaldesk-task-shelf
 755 usr/bin/focaldesk-powerd
@@ -32,7 +33,10 @@
 755 usr/bin/focald-connectors
 755 usr/lib64/security/pam_focald_secrets.so
 644 usr/share/focaldesk/default.toml
-644 usr/share/focaldesk/wallpaper/focaldesk_wallpaper.png
+644 usr/share/focaldesk/wallpaper/focaldesk_wallpaper_hdr1400.exr
+644 usr/share/focaldesk/optional-themes/lunar_transport.fdtheme
+644 usr/share/focaldesk/optional-themes/moonbase.fdtheme
+644 usr/share/focaldesk/optional-themes/classic.fdtheme
 644 usr/share/wayland-sessions/focaldesk.desktop
 644 usr/lib/systemd/user/focaldesk-session.target
 644 usr/lib/systemd/user/focaldesk-server.service

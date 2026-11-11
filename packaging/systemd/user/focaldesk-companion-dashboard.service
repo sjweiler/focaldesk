@@ -1,0 +1,18 @@
+[Unit]
+Description=FocalDesk touchscreen companion dashboard
+PartOf=focaldesk-session.target
+After=focaldesk-session.target
+
+[Service]
+Type=simple
+# The companion retries monitor discovery itself during DRM output
+# enumeration, so it can start immediately without risking an unmapped
+# layer-shell surface.
+ExecStart=%h/.local/bin/focaldesk-companion-dashboard
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=focaldesk-session.target

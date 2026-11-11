@@ -32,6 +32,7 @@ pub const TOPBAR_DND_ID: u32 = 106;
 pub const TOPBAR_NOTIFICATIONS_ID: u32 = 107;
 pub const TOPBAR_MICROPHONE_ID: u32 = 108;
 pub const TOPBAR_UPDATES_ID: u32 = 109;
+pub const TOPBAR_RECORDING_ID: u32 = 110;
 
 // Workspace buttons get dynamically assigned IDs instead of fixed per-slot
 // consts, since the number of individually displayed workspace buttons is
@@ -121,6 +122,8 @@ pub struct UiBuildOptions {
     pub max_workspace_slots: usize,
     pub active_workspace: u32,
     pub ai_flow_mode: AiFlowMode,
+    /// True only for the output currently captured by the native recorder.
+    pub recording_active: bool,
     /// Replaces the generated sidebar collection when supplied. Invisible
     /// items do not consume layout slots.
     pub sidebar_items: Option<Vec<ChromeItem>>,
@@ -149,6 +152,7 @@ impl Default for UiBuildOptions {
             max_workspace_slots: 4,
             active_workspace: 1,
             ai_flow_mode: AiFlowMode::Idle,
+            recording_active: false,
             sidebar_items: None,
             status_items: None,
         }
@@ -309,6 +313,15 @@ pub fn default_status_items(options: &UiBuildOptions) -> Vec<ChromeItem> {
     );
 
     vec![
+        ChromeItem::new(
+            TOPBAR_RECORDING_ID,
+            IconId::Video,
+            "Screen recording active — select Recording to stop",
+            UiAction::OpenPanel(PanelKind::Recording),
+        )
+        .selected(options.recording_active)
+        .active(options.recording_active)
+        .visible(options.recording_active),
         ChromeItem::new(
             TOPBAR_NETWORK_ID,
             network_icon(&options.network_state),

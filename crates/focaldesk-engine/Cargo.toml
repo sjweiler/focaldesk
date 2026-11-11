@@ -20,9 +20,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize.workspace = true
 focaldesk-ui = { path = "../focaldesk-ui" }
 focaldesk-render = { path = "../focaldesk-render", default-features = false, optional = true }
+vui-core = { git = "https://github.com/sjweiler/vello-ui", rev = "1e46b0cd1d44cddac1b6cb9b0478f57e6afa9b1a", optional = true }
+vui-vello = { git = "https://github.com/sjweiler/vello-ui", rev = "1e46b0cd1d44cddac1b6cb9b0478f57e6afa9b1a", optional = true }
+vui-ash = { git = "https://github.com/sjweiler/vello-ui", rev = "1e46b0cd1d44cddac1b6cb9b0478f57e6afa9b1a", optional = true }
+vui-text = { git = "https://github.com/sjweiler/vello-ui", rev = "1e46b0cd1d44cddac1b6cb9b0478f57e6afa9b1a", optional = true }
+ash = { workspace = true, optional = true }
 focaldesk-ai = { path = "../focaldesk-ai" }
 focaldesk-permissions = { path = "../focaldesk-permissions" }
-focaldesk-flow = { path = "../focaldesk-flow" }
+focaldesk-input = { path = "../focaldesk-input", features = ["smithay"] }
+focaldesk-shortcuts = { path = "../focaldesk-shortcuts" }
 focaldesk-types = { path = "../focaldesk-types" }
 focaldesk-logging = { path = "../focaldesk-logging" }
 focaldesk-resources = { path = "../focaldesk-resources" }
@@ -60,6 +66,7 @@ glow.workspace = true
 libc = "0.2"
 lcms2 = "6.1.1"
 md5 = "0.7"
+half = "2"
 #winit
 
 
@@ -67,10 +74,23 @@ md5 = "0.7"
 [features]
 default = ["winit"]
 winit = ["dep:winit"]
-wgpu = ["dep:winit", "dep:focaldesk-render", "focaldesk-render/wgpu"]
+wgpu = [
+    "dep:winit",
+    "dep:focaldesk-render",
+    "dep:vui-core",
+    "dep:vui-vello",
+    "dep:vui-text",
+    "focaldesk-render/wgpu",
+]
 xwayland = ["smithay/xwayland"]
 drm = []
-drm-vulkan = ["drm", "wgpu", "focaldesk-render/ash-drm"]
+drm-vulkan = [
+    "drm",
+    "wgpu",
+    "dep:vui-ash",
+    "dep:ash",
+    "focaldesk-render/ash-drm",
+]
 # Compatibility alias for existing build scripts. The DRM renderer is raw ash;
 # wgpu is used only by the nested backend and shared scene extraction code.
 drm-wgpu = ["drm-vulkan"]

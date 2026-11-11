@@ -260,16 +260,11 @@ fn run_server() -> Result<()> {
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    if let Ok(identity) =
-                        transport::require_authorized_peer(&stream, transport::MIC_POLICY)
-                    {
-                        let requester = identity
-                            .executable
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("authorized-client")
-                            .to_string();
-                        handle_client(stream, &mut state, &requester);
+                    // The owner-only socket and SO_PEERCRED provide the
+                    // boundary here. Yama may prohibit /proc executable
+                    // inspection between sibling user services.
+                    if transport::require_same_user(&stream).is_ok() {
+                        handle_client(stream, &mut state, "same-user-client");
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,

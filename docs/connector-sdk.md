@@ -18,13 +18,15 @@ is retrieved by the AI service from `focald-secrets`; it is never returned by
 connector status or the AI Console. Built-in connectors use an internal trusted
 path and have no key handle.
 
-The five built-ins are installed disabled:
+The seven built-ins are installed disabled:
 
 - `desktop-events`
 - `workflow-events`
 - `service-health`
 - `notifications`
 - `local-calendar`
+- `google-calendar`
+- `microsoft-calendar`
 
 Desktop and workflow connectors are wired to existing typed runtime events.
 The remaining built-ins define the local schema and trust identity used by

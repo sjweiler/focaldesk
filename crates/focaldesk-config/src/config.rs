@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use focaldesk_themes::ThemePackage;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
@@ -28,6 +29,23 @@ pub struct AppearanceConfig {
     pub output_focus_glow: bool,
     pub shader_chrome: bool,
     pub work_area_glass: bool,
+    pub rail_backdrop: RailBackdrop,
+    /// A user-selected opacity for both shell backings. `None` keeps the
+    /// active theme's independent rail and dock defaults.
+    #[serde(default)]
+    pub panel_darkness: Option<f64>,
+}
+
+/// The compositor-owned surface behind the external system rail.
+///
+/// `Solid` deliberately remains the default so configurations created before
+/// this option retain their existing appearance.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RailBackdrop {
+    #[default]
+    Solid,
+    SmokedGlass,
 }
 
 impl FocalDeskConfig {
@@ -49,6 +67,8 @@ impl Default for AppearanceConfig {
             output_focus_glow: true,
             shader_chrome: true,
             work_area_glass: true,
+            rail_backdrop: RailBackdrop::Solid,
+            panel_darkness: None,
         }
     }
 }
@@ -176,15 +196,10 @@ fn legacy_config_path() -> PathBuf {
 /// partial configuration returns `None` instead of the built-in configuration
 /// default, allowing the compositor to use its system-installed default theme.
 pub fn configured_theme() -> Option<String> {
-    if let Ok(text) = fs::read_to_string(config_path()) {
-        if let Some(config) = config_from_settings_json(&text) {
-            return Some(config.appearance.theme);
-        }
-    }
-    let text = fs::read_to_string(legacy_config_path()).ok()?;
-    configured_theme_from_toml(&text)
+    Some(load_config().appearance.theme)
 }
 
+#[cfg(test)]
 fn configured_theme_from_toml(text: &str) -> Option<String> {
     let value: toml::Value = toml::from_str(text).ok()?;
     value
@@ -200,7 +215,58 @@ fn config_from_settings_json(text: &str) -> Option<FocalDeskConfig> {
 }
 
 pub fn load_config() -> FocalDeskConfig {
-    load_config_from_paths(&config_path(), &legacy_config_path())
+    let mut config = load_config_from_paths(&config_path(), &legacy_config_path());
+    if migrate_legacy_theme_selection(&mut config) {
+        // The migration is deliberately best-effort: an unwritable home
+        // directory must not prevent a desktop session from loading Default.
+        let _ = save_config(&config);
+    }
+    config
+}
+
+/// Migrate the retired built-in palette names to user-owned installed package
+/// documents. This runs once because the resulting appearance value is an
+/// absolute `theme.toml` path rather than a legacy name.
+fn migrate_legacy_theme_selection(config: &mut FocalDeskConfig) -> bool {
+    let legacy_name = match config.appearance.theme.as_str() {
+        "Eagle" => "eagle",
+        "Moonbase" => "moonbase",
+        "Classic" => "classic",
+        _ => return false,
+    };
+
+    let package_path = installed_legacy_theme_package(legacy_name);
+    let migrated = package_path
+        .as_deref()
+        .and_then(|path| ThemePackage::load(path).ok())
+        .and_then(|package| package.install(&installed_themes_root()).ok())
+        .map(|installed| installed.document_path.to_string_lossy().into_owned());
+    config.appearance.theme = migrated.unwrap_or_else(|| "Default".to_string());
+    true
+}
+
+fn installed_themes_root() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("focaldesk")
+        .join("themes")
+}
+
+fn installed_legacy_theme_package(name: &str) -> Option<PathBuf> {
+    let system = Path::new("/usr/share/focaldesk/optional-themes").join(format!("{name}.fdtheme"));
+    if system.is_file() {
+        return Some(system);
+    }
+    #[cfg(debug_assertions)]
+    {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/themes/optional")
+            .join(format!("{name}.fdtheme"));
+        if source.is_file() {
+            return Some(source);
+        }
+    }
+    None
 }
 
 fn load_config_from_paths(settings_path: &Path, legacy_path: &Path) -> FocalDeskConfig {
@@ -382,6 +448,26 @@ mod tests {
         assert_eq!(config.panel.clock_format, ClockFormat::TwelveHour);
         assert_eq!(config.dock.position, DockPosition::Left);
         assert_eq!(config.dock.size, DockSize::Normal);
+        assert_eq!(config.appearance.rail_backdrop, RailBackdrop::Solid);
+        assert_eq!(config.appearance.panel_darkness, None);
+    }
+
+    #[test]
+    fn rail_backdrop_round_trips_through_canonical_settings() {
+        let config = config_from_settings_json(
+            r#"{"desktop_config":{"appearance":{"rail_backdrop":"smoked-glass"}}}"#,
+        )
+        .expect("parse rail backdrop");
+        assert_eq!(config.appearance.rail_backdrop, RailBackdrop::SmokedGlass);
+    }
+
+    #[test]
+    fn panel_darkness_can_be_absent_or_explicit_in_canonical_settings() {
+        let config = config_from_settings_json(
+            r#"{"desktop_config":{"appearance":{"panel_darkness":0.62}}}"#,
+        )
+        .expect("parse panel darkness");
+        assert_eq!(config.appearance.panel_darkness, Some(0.62));
     }
 
     #[test]

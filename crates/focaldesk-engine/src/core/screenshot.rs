@@ -16,6 +16,61 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::path::PathBuf;
 
+/// Crop a packed RGB16 image. Coordinates are physical pixels and are clamped
+/// to the source so a display reconfiguration cannot panic a screenshot save.
+pub fn crop_rgb16(
+    pixels: &[u16],
+    source_width: u32,
+    source_height: u32,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Result<(u32, u32, Vec<u16>)> {
+    let x = x.min(source_width);
+    let y = y.min(source_height);
+    let width = width.min(source_width.saturating_sub(x));
+    let height = height.min(source_height.saturating_sub(y));
+    anyhow::ensure!(width > 0 && height > 0, "empty screenshot selection");
+    anyhow::ensure!(
+        pixels.len() == source_width as usize * source_height as usize * 3,
+        "invalid RGB16 screenshot buffer"
+    );
+    let mut cropped = Vec::with_capacity(width as usize * height as usize * 3);
+    for row in y..y + height {
+        let start = (row as usize * source_width as usize + x as usize) * 3;
+        cropped.extend_from_slice(&pixels[start..start + width as usize * 3]);
+    }
+    Ok((width, height, cropped))
+}
+
+/// Crop a packed RGBA8 image, retaining alpha for the later color conversion.
+pub fn crop_rgba8(
+    pixels: &[u8],
+    source_width: u32,
+    source_height: u32,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Result<(u32, u32, Vec<u8>)> {
+    let x = x.min(source_width);
+    let y = y.min(source_height);
+    let width = width.min(source_width.saturating_sub(x));
+    let height = height.min(source_height.saturating_sub(y));
+    anyhow::ensure!(width > 0 && height > 0, "empty screenshot selection");
+    anyhow::ensure!(
+        pixels.len() == source_width as usize * source_height as usize * 4,
+        "invalid RGBA8 screenshot buffer"
+    );
+    let mut cropped = Vec::with_capacity(width as usize * height as usize * 4);
+    for row in y..y + height {
+        let start = (row as usize * source_width as usize + x as usize) * 4;
+        cropped.extend_from_slice(&pixels[start..start + width as usize * 4]);
+    }
+    Ok((width, height, cropped))
+}
+
 const DISPLAY_P3_PNG_GAMMA: u32 = 45_455;
 
 fn display_p3_png_chromaticities() -> SourceChromaticities {
@@ -305,5 +360,24 @@ mod tests {
         let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
         let output = reader.next_frame(&mut pixels).unwrap();
         assert_eq!(&pixels[..output.buffer_size()], &[0, 0, 128, 0, 255, 255]);
+    }
+
+    #[test]
+    fn crops_preserve_rows_and_channels() {
+        let rgb = (0_u16..36).collect::<Vec<_>>(); // 4 × 3 × RGB
+        let (width, height, cropped) = crop_rgb16(&rgb, 4, 3, 1, 1, 2, 2).unwrap();
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(
+            cropped,
+            vec![15, 16, 17, 18, 19, 20, 27, 28, 29, 30, 31, 32]
+        );
+
+        let rgba = (0_u8..48).collect::<Vec<_>>(); // 4 × 3 × RGBA
+        let (width, height, cropped) = crop_rgba8(&rgba, 4, 3, 2, 0, 2, 2).unwrap();
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(
+            cropped,
+            vec![8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31]
+        );
     }
 }

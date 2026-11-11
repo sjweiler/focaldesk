@@ -68,6 +68,10 @@ fn launch(req: LaunchRequest) -> anyhow::Result<()> {
 
     let mut cmd = Command::new(&req.app);
 
+    if let Some(workspace) = req.workspace.filter(|workspace| *workspace > 0) {
+        cmd.env("FOCALDESK_LAUNCH_WORKSPACE", workspace.to_string());
+    }
+
     if req.auto_hdr || auto_hdr_app_enabled(&req.app) {
         // These only expose native HDR when the game supports it. The compositor
         // separately detects SDR surfaces and applies ITM to those instead.

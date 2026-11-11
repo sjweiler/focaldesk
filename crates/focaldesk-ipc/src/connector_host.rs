@@ -11,6 +11,47 @@ pub const CONNECTOR_HOST_SOCKET_NAME: &str = "focald-connectors.sock";
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ConnectorHostIpcRequest {
     Status,
+    CalendarUpcoming {
+        after_unix: i64,
+        before_unix: i64,
+        #[serde(default = "default_calendar_limit")]
+        limit: usize,
+    },
+    CalendarConnect {
+        provider: String,
+        account_id: String,
+        client_id: String,
+        #[serde(default)]
+        client_secret: Option<String>,
+        #[serde(default)]
+        tenant: Option<String>,
+    },
+    CalendarOAuthStatus {
+        flow_id: String,
+    },
+    CalendarAccounts,
+    CalendarSaveEvent {
+        event: CalendarEventSnapshot,
+    },
+    CalendarDeleteEvent {
+        event: CalendarEventSnapshot,
+    },
+    CalendarDiscover {
+        account_id: String,
+    },
+    CalendarUpdatePreferences {
+        account_id: String,
+        calendar_ids: Vec<String>,
+        reminder_minutes: u32,
+    },
+    CalendarSyncNow {
+        account_id: String,
+    },
+    CalendarDisconnect {
+        account_id: String,
+        #[serde(default)]
+        delete_local_data: bool,
+    },
     PollNow {
         #[serde(default)]
         connector_id: Option<String>,
@@ -21,6 +62,66 @@ pub enum ConnectorHostIpcRequest {
     ClearQuarantine {
         connector_id: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CalendarOAuthSnapshot {
+    pub flow_id: String,
+    pub provider: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+const fn default_calendar_limit() -> usize {
+    50
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CalendarEventSnapshot {
+    pub account_id: String,
+    pub provider: String,
+    pub calendar_id: String,
+    pub event_id: String,
+    pub title: String,
+    pub start_time: String,
+    pub end_time: String,
+    pub organizer: String,
+    pub all_day: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CalendarAccountSnapshot {
+    pub account_id: String,
+    pub provider: String,
+    pub connected: bool,
+    pub enabled: bool,
+    pub cached_events: u64,
+    pub sync_state: String,
+    #[serde(default)]
+    pub calendar_ids: Vec<String>,
+    #[serde(default = "default_reminder_minutes")]
+    pub reminder_minutes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sync_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+const fn default_reminder_minutes() -> u32 {
+    10
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CalendarAvailableSnapshot {
+    pub id: String,
+    pub name: String,
+    pub primary: bool,
+    pub selected: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -48,6 +149,14 @@ pub struct ConnectorHostIpcResponse {
     pub paused: bool,
     #[serde(default)]
     pub connectors: Vec<ConnectorRuntimeStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calendar_events: Vec<CalendarEventSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<CalendarOAuthSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calendar_accounts: Vec<CalendarAccountSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_calendars: Vec<CalendarAvailableSnapshot>,
 }
 
 pub fn connector_host_socket_path() -> Result<std::path::PathBuf, String> {
@@ -61,6 +170,15 @@ pub fn send_connector_host_request(
     let mut stream = UnixStream::connect(&path)
         .map_err(|error| format!("could not connect to {}: {error}", path.display()))?;
     transport::configure_stream(&stream).map_err(|error| error.to_string())?;
+    if matches!(
+        request,
+        ConnectorHostIpcRequest::CalendarSaveEvent { .. }
+            | ConnectorHostIpcRequest::CalendarDeleteEvent { .. }
+    ) {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(90)))
+            .map_err(|e| e.to_string())?;
+    }
     let encoded = transport::encode_message(request)?;
     stream
         .write_all(&encoded)
@@ -80,9 +198,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn calendar_mutations_round_trip() {
+        let event = CalendarEventSnapshot {
+            account_id: "work".into(),
+            provider: "google".into(),
+            calendar_id: "primary".into(),
+            event_id: "event".into(),
+            title: "Planning".into(),
+            start_time: "2026-11-09T09:00:00Z".into(),
+            end_time: "2026-11-09T10:00:00Z".into(),
+            organizer: String::new(),
+            all_day: false,
+        };
+        for request in [
+            ConnectorHostIpcRequest::CalendarSaveEvent {
+                event: event.clone(),
+            },
+            ConnectorHostIpcRequest::CalendarDeleteEvent { event },
+        ] {
+            let encoded = serde_json::to_vec(&request).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<ConnectorHostIpcRequest>(&encoded).unwrap(),
+                request
+            );
+        }
+    }
+
+    #[test]
     fn control_requests_round_trip() {
         for request in [
             ConnectorHostIpcRequest::Status,
+            ConnectorHostIpcRequest::CalendarUpcoming {
+                after_unix: 0,
+                before_unix: 86_400,
+                limit: 10,
+            },
+            ConnectorHostIpcRequest::CalendarConnect {
+                provider: "google".into(),
+                account_id: "school".into(),
+                client_id: "client".into(),
+                client_secret: None,
+                tenant: None,
+            },
+            ConnectorHostIpcRequest::CalendarOAuthStatus {
+                flow_id: "flow".into(),
+            },
+            ConnectorHostIpcRequest::CalendarAccounts,
+            ConnectorHostIpcRequest::CalendarDiscover {
+                account_id: "school".into(),
+            },
+            ConnectorHostIpcRequest::CalendarUpdatePreferences {
+                account_id: "school".into(),
+                calendar_ids: vec!["primary".into()],
+                reminder_minutes: 15,
+            },
+            ConnectorHostIpcRequest::CalendarSyncNow {
+                account_id: "school".into(),
+            },
+            ConnectorHostIpcRequest::CalendarDisconnect {
+                account_id: "school".into(),
+                delete_local_data: true,
+            },
             ConnectorHostIpcRequest::PollNow {
                 connector_id: Some("service-health".into()),
             },

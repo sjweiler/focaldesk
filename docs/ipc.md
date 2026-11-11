@@ -59,6 +59,10 @@ Responsibilities may include:
 - Future permission validation
 - Future app metadata handling
 
+The Launcher also has authenticated access to the bounded desktop snapshot and
+typed `FocusWindow` and `OpenSettingsPanel` actions. This powers local search
+for open windows and Settings pages without exposing a generic command runner.
+
 ### focal-launch-shared
 
 `focal-launch-shared` contains shared IPC message types used by both the compositor and launcher daemon.
@@ -78,13 +82,26 @@ Responsibilities may include:
 
 ### focaldesk-notificationsd
 
-`focaldesk-notificationsd` owns notification queueing and visibility state.
+`focaldesk-notificationsd` owns notification queueing and visibility state. It
+exports `org.freedesktop.Notifications` on the session bus at
+`/org/freedesktop/Notifications`, while retaining the private typed socket used
+by the FocalDesk shell.
 
-Responsibilities may include:
+Responsibilities include:
 
-- Accepting notification requests
+- Accepting standard desktop and private notification requests
 - Expiring timed notifications
 - Returning visible notification snapshots to the compositor
+- Handling replacement IDs, application metadata, urgency, actions, transient
+  notifications, and resident notifications
+- Emitting the standard `NotificationClosed` and `ActionInvoked` signals
+- Keeping critical notifications visible through Do Not Disturb while
+  suppressing normal and low-urgency popups
+
+The standard interface currently advertises the `actions` and `body`
+capabilities. Input text, identifiers, action counts, and notification history
+are bounded before reaching shell UI or persistent state. Historical actions
+are discarded when a notification closes so they cannot be invoked later.
 
 ### focaldesk-updatesd
 

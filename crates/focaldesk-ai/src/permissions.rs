@@ -713,7 +713,9 @@ pub(crate) fn authorize_ai_chat(
 /// model is not consent to change desktop state or delete stored data.
 pub(crate) fn confirm_ai_action(tool: &str, title: &str, message: &str) -> anyhow::Result<()> {
     let resource = match tool {
-        "focus_window" | "move_window_to_workspace" => PermissionResource::RemoteInput,
+        "focus_window" | "move_window_to_workspace" | "browser_click" | "browser_type" => {
+            PermissionResource::RemoteInput
+        }
         "show_notification" => PermissionResource::Notifications,
         "open_settings_panel" | "forget_memory" | "clear_memory" | "remove_indexed_document" => {
             PermissionResource::AiChat

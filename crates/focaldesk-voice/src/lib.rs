@@ -1,6 +1,5 @@
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,7 +25,7 @@ pub enum VoiceEvent {
     WakeDetected,
     /// A finalized ambient command after wake-phrase gating.
     Command(String),
-    /// Capture stopped and its in-memory rolling audio was discarded.
+    /// Capture stopped.
     Stopped,
     /// Recognition stopped because of an error; the session has ended.
     Error(String),
@@ -233,11 +232,6 @@ fn run_recognition(
         .play()
         .context("failed to start microphone capture")?;
     let _ = events.send(VoiceEvent::Ready);
-    let max_rolling_samples = ambient
-        .as_ref()
-        .map(|config| (sample_rate as f64 * config.rolling_buffer.as_secs_f64()) as usize)
-        .unwrap_or(0);
-    let mut rolling_audio = VecDeque::<i16>::with_capacity(max_rolling_samples);
     let mut voice_active = false;
     let mut command_until: Option<Instant> = None;
 
@@ -249,10 +243,6 @@ fn run_recognition(
                     if active != voice_active {
                         voice_active = active;
                         let _ = events.send(VoiceEvent::VoiceActivity(active));
-                    }
-                    rolling_audio.extend(chunk.iter().copied());
-                    while rolling_audio.len() > max_rolling_samples {
-                        rolling_audio.pop_front();
                     }
                 }
                 match recognizer.accept_waveform(&chunk) {
@@ -294,7 +284,6 @@ fn run_recognition(
     if !final_text.is_empty() {
         emit_recognized(&final_text, ambient.as_ref(), &mut command_until, events);
     }
-    rolling_audio.clear();
     let _ = events.send(VoiceEvent::Stopped);
 
     Ok(())

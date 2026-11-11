@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=FocalDesk Calendar
+Comment=Browse your calendar
+Exec=focaldesk-calendar
+Icon=office-calendar
+Terminal=false
+Categories=Office;Calendar;
+StartupNotify=true

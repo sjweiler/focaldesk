@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 /// Turns text into a fixed-length vector. Implementations must always return
 /// vectors of `dimension()` length so they can be stored in a single
 /// sqlite-vec table (its column width is fixed at table-creation time).
+// async-trait adds must_use to futures that are already must_use.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     fn dimension(&self) -> usize;
@@ -71,61 +73,81 @@ impl EmbeddingProvider for OllamaEmbeddingProvider {
         Ok(embeddings.remove(0))
     }
 
+    #[tracing::instrument(name = "ai.embedding", target = "focaldesk.telemetry", skip_all)]
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
+        let mut operation = focaldesk_logging::metrics::Operation::start(
+            focaldesk_logging::metrics::Stage::Embedding,
+        );
+        let result: anyhow::Result<_> = async {
+            if texts.is_empty() {
+                return Ok(Vec::new());
+            }
 
-        let response = self
-            .client
-            .post(format!("{}/api/embed", self.base_url))
-            .json(&OllamaEmbedRequest {
-                model: &self.model,
-                input: texts,
-            })
-            .send()
-            .await
-            .context("Ollama embedding request failed")?;
+            let response = self
+                .client
+                .post(format!("{}/api/embed", self.base_url))
+                .json(&OllamaEmbedRequest {
+                    model: &self.model,
+                    input: texts,
+                })
+                .send()
+                .await
+                .context("Ollama embedding request failed")?;
 
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .context("failed to read Ollama embedding response body")?;
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .context("failed to read Ollama embedding response body")?;
 
-        if !status.is_success() {
-            bail!("Ollama returned HTTP {} while embedding: {}", status, body);
-        }
+            if !status.is_success() {
+                bail!("Ollama returned HTTP {} while embedding: {}", status, body);
+            }
 
-        let decoded: OllamaEmbedResponse =
-            serde_json::from_str(&body).context("failed to parse Ollama embedding response")?;
+            let decoded: OllamaEmbedResponse =
+                serde_json::from_str(&body).context("failed to parse Ollama embedding response")?;
 
-        if decoded.embeddings.len() != texts.len() {
-            bail!(
-                "Ollama model '{}' returned {} embeddings for {} inputs",
-                self.model,
-                decoded.embeddings.len(),
-                texts.len()
-            );
-        }
+            if decoded.embeddings.len() != texts.len() {
+                bail!(
+                    "Ollama model '{}' returned {} embeddings for {} inputs",
+                    self.model,
+                    decoded.embeddings.len(),
+                    texts.len()
+                );
+            }
 
-        decoded
-            .embeddings
-            .into_iter()
-            .enumerate()
-            .map(|(index, embedding)| {
-                if embedding.len() != self.dimension {
-                    bail!(
-                        "Ollama model '{}' returned a {}-dim embedding for input {}, expected {}",
-                        self.model,
-                        embedding.len(),
-                        index,
-                        self.dimension
-                    );
-                }
-                Ok(embedding.into_iter().map(|value| value as f32).collect())
-            })
-            .collect()
+            decoded
+                .embeddings
+                .into_iter()
+                .enumerate()
+                .map(|(index, embedding)| {
+                    if embedding.len() != self.dimension {
+                        bail!(
+                            "Ollama model '{}' returned a {}-dim embedding for input {}, expected {}",
+                            self.model,
+                            embedding.len(),
+                            index,
+                            self.dimension
+                        );
+                    }
+                    Ok(embedding.into_iter().map(|value| value as f32).collect())
+                })
+                .collect()
+        }.await;
+        let outcome = match &result {
+            Ok(_) => focaldesk_logging::metrics::Outcome::Ok,
+            Err(error)
+                if error.chain().any(|e| {
+                    e.downcast_ref::<reqwest::Error>()
+                        .is_some_and(reqwest::Error::is_timeout)
+                }) =>
+            {
+                focaldesk_logging::metrics::Outcome::Timeout
+            }
+            Err(_) => focaldesk_logging::metrics::Outcome::Error,
+        };
+        operation.finish(outcome);
+        result
     }
 }
 

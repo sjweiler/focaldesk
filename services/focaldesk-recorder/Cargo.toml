@@ -1,0 +1,10 @@
+[package]
+name = "focaldesk-recorder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+focaldesk-remote-protocol = { path = "../../crates/focaldesk-remote-protocol" }
+focaldesk-ipc = { path = "../../crates/focaldesk-ipc" }
+

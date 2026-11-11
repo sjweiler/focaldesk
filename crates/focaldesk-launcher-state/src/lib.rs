@@ -10,6 +10,7 @@ pub struct LauncherState {
     pub favorites: Vec<String>,
     pub file_favorites: Vec<String>,
     pub recents: Vec<String>,
+    pub recent_files: Vec<String>,
 }
 
 pub const MAX_RECENTS: usize = 12;
@@ -26,9 +27,7 @@ pub fn load_launcher_state() -> LauncherState {
 }
 
 fn remember_recent(state: &mut LauncherState, id: &str) {
-    state.recents.retain(|entry| entry != id);
-    state.recents.insert(0, id.to_string());
-    state.recents.truncate(MAX_RECENTS);
+    remember_recent_entry(&mut state.recents, id);
 }
 
 fn clear_recent(state: &mut LauncherState) {
@@ -45,6 +44,19 @@ pub fn remember_recent_app(id: &str) -> io::Result<()> {
 
 pub fn clear_recent_apps() -> io::Result<()> {
     mutate_launcher_state(&state_path(), clear_recent)
+}
+
+pub fn remember_recent_file(uri: &str) -> io::Result<()> {
+    mutate_launcher_state(&state_path(), |state| {
+        remember_recent_entry(&mut state.recent_files, uri)
+    })
+}
+
+pub fn clear_recent_activity() -> io::Result<()> {
+    mutate_launcher_state(&state_path(), |state| {
+        state.recents.clear();
+        state.recent_files.clear();
+    })
 }
 
 pub fn toggle_app_favorite(id: &str) -> io::Result<bool> {
@@ -94,6 +106,7 @@ fn load_launcher_state_from(path: &Path) -> io::Result<LauncherState> {
             "favorite" => &mut state.favorites,
             "file-favorite" => &mut state.file_favorites,
             "recent" => &mut state.recents,
+            "recent-file" => &mut state.recent_files,
             _ => continue,
         };
         if !entries.iter().any(|entry| entry == value) {
@@ -101,6 +114,7 @@ fn load_launcher_state_from(path: &Path) -> io::Result<LauncherState> {
         }
     }
     state.recents.truncate(MAX_RECENTS);
+    state.recent_files.truncate(MAX_RECENTS);
     Ok(state)
 }
 
@@ -158,6 +172,7 @@ fn save_launcher_state_to(path: &Path, state: &LauncherState) -> io::Result<()> 
     append_entries(&mut contents, "favorite", &state.favorites);
     append_entries(&mut contents, "file-favorite", &state.file_favorites);
     append_entries(&mut contents, "recent", &state.recents);
+    append_entries(&mut contents, "recent-file", &state.recent_files);
     write_private_atomic(parent, path, contents.as_bytes())
 }
 
@@ -222,6 +237,15 @@ fn append_entries(contents: &mut String, kind: &str, entries: &[String]) {
     }
 }
 
+fn remember_recent_entry(entries: &mut Vec<String>, value: &str) {
+    if value.is_empty() || value.contains(['\t', '\n', '\r']) {
+        return;
+    }
+    entries.retain(|entry| entry != value);
+    entries.insert(0, value.to_string());
+    entries.truncate(MAX_RECENTS);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -245,6 +269,7 @@ mod tests {
             favorites: vec!["one.desktop".into()],
             file_favorites: vec!["file:///home/user/Notes.txt".into()],
             recents: vec!["two.desktop".into()],
+            recent_files: vec!["file:///home/user/Report.pdf".into()],
         };
 
         save_launcher_state_to(&path, &state).expect("save state");
@@ -268,6 +293,7 @@ mod tests {
         assert_eq!(state.favorites, ["one.desktop"]);
         assert_eq!(state.recents, ["two.desktop"]);
         assert!(state.file_favorites.is_empty());
+        assert!(state.recent_files.is_empty());
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -308,6 +334,7 @@ mod tests {
             favorites: vec!["favorite.desktop".into()],
             file_favorites: vec!["file:///tmp/note.txt".into()],
             recents: vec!["recent.desktop".into()],
+            recent_files: vec!["file:///tmp/recent.txt".into()],
         };
 
         clear_recent(&mut state);

@@ -17,6 +17,8 @@ use smithay::{
 
 pub const PANEL_NAMESPACE: &str = "focaldesk-system-rail";
 pub const DOCK_NAMESPACE: &str = "focaldesk-task-shelf";
+/// Full-screen trusted client used only on outputs configured as ControlPanel.
+pub const COMPANION_NAMESPACE: &str = "focaldesk-companion-dashboard";
 pub const LEGACY_PANEL_NAMESPACE: &str = "focal-panel";
 pub const LEGACY_DOCK_NAMESPACE: &str = "focal-dock";
 pub const SYSTEM_RAIL_INPUT_WIDTH: i32 = 64;
@@ -27,6 +29,8 @@ pub const NATIVE_CHROME_STARTUP_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TrustedShellPresence {
+    /// Full-screen replacement UI for a ControlPanel output.
+    pub companion_dashboard: bool,
     pub system_rail: bool,
     pub task_shelf: bool,
     pub legacy_panel: bool,
@@ -35,10 +39,17 @@ pub struct TrustedShellPresence {
 
 impl TrustedShellPresence {
     pub fn is_active(self) -> bool {
-        self.system_rail || self.task_shelf || self.legacy_panel || self.legacy_dock
+        self.companion_dashboard
+            || self.system_rail
+            || self.task_shelf
+            || self.legacy_panel
+            || self.legacy_dock
     }
 
     pub fn internal_chrome(self) -> InternalChromeVisibility {
+        if self.companion_dashboard {
+            return InternalChromeVisibility::hidden();
+        }
         InternalChromeVisibility {
             topbar: !self.system_rail && !self.legacy_panel,
             sidebar_buttons: !self.task_shelf && !self.legacy_dock,
@@ -97,7 +108,11 @@ impl InternalChromeVisibility {
 pub fn is_trusted_namespace(namespace: &str) -> bool {
     matches!(
         namespace,
-        PANEL_NAMESPACE | DOCK_NAMESPACE | LEGACY_PANEL_NAMESPACE | LEGACY_DOCK_NAMESPACE
+        PANEL_NAMESPACE
+            | DOCK_NAMESPACE
+            | COMPANION_NAMESPACE
+            | LEGACY_PANEL_NAMESPACE
+            | LEGACY_DOCK_NAMESPACE
     )
 }
 
@@ -112,6 +127,7 @@ pub fn input_region_contains(namespace: &str, point: Point<f64, Logical>) -> boo
             point.x >= 0.0 && point.x < SYSTEM_RAIL_INPUT_WIDTH as f64 && point.y >= 0.0
         }
         DOCK_NAMESPACE => point.x >= 0.0 && point.y >= 0.0,
+        COMPANION_NAMESPACE => point.x >= 0.0 && point.y >= 0.0,
         LEGACY_PANEL_NAMESPACE => point.x >= 0.0 && point.y >= 0.0 && point.y < 64.0,
         LEGACY_DOCK_NAMESPACE => point.x >= 0.0 && point.x < 76.0 && point.y >= 0.0,
         _ => false,
@@ -155,6 +171,7 @@ pub fn presence_for_output(output: &Output) -> TrustedShellPresence {
         }
 
         match layer.namespace() {
+            COMPANION_NAMESPACE => presence.companion_dashboard = true,
             PANEL_NAMESPACE => presence.system_rail = true,
             DOCK_NAMESPACE => presence.task_shelf = true,
             LEGACY_PANEL_NAMESPACE => presence.legacy_panel = true,

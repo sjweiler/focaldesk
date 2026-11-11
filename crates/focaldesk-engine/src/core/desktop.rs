@@ -1,5 +1,8 @@
 #![allow(unused_imports)]
 
+mod input;
+mod magnifier;
+
 use focaldesk_types::types::{OutputId, WindowId, WorkspaceId};
 use focaldesk_ui::uitree::UiTree;
 use smithay::backend::allocator::{Fourcc, Modifier};
@@ -25,6 +28,7 @@ use crate::core::color::{
 use crate::core::output_store::OutputStore;
 use crate::core::window_store::WindowStore;
 use crate::core::workspace_store::WorkspaceStore;
+use focaldesk_settings_core::OutputRole;
 use focaldesk_ui::desktop_frame::DesktopFrameCtx;
 use focaldesk_ui::egui_layer::{EguiInputEvent, EguiModifiers, EguiPointerButton, EguiScrollDelta};
 use focaldesk_ui::element::UiElement;
@@ -35,7 +39,13 @@ use smithay::backend::renderer::element::Id;
 use smithay::desktop::{WindowSurface, WindowSurfaceType};
 use smithay::input::keyboard::{keysyms, xkb, XkbConfig};
 use smithay::input::pointer::{
-    AxisFrame, ButtonEvent, CursorIcon, CursorImageAttributes, MotionEvent, RelativeMotionEvent,
+    AxisFrame, ButtonEvent, CursorIcon, CursorImageAttributes, GestureSwipeBeginEvent,
+    GestureSwipeEndEvent, GestureSwipeUpdateEvent, MotionEvent, RelativeMotionEvent,
+};
+use smithay::reexports::input::{
+    AccelProfile as LibinputAccelProfile, Device as LibinputDevice,
+    DeviceCapability as LibinputDeviceCapability, ScrollMethod as LibinputScrollMethod,
+    SendEventsMode,
 };
 use smithay::reexports::wayland_server::Resource;
 
@@ -44,7 +54,8 @@ use crate::core::session_restore::{
     SavedSplitPlacement, SavedWindow, SessionRestoreState, SessionSnapshot,
 };
 use crate::core::shell::xwayland::{
-    is_noninteractive_fixed_size_helper, XwaylandSurfaceRole, XwaylandWindowMeta,
+    is_noninteractive_fixed_size_helper, workspace_from_process_env, XwaylandSurfaceRole,
+    XwaylandWindowMeta,
 };
 use crate::core::shell::WaylandWindowMeta;
 use focaldesk_cursor::{CursorIcon as FlowCursorIcon, CursorManager};
@@ -59,28 +70,23 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use crate::core::input::FlowKeyState;
-use crate::core::input::FlowModifiers;
-use crate::core::input::FlowMouseButton;
-use crate::core::input::FlowScrollDelta;
-use crate::core::input::FlowScrollSource;
-use crate::core::input::{FlowInputEvent, InputState};
+use crate::core::keyboard_accessibility::KeyboardAccessibilityFilter;
 use crate::core::lock::{
     authenticate_current_user, LockPulseKind, LockScreenState, LOCK_PULSE_DURATION,
 };
 use crate::core::shell::ManagedWindow;
+use crate::core::BackendEvent;
 use crate::core::RenderState;
 use focal_launch_shared::{request_launch, BrowserBackend, LaunchRequest, LaunchSource};
 use focaldesk_config::{load_config, save_config, FocalDeskConfig};
-use focaldesk_flow::actions::KeyAction;
-use focaldesk_flow::keybinds::BackendKind;
-use focaldesk_flow::Keybinds;
-use focaldesk_flow::ModMask;
+use focaldesk_input::{
+    InputEvent, InputState, KeyState, Modifiers, MouseButton, ScrollDelta, ScrollSource,
+};
 use focaldesk_ipc::{
     desktop_socket_path, send_control_request, send_notification_request, send_power_request,
     send_update_request, transport, ControlIpcRequest, ControlIpcResponse, ControlSetting,
     DesktopAction, DesktopDirection, DesktopSnapshot, DesktopSplitKeyboardAction,
-    DesktopSplitLayout, DisplayRuntimeOutputStatus, IpcRequest, IpcResponse,
+    DesktopSplitLayout, DisplayRuntimeOutputStatus, InputDeviceSnapshot, IpcRequest, IpcResponse,
     NotificationIpcRequest, NotificationIpcResponse, OutputSnapshot, PowerIpcRequest,
     PowerIpcResponse, RenderingStatus, SessionStatus, ThemeEditorCommand, UpdateIpcRequest,
     UpdateIpcResponse, WindowSnapshot, WorkspaceSnapshot, THEME_EDITOR_PROTOCOL_VERSION,
@@ -93,13 +99,16 @@ use focaldesk_power::{
     PowerAuthorization, PowerCommand, PowerManager, PowerSnapshot, LOW_BATTERY_THRESHOLD_PERCENT,
 };
 use focaldesk_settings_core::{
-    load_settings, rearm_exclusive_hdr_for_next_session, save_settings, AppSettings,
-    BrowserLaunchBackend, ChromeRegionSettings, ChromeSettings, DebugLogLevel, DebugSettings,
-    DisplayColorProfile, DisplayTransform, HdrAppearance, HdrCalibrationPattern, LidCloseAction,
-    LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction, PowerSettings,
-    PrivacySettings, WorkspaceSettings,
+    load_settings, rearm_exclusive_hdr_for_next_session, save_settings, AccessibilitySettings,
+    AppSettings, BrowserLaunchBackend, ChromeRegionSettings, ChromeSettings, DebugLogLevel,
+    DebugSettings, DisplayColorProfile, DisplayTransform, HdrAppearance, HdrCalibrationPattern,
+    InputAccelerationProfile, InputDeviceSettings, InputScrollMethod, InputSettings,
+    LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction,
+    PowerSettings, PrivacySettings, WindowRule, WorkspaceSettings, WorkspaceTransitionStyle,
 };
+use focaldesk_shortcuts::{KeyAction, KeySymbol, Keybinds, ModMask};
 use focaldesk_sounds::{UiSound, UiSoundPlayer};
+use focaldesk_types::CompositorBackend;
 use focaldesk_ui::atlas::IconId;
 use focaldesk_ui::chrome::Chrome;
 use focaldesk_ui::chrome::ChromeMetrics;
@@ -620,6 +629,9 @@ pub struct OutputState {
     pub logical_origin: Point<i32, Logical>,
     pub scale_factor: f64,
     pub scale: Scale<f64>,
+    /// Normal outputs accept ordinary windows. Control-panel outputs are kept
+    /// in the physical topology but reserved for FocalDesk controls.
+    pub role: OutputRole,
     pub hdr_supported: bool,
     pub hdr_requested: bool,
     /// KMS connector HDR state is live on this output. Scanout may remain
@@ -1602,7 +1614,7 @@ pub struct DesktopInit {
     pub color_representation_state:
         crate::core::wayland::color_representation_protocol::ColorRepresentationState,
     pub cursor_shape_state: smithay::wayland::cursor_shape::CursorShapeManagerState,
-    pub backend_kind: BackendKind,
+    pub backend_kind: CompositorBackend,
     pub cursor_manager: CursorManager,
     pub seat: Seat<DesktopState>,
     pub notification_snapshots: Vec<NotificationSnapshot>,
@@ -1611,6 +1623,9 @@ pub struct DesktopInit {
     pub client_wayland_display: String,
     pub theme_manager: ThemeManager,
     pub apps: AppSettings,
+    pub animations_enabled: bool,
+    pub input_settings: InputSettings,
+    pub accessibility_settings: AccessibilitySettings,
     pub workspaces: WorkspaceSettings,
     pub privacy: PrivacySettings,
     pub power: PowerSettings,
@@ -1639,6 +1654,120 @@ struct UiBuildCache {
     metrics: ChromeMetrics,
     theme_id: FlowThemeId,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct WorkspaceSwipe {
+    captured: bool,
+    delta_x: f64,
+    delta_y: f64,
+    velocity_x: f64,
+    velocity_y: f64,
+    last_update_msec: u32,
+}
+
+const WORKSPACE_TRANSITION_DURATION: Duration = Duration::from_millis(220);
+
+#[derive(Debug, Clone, Copy)]
+enum WorkspaceTransitionPhase {
+    Interactive,
+    Settling {
+        started_at: Instant,
+        start_progress: f64,
+        target_progress: f64,
+        duration: Duration,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WorkspaceTransition {
+    from: WorkspaceId,
+    to: WorkspaceId,
+    style: WorkspaceTransitionStyle,
+    progress: f64,
+    phase: WorkspaceTransitionPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct WorkspaceRenderView {
+    pub workspace: WorkspaceId,
+    pub offset_x: i32,
+    pub offset_y: i32,
+    pub opacity: f32,
+}
+
+impl WorkspaceTransition {
+    fn sampled_progress(self, now: Instant) -> (f64, bool) {
+        match self.phase {
+            WorkspaceTransitionPhase::Interactive => (self.progress.clamp(0.0, 1.0), false),
+            WorkspaceTransitionPhase::Settling {
+                started_at,
+                start_progress,
+                target_progress,
+                duration,
+            } => {
+                let elapsed = now.saturating_duration_since(started_at);
+                if elapsed >= duration || duration.is_zero() {
+                    return (target_progress, true);
+                }
+                let linear = (elapsed.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0);
+                let eased = 1.0 - (1.0 - linear).powi(3);
+                (
+                    start_progress + (target_progress - start_progress) * eased,
+                    false,
+                )
+            }
+        }
+    }
+}
+
+fn workspace_transition_views(
+    transition: WorkspaceTransition,
+    progress: f64,
+    output_width: i32,
+) -> [WorkspaceRenderView; 2] {
+    if transition.style == WorkspaceTransitionStyle::Materialize {
+        // An original 2D materialization: the old workspace gently disperses
+        // upward while the new one resolves from below. Alpha is applied to
+        // each client surface by both compositor backends.
+        const MATERIALIZE_TRAVEL: f64 = 24.0;
+        return [
+            WorkspaceRenderView {
+                workspace: transition.from,
+                offset_x: 0,
+                offset_y: (-progress * MATERIALIZE_TRAVEL).round() as i32,
+                opacity: (1.0 - progress) as f32,
+            },
+            WorkspaceRenderView {
+                workspace: transition.to,
+                offset_x: 0,
+                offset_y: ((1.0 - progress) * MATERIALIZE_TRAVEL).round() as i32,
+                opacity: progress as f32,
+            },
+        ];
+    }
+    let direction = if transition.to.0 > transition.from.0 {
+        1.0
+    } else {
+        -1.0
+    };
+    let width = f64::from(output_width.max(1));
+    [
+        WorkspaceRenderView {
+            workspace: transition.from,
+            offset_x: (-direction * progress * width).round() as i32,
+            offset_y: 0,
+            opacity: 1.0,
+        },
+        WorkspaceRenderView {
+            workspace: transition.to,
+            offset_x: (direction * (1.0 - progress) * width).round() as i32,
+            offset_y: 0,
+            opacity: 1.0,
+        },
+    ]
+}
+
+type ScreenshotSelection = (OutputId, Point<i32, Logical>, Point<i32, Logical>);
 
 pub struct DesktopState {
     // smithay protocol state
@@ -1724,7 +1853,7 @@ pub struct DesktopState {
         HashMap<OutputId, crate::core::linear_compositing::LinearOffscreenTargets>,
     /// Set after the first successful DRM present; portal capture waits for this.
     pub compositor_ready: bool,
-    pub backend_kind: BackendKind,
+    pub backend_kind: CompositorBackend,
     pub cursor_manager: CursorManager,
     pub seat: Seat<DesktopState>,
     // desktop model
@@ -1811,7 +1940,15 @@ pub struct DesktopState {
 
     pub client_wayland_display: String,
     pub apps: AppSettings,
+    pub animations_enabled: bool,
+    pub input_settings: InputSettings,
+    keyboard_accessibility: KeyboardAccessibilityFilter,
+    pub accessibility_settings: AccessibilitySettings,
+    magnifier_views: HashMap<OutputId, crate::core::magnifier::MagnifierView>,
+    libinput_devices: HashMap<String, LibinputDevice>,
     pub workspaces: WorkspaceSettings,
+    workspace_swipe: Option<WorkspaceSwipe>,
+    workspace_transitions: HashMap<OutputId, WorkspaceTransition>,
     pub privacy: PrivacySettings,
     pub power: PowerSettings,
     pub debug: DebugSettings,
@@ -1850,6 +1987,12 @@ pub struct DesktopState {
 
     pub screenshot_requested: Option<OutputId>,
     pub screenshot_all_requested: bool,
+    /// (output, drag origin, current pointer), all in output-local logical coordinates.
+    pub screenshot_selection: Option<ScreenshotSelection>,
+    /// The shortcut arms selection; the next left press supplies its origin.
+    pub screenshot_selection_dragging: bool,
+    /// Region to crop from the next clean output capture.
+    pub screenshot_crop: Option<(OutputId, Rectangle<i32, Logical>)>,
     pub screenshot_seq: u64,
 
     pub fonts: FontSystem,
@@ -1877,7 +2020,8 @@ pub struct DesktopState {
     wp_color_surface_outputs: HashMap<wayland_server::backend::ObjectId, OutputId>,
     pub damage_debug_enabled: bool,
     pub damage_source_counts: DamageSourceCounts,
-    damage_last_logged_surface_commit: u64,
+    damage_last_logged_surface_commit: HashMap<OutputId, u64>,
+    damage_last_logged_frame: HashMap<OutputId, u64>,
     pub sidebar_pulse: Option<SidebarPulse>,
     pub topbar_pulse: Option<TopbarPulse>,
     pub clock_pulse: Option<ClockPulse>,
@@ -1889,8 +2033,13 @@ pub struct DesktopState {
     next_dialog_id: DialogId,
     pending_ui_actions: Vec<UiAction>,
     pending_egui_ops: Vec<PendingEguiOp>,
+    pending_vui_quick_settings: Option<OutputId>,
     pending_sidebar_dialogs: HashMap<DialogId, SidebarDialogKind>,
-    pending_app_launches: Vec<(u64, String, Vec<String>, LaunchSource)>,
+    pending_app_launches: Vec<(u64, String, Vec<String>, LaunchSource, WorkspaceId)>,
+    /// Trusted shell chrome that has actually painted, keyed by namespace and
+    /// output connector. A wildcard entry preserves compatibility with older
+    /// shell clients that only report a global ready signal.
+    ready_shell_clients: HashSet<(String, String)>,
     /// Map/focus deferred out of `handle_commit` so Wayland dispatch does not re-enter seat/xdg.
     pending_window_maps: Vec<(WindowId, Point<i32, Logical>)>,
     pending_focus_window: Option<WindowId>,
@@ -1922,7 +2071,7 @@ struct LaunchContext {
     #[cfg(feature = "xwayland")]
     xwayland_display: Option<String>,
     browser_launch_backend: BrowserLaunchBackend,
-    backend_kind: BackendKind,
+    backend_kind: CompositorBackend,
     /// True once any output is rendering, or is about to render, a PQ frame.
     /// Browser launch policy must follow live compositor state rather than the
     /// persisted exclusive-HDR state, which does not cover normal HDR toggles.
@@ -1944,6 +2093,7 @@ enum PendingEguiOp {
 #[derive(Debug, Clone, Copy)]
 enum SidebarDialogKind {
     DeleteWorkspace,
+    ToggleStickyKeys,
 }
 
 fn apply_debug_log_level(level: DebugLogLevel) {
@@ -2094,6 +2244,109 @@ fn encoding_from_fourcc(code: Fourcc) -> ClientBufferEncoding {
             } else {
                 ClientBufferEncoding::Unknown
             }
+        }
+    }
+}
+
+fn libinput_device_id(device: &LibinputDevice) -> String {
+    let mut slug = String::with_capacity(64);
+    let mut previous_dash = false;
+    for character in device.name().chars().flat_map(char::to_lowercase) {
+        if slug.len() >= 64 {
+            break;
+        }
+        if character.is_ascii_alphanumeric() {
+            slug.push(character);
+            previous_dash = false;
+        } else if !previous_dash && !slug.is_empty() {
+            slug.push('-');
+            previous_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        slug.push_str("pointer");
+    }
+    let sysname = device
+        .sysname()
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .take(32)
+        .collect::<String>();
+    format!(
+        "{:04x}:{:04x}:{slug}:{}",
+        device.id_vendor(),
+        device.id_product(),
+        if sysname.is_empty() {
+            "device"
+        } else {
+            &sysname
+        }
+    )
+}
+
+fn apply_libinput_device_settings(device: &mut LibinputDevice, settings: &InputDeviceSettings) {
+    let can_disable = !device.has_capability(LibinputDeviceCapability::Keyboard)
+        && device
+            .config_send_events_modes()
+            .contains(SendEventsMode::DISABLED);
+    if can_disable {
+        if let Some(enabled) = settings.enabled {
+            let mode = if enabled {
+                SendEventsMode::ENABLED
+            } else {
+                SendEventsMode::DISABLED
+            };
+            let _ = device.config_send_events_set_mode(mode);
+        }
+    }
+    if device.config_tap_finger_count() > 0 {
+        if let Some(enabled) = settings.tap_to_click {
+            let _ = device.config_tap_set_enabled(enabled);
+        }
+    }
+    if device.config_dwt_is_available() {
+        if let Some(enabled) = settings.disable_while_typing {
+            let _ = device.config_dwt_set_enabled(enabled);
+        }
+    }
+    if device.config_accel_is_available() {
+        let profile = match settings.acceleration_profile {
+            InputAccelerationProfile::Default => device.config_accel_default_profile(),
+            InputAccelerationProfile::Adaptive => Some(LibinputAccelProfile::Adaptive),
+            InputAccelerationProfile::Flat => Some(LibinputAccelProfile::Flat),
+        };
+        if let Some(profile) = profile {
+            if device.config_accel_profiles().contains(&profile) {
+                let _ = device.config_accel_set_profile(profile);
+            }
+        }
+        if let Some(speed) = settings.acceleration_speed {
+            let _ = device.config_accel_set_speed(speed.clamp(-1.0, 1.0));
+        }
+    }
+    let scroll_method = match settings.scroll_method {
+        InputScrollMethod::Default => device.config_scroll_default_method(),
+        InputScrollMethod::TwoFinger => Some(LibinputScrollMethod::TwoFinger),
+        InputScrollMethod::Edge => Some(LibinputScrollMethod::Edge),
+        InputScrollMethod::OnButtonDown => Some(LibinputScrollMethod::OnButtonDown),
+        InputScrollMethod::Disabled => Some(LibinputScrollMethod::NoScroll),
+    };
+    if let Some(method) = scroll_method {
+        if device.config_scroll_methods().contains(&method) {
+            let _ = device.config_scroll_set_method(method);
+        }
+    }
+    if device.config_left_handed_is_available() {
+        if let Some(enabled) = settings.left_handed {
+            let _ = device.config_left_handed_set(enabled);
+        }
+    }
+    if device.config_middle_emulation_is_available() {
+        if let Some(enabled) = settings.middle_button_emulation {
+            let _ = device.config_middle_emulation_set_enabled(enabled);
         }
     }
 }
@@ -2283,16 +2536,18 @@ impl DesktopState {
                 .values()
                 .any(|output| output.hdr_kms_applied || output.hdr_transition_target == Some(true)),
         };
-        let apps: Vec<(u64, String, Vec<String>, LaunchSource)> =
+        let apps: Vec<(u64, String, Vec<String>, LaunchSource, WorkspaceId)> =
             std::mem::take(&mut self.pending_app_launches);
-        for (launch_trace_id, app, args, source) in apps {
+        for (launch_trace_id, app, args, source, workspace) in apps {
             flog_info!(
                 "dequeuing app launch trace_id={} app={}",
                 launch_trace_id,
                 app
             );
             let ctx = ctx.clone();
-            thread::spawn(move || spawn_app_detached(ctx, launch_trace_id, app, args, source));
+            thread::spawn(move || {
+                spawn_app_detached(ctx, launch_trace_id, app, args, source, workspace)
+            });
         }
     }
 
@@ -2311,6 +2566,13 @@ impl DesktopState {
         }
         if queued > 0 {
             flog_info!("Session restore queued {queued} application launch(es)");
+        }
+    }
+
+    fn queue_startup_apps(&mut self) {
+        let startup_apps = self.apps.startup_apps.clone();
+        for startup in startup_apps.into_iter().filter(|startup| startup.enabled) {
+            self.launch_app_with_args(startup.command, startup.arguments);
         }
     }
 
@@ -2436,7 +2698,7 @@ impl DesktopState {
                     && self.workspaces.split_screen_enabled)
                     .then(|| {
                         let work = self.work_recess_for_output(output_id)?;
-                        saved_split_placement(work, window.tile_rect?)
+                        saved_split_placement(work, window.tile_rect.or(window.restore_rect)?)
                     })
                     .flatten();
 
@@ -3015,7 +3277,7 @@ impl DesktopState {
         use smithay::input::keyboard::FilterResult;
 
         let Some(keyboard) = self.seat.get_keyboard() else {
-            self.input.modifiers = FlowModifiers::default();
+            self.input.modifiers = Modifiers::default();
             return;
         };
 
@@ -3029,7 +3291,7 @@ impl DesktopState {
                 |_, _, _| FilterResult::<()>::Forward,
             );
         }
-        self.input.modifiers = FlowModifiers::default();
+        self.input.modifiers = Modifiers::default();
     }
 
     pub(crate) fn on_resume(&mut self) {
@@ -3123,10 +3385,19 @@ impl DesktopState {
         let config = load_config();
         self.notify_config_changes(&old_config, &config);
         self.settings_ipc_config = config.clone();
-        self.apply_config(config);
+        self.apply_config(config, true);
 
-        let settings = load_settings();
-        let mut keybinds = Keybinds::with_defaults(self.backend_kind);
+        let mut settings = load_settings();
+        settings.input.accessibility = settings.input.accessibility.sanitized();
+        let releases = self
+            .keyboard_accessibility
+            .reconfigure(settings.input.accessibility);
+        for release in releases {
+            self.handle_key_event(release.keycode, release.state);
+        }
+        let mut keybinds = Keybinds::with_defaults(crate::backend::common::shortcut_capabilities(
+            self.backend_kind,
+        ));
         for warning in keybinds.apply_overrides(
             settings
                 .input
@@ -3158,11 +3429,35 @@ impl DesktopState {
         }
         self.keybinds = keybinds;
         self.apps = settings.apps;
+        self.animations_enabled = settings.appearance.animations;
+        if !self.animations_enabled {
+            self.workspace_transitions.clear();
+        }
+        self.input_settings = settings.input;
+        let start_on_screen_keyboard = !self.accessibility_settings.on_screen_keyboard_enabled
+            && settings.accessibility.on_screen_keyboard_enabled;
+        self.accessibility_settings = settings.accessibility;
+        if start_on_screen_keyboard {
+            self.launch_app("maliit-keyboard".to_string());
+        }
+        self.refresh_magnifier_targets();
+        let cursor_scale = self
+            .outputs
+            .get(&self.focused_output)
+            .map(|output| output.scale_factor as f32)
+            .unwrap_or(1.0);
+        self.cursor_manager
+            .set_base_size_and_scale(self.cursor_base_size(), cursor_scale);
+        self.apply_all_libinput_device_settings();
         if self.workspaces.split_screen_enabled && !settings.workspaces.split_screen_enabled {
             self.clear_snap_preview();
             self.restore_all_split_windows();
         }
         self.workspaces = settings.workspaces;
+        if self.workspaces.transition_style == WorkspaceTransitionStyle::None {
+            self.workspace_transitions.clear();
+        }
+        self.apply_workspace_name_overrides();
         self.session_restore
             .set_enabled(self.workspaces.restore_session);
         self.privacy = settings.privacy;
@@ -3171,6 +3466,98 @@ impl DesktopState {
         self.apply_power_settings();
         self.apply_debug_settings(settings.debug);
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
+    }
+
+    pub(crate) fn register_libinput_device(&mut self, mut device: LibinputDevice) {
+        // Touchscreens commonly expose only the Touch capability (and no
+        // relative Pointer capability). Keep those devices in the registry so
+        // their enabled state is applied and they remain visible to the
+        // compositor's input-management path.
+        if !device.has_capability(LibinputDeviceCapability::Pointer)
+            && !device.has_capability(LibinputDeviceCapability::Touch)
+        {
+            return;
+        }
+        let id = libinput_device_id(&device);
+        if let Some(settings) = self.input_settings.devices.get(&id) {
+            apply_libinput_device_settings(&mut device, settings);
+        }
+        self.libinput_devices.insert(id, device);
+    }
+
+    pub(crate) fn unregister_libinput_device(&mut self, device: &LibinputDevice) {
+        self.libinput_devices.remove(&libinput_device_id(device));
+    }
+
+    fn apply_all_libinput_device_settings(&mut self) {
+        for (id, device) in &mut self.libinput_devices {
+            if let Some(settings) = self.input_settings.devices.get(id) {
+                apply_libinput_device_settings(device, settings);
+            }
+        }
+    }
+
+    fn input_device_snapshots(&self) -> Vec<InputDeviceSnapshot> {
+        let mut devices = self
+            .libinput_devices
+            .iter()
+            .take(32)
+            .map(|(id, device)| {
+                let acceleration_profiles = device.config_accel_profiles();
+                let scroll_methods = device.config_scroll_methods();
+                let send_events_modes = device.config_send_events_modes();
+                InputDeviceSnapshot {
+                    id: id.clone(),
+                    name: device.name().chars().take(128).collect(),
+                    sysname: device.sysname().chars().take(64).collect(),
+                    vendor_id: device.id_vendor(),
+                    product_id: device.id_product(),
+                    touchpad: device.config_tap_finger_count() > 0,
+                    enabled: !device
+                        .config_send_events_mode()
+                        .contains(SendEventsMode::DISABLED),
+                    can_disable: !device.has_capability(LibinputDeviceCapability::Keyboard)
+                        && send_events_modes.contains(SendEventsMode::DISABLED),
+                    tap_finger_count: device.config_tap_finger_count(),
+                    tap_to_click: device.config_tap_enabled(),
+                    supports_disable_while_typing: device.config_dwt_is_available(),
+                    disable_while_typing: device.config_dwt_enabled(),
+                    supports_acceleration: device.config_accel_is_available(),
+                    supports_adaptive_acceleration: acceleration_profiles
+                        .contains(&LibinputAccelProfile::Adaptive),
+                    supports_flat_acceleration: acceleration_profiles
+                        .contains(&LibinputAccelProfile::Flat),
+                    acceleration_profile: device.config_accel_profile().map(
+                        |profile| match profile {
+                            LibinputAccelProfile::Adaptive => "adaptive".to_string(),
+                            LibinputAccelProfile::Flat => "flat".to_string(),
+                            _ => "custom".to_string(),
+                        },
+                    ),
+                    acceleration_speed: device.config_accel_speed(),
+                    supports_two_finger_scroll: scroll_methods
+                        .contains(&LibinputScrollMethod::TwoFinger),
+                    supports_edge_scroll: scroll_methods.contains(&LibinputScrollMethod::Edge),
+                    supports_button_scroll: scroll_methods
+                        .contains(&LibinputScrollMethod::OnButtonDown),
+                    supports_disabled_scroll: scroll_methods
+                        .contains(&LibinputScrollMethod::NoScroll),
+                    scroll_method: device.config_scroll_method().map(|method| match method {
+                        LibinputScrollMethod::NoScroll => "disabled".to_string(),
+                        LibinputScrollMethod::TwoFinger => "two_finger".to_string(),
+                        LibinputScrollMethod::Edge => "edge".to_string(),
+                        LibinputScrollMethod::OnButtonDown => "on_button_down".to_string(),
+                        _ => "unknown".to_string(),
+                    }),
+                    supports_left_handed: device.config_left_handed_is_available(),
+                    left_handed: device.config_left_handed(),
+                    supports_middle_button_emulation: device.config_middle_emulation_is_available(),
+                    middle_button_emulation: device.config_middle_emulation_enabled(),
+                }
+            })
+            .collect::<Vec<_>>();
+        devices.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+        devices
     }
 
     fn handle_settings_ipc_request(
@@ -3222,7 +3609,7 @@ impl DesktopState {
                     Ok(()) => {
                         self.notify_config_changes(&old_config, &config);
                         self.settings_ipc_config = config.clone();
-                        self.apply_config(config);
+                        self.apply_config(config, true);
                         Some(IpcResponse::Ok)
                     }
                     Err(err) => Some(IpcResponse::Error {
@@ -3235,7 +3622,7 @@ impl DesktopState {
                 let config = load_config();
                 self.notify_config_changes(&old_config, &config);
                 self.settings_ipc_config = config.clone();
-                self.apply_config(config);
+                self.apply_config(config, true);
                 Some(IpcResponse::Ok)
             }
             IpcRequest::Reload => {
@@ -3275,11 +3662,36 @@ impl DesktopState {
             IpcRequest::ShellReady {
                 namespace,
                 output_count,
+                connector,
+                ready,
             } => {
                 if crate::core::wayland::trusted_shell::is_trusted_namespace(&namespace) {
+                    let connector_name = connector.as_deref().unwrap_or("all");
+                    let changed = match connector.as_ref() {
+                        Some(connector) if ready => self
+                            .ready_shell_clients
+                            .insert((namespace.clone(), connector.clone())),
+                        Some(connector) => self
+                            .ready_shell_clients
+                            .remove(&(namespace.clone(), connector.clone())),
+                        None if ready => self
+                            .ready_shell_clients
+                            .insert((namespace.clone(), "*".into())),
+                        None => {
+                            let previous_len = self.ready_shell_clients.len();
+                            self.ready_shell_clients
+                                .retain(|(client, _)| client != &namespace);
+                            self.ready_shell_clients.len() != previous_len
+                        }
+                    };
+                    if changed {
+                        self.mark_all_outputs_full_damage(DamageSource::Unknown);
+                    }
                     flog_info!(
-                        "trusted shell ready namespace={} outputs={output_count}",
-                        namespace
+                        "trusted shell frame state namespace={} connector={} ready={} outputs={output_count}",
+                        namespace,
+                        connector_name,
+                        ready,
                     );
                     Some(IpcResponse::Ok)
                 } else {
@@ -3310,6 +3722,9 @@ impl DesktopState {
             }),
             IpcRequest::GetDesktopSnapshot => Some(IpcResponse::DesktopSnapshot {
                 snapshot: self.desktop_snapshot(),
+            }),
+            IpcRequest::GetInputDevices => Some(IpcResponse::InputDevices {
+                devices: self.input_device_snapshots(),
             }),
             IpcRequest::GetThemeEditorStatus { protocol_version } => {
                 if protocol_version != THEME_EDITOR_PROTOCOL_VERSION {
@@ -3909,7 +4324,9 @@ impl DesktopState {
             DesktopAction::OpenSettingsPanel { panel } => {
                 const PANELS: &[&str] = &[
                     "appearance",
+                    "theme editor",
                     "network",
+                    "calendar",
                     "bluetooth",
                     "printers",
                     "displays",
@@ -3917,6 +4334,7 @@ impl DesktopState {
                     "applications",
                     "chrome",
                     "workspaces",
+                    "mouse & touchpad",
                     "keyboard",
                     "privacy",
                     "power",
@@ -3939,7 +4357,13 @@ impl DesktopState {
                     .iter()
                     .find_map(|(id, output)| (output.handle.name() == connector).then_some(*id))
                     .ok_or_else(|| format!("output {connector} does not exist"))?;
+                if matches!(panel, focaldesk_ipc::ShellPanel::QuickSettings) {
+                    self.pending_vui_quick_settings = Some(output);
+                    self.mark_output_full_damage(output, DamageSource::Unknown);
+                    return Ok(());
+                }
                 let panel = match panel {
+                    focaldesk_ipc::ShellPanel::QuickSettings => unreachable!(),
                     focaldesk_ipc::ShellPanel::Network => focaldesk_ui::types::PanelKind::Network,
                     focaldesk_ipc::ShellPanel::Bluetooth => {
                         focaldesk_ui::types::PanelKind::Bluetooth
@@ -4049,6 +4473,7 @@ impl DesktopState {
         let mut preferred_color_changed = false;
         let mut changed = false;
         let mut unmatched = Vec::new();
+        let mut control_panel_outputs = Vec::new();
         for config in outputs {
             let output_id = self
                 .outputs
@@ -4089,7 +4514,7 @@ impl DesktopState {
             let requested_hdr = self.outputs.get(&output_id).is_some_and(|output| {
                 output.hdr_supported && (config.hdr_requested || config.hdr_enabled)
             });
-            let (geometry_changed, color_changed, hdr_request_changed) = self
+            let (geometry_changed, color_changed, hdr_request_changed, role_changed) = self
                 .outputs
                 .get(&output_id)
                 .map(|output| {
@@ -4106,9 +4531,10 @@ impl DesktopState {
                         output.color_profile_override != config.color_profile
                             || output.icc_profile_path != config.icc_profile_path,
                         output.hdr_requested != requested_hdr,
+                        output.role != config.role,
                     )
                 })
-                .unwrap_or((true, true, true));
+                .unwrap_or((true, true, true, true));
             backend_reconfigure_needed |=
                 !config.enabled || geometry_changed || hdr_request_changed;
             preferred_color_changed |= color_changed;
@@ -4131,6 +4557,10 @@ impl DesktopState {
                 output.hdr_appearance = config.hdr_appearance;
                 output.color_profile_override = config.color_profile;
                 output.icc_profile_path = config.icc_profile_path.clone();
+                output.role = config.role;
+            }
+            if role_changed && config.role == OutputRole::ControlPanel {
+                control_panel_outputs.push(output_id);
             }
             if geometry_changed {
                 self.update_output_size_from_work(output_id, physical_size, scale_factor, old_work);
@@ -4143,7 +4573,7 @@ impl DesktopState {
                 self.primary_output = output_id;
             }
 
-            changed = true;
+            changed |= role_changed || geometry_changed || color_changed || hdr_request_changed;
             flog_info!(
                 "applied display IPC update name={} output={:?} size={}x{} scale={} origin={},{} primary={}",
                 config.connector,
@@ -4157,6 +4587,43 @@ impl DesktopState {
             );
         }
 
+        // A role change must not strand existing clients on the newly reserved
+        // panel. Rehome them to a normal output before the next render cycle.
+        if !control_panel_outputs.is_empty() {
+            let fallback = self.normal_output_for_windows();
+            let workspace = self
+                .outputs
+                .get(&fallback)
+                .map(|output| output.active_workspace)
+                .unwrap_or_else(|| self.focused_workspace());
+            let windows = self
+                .windows
+                .iter()
+                .filter(|window| {
+                    window
+                        .output
+                        .is_some_and(|output| control_panel_outputs.contains(&output))
+                })
+                .map(|window| window.id)
+                .collect::<Vec<_>>();
+            for window_id in windows {
+                if let Some(window) = self.window_mut(window_id) {
+                    window.set_output(Some(fallback));
+                    window.set_workspace(workspace);
+                    window.fullscreen = false;
+                    window.maximized = false;
+                    window.tile_rect = None;
+                }
+                if let Some(window) = self.window(window_id).map(|window| window.window.clone()) {
+                    self.map_window_bbox_location(
+                        window,
+                        self.default_toplevel_map_location(fallback),
+                        false,
+                    );
+                }
+            }
+        }
+
         if changed {
             self.display_reconfigure_requested |= backend_reconfigure_needed;
             if preferred_color_changed {
@@ -4166,7 +4633,7 @@ impl DesktopState {
             }
             self.mark_all_outputs_full_damage(DamageSource::Unknown);
             self.cursor_manager.set_base_size_and_scale(
-                24,
+                self.cursor_base_size(),
                 self.outputs
                     .get(&self.focused_output)
                     .or_else(|| self.outputs.get(&self.primary_output))
@@ -4187,6 +4654,10 @@ impl DesktopState {
 
     pub(crate) fn take_display_reconfigure_request(&mut self) -> bool {
         std::mem::take(&mut self.display_reconfigure_requested)
+    }
+
+    pub(crate) fn take_vui_quick_settings_request(&mut self) -> Option<OutputId> {
+        self.pending_vui_quick_settings.take()
     }
 
     fn set_hdr_appearance(
@@ -4259,7 +4730,9 @@ impl DesktopState {
             Ok(()) => {
                 self.notify_config_changes(&old_config, &new_config);
                 self.settings_ipc_config = new_config.clone();
-                self.apply_config(new_config);
+                // A single non-theme setting must not re-apply the configured
+                // default theme over an in-memory theme-editor preview.
+                self.apply_config(new_config, key == "appearance.theme");
                 IpcResponse::Ok
             }
             Err(err) => IpcResponse::Error {
@@ -4361,13 +4834,21 @@ impl DesktopState {
         });
     }
 
-    fn apply_config(&mut self, config: FocalDeskConfig) {
+    fn apply_config(&mut self, config: FocalDeskConfig, refresh_theme: bool) {
         let old_theme_id = self.theme.active_theme().id.clone();
         let new_theme_id = theme_id_from_config(&config);
         let use_system_default = matches!(config.appearance.theme.as_str(), "" | "Default");
 
-        if old_theme_id != new_theme_id || use_system_default {
-            self.theme.set_builtin(new_theme_id.clone());
+        if refresh_theme && (old_theme_id != new_theme_id || use_system_default) {
+            if let FlowThemeId::Custom(path) = &new_theme_id {
+                if let Err(err) = self.theme.set_custom(std::path::PathBuf::from(path)) {
+                    flog_error!("failed to load configured custom theme {path}: {err}");
+                    self.theme
+                        .set_builtin(FlowThemeId::BuiltIn(BuiltInThemeId::Eagle));
+                }
+            } else {
+                self.theme.set_builtin(new_theme_id.clone());
+            }
             if use_system_default {
                 match focaldesk_themes::ThemeDocument::load(std::path::Path::new(
                     focaldesk_themes::SYSTEM_DEFAULT_THEME_PATH,
@@ -4380,10 +4861,12 @@ impl DesktopState {
                     Err(err) => flog_error!("failed to load system default theme: {err}"),
                 }
             }
-            if let Some(theme_id) = new_theme_id.builtin_id() {
-                if let Err(err) = self.fonts.reload_for_theme(theme_id) {
-                    flog_error!("failed to reload fonts for theme {:?}: {err}", theme_id);
-                }
+            let font_theme_id = new_theme_id.builtin_id().unwrap_or(BuiltInThemeId::Eagle);
+            if let Err(err) = self.fonts.reload_for_theme(font_theme_id) {
+                flog_error!(
+                    "failed to reload fonts for theme {:?}: {err}",
+                    font_theme_id
+                );
             }
 
             self.render.fonts_prewarm_done = false;
@@ -4401,6 +4884,14 @@ impl DesktopState {
 
     pub(crate) fn work_area_glass_enabled(&self) -> bool {
         self.settings_ipc_config.appearance.work_area_glass
+    }
+
+    pub(crate) fn rail_backdrop(&self) -> focaldesk_config::RailBackdrop {
+        self.settings_ipc_config.appearance.rail_backdrop
+    }
+
+    pub(crate) fn panel_darkness(&self) -> Option<f64> {
+        self.settings_ipc_config.appearance.panel_darkness
     }
 
     fn apply_power_settings(&self) {
@@ -4433,6 +4924,18 @@ impl DesktopState {
                     && y < o.logical_origin.y + o.logical_size.h
             })
             .map(|(id, _)| *id)
+    }
+
+    /// Return the touch target when exactly one output is reserved for
+    /// compositor-native controls. With more than one control panel, a device
+    /// to output mapping is required instead of guessing.
+    pub(crate) fn sole_control_panel_output(&self) -> Option<OutputId> {
+        let mut panels = self
+            .outputs
+            .iter()
+            .filter_map(|(id, output)| (output.role == OutputRole::ControlPanel).then_some(*id));
+        let panel = panels.next()?;
+        panels.next().is_none().then_some(panel)
     }
     pub fn update_ui_hover_for_output(&mut self, output_id: OutputId) -> bool {
         self.update_ui_hover_for_output_inner(output_id, true, true)
@@ -4588,6 +5091,20 @@ impl DesktopState {
         output_id: OutputId,
         now: Instant,
     ) -> crate::core::wayland::trusted_shell::InternalChromeVisibility {
+        // A ControlPanel is a dedicated full-screen surface.  It must never
+        // receive compositor fallback rail/dock chrome, including during the
+        // short period before its companion client has mapped.
+        if self.outputs.get(&output_id).is_some_and(|output| {
+            load_settings()
+                .displays
+                .outputs
+                .into_iter()
+                .find(|configured| configured.connector == output.handle.name())
+                .map(|configured| configured.role == OutputRole::ControlPanel)
+                .unwrap_or(output.role == OutputRole::ControlPanel)
+        }) {
+            return crate::core::wayland::trusted_shell::InternalChromeVisibility::hidden();
+        }
         let presence = self
             .outputs
             .get(&output_id)
@@ -4595,7 +5112,7 @@ impl DesktopState {
             .unwrap_or_default();
         presence.internal_chrome_with_startup_policy(
             now.saturating_duration_since(self.render.start_time),
-            self.backend_kind == BackendKind::Drm,
+            self.backend_kind == CompositorBackend::Drm,
         )
     }
 
@@ -4664,6 +5181,10 @@ impl DesktopState {
             max_workspace_slots: self.workspaces.max_workspace_slots as usize,
             active_workspace: output.active_workspace.0,
             ai_flow_mode: self.ai_flow_mode(),
+            recording_active: self
+                .local_remote_capture
+                .as_ref()
+                .is_some_and(|capture| capture.recording_output_active(output_id)),
             sidebar_items: None,
             status_items: None,
         };
@@ -4876,7 +5397,7 @@ impl DesktopState {
         true
     }
 
-    fn egui_modifiers(modifiers: FlowModifiers) -> EguiModifiers {
+    fn egui_modifiers(modifiers: Modifiers) -> EguiModifiers {
         EguiModifiers {
             alt: modifiers.alt,
             ctrl: modifiers.ctrl,
@@ -4901,7 +5422,7 @@ impl DesktopState {
             rendering_output: output_id,
             now,
             start_time: self.render.start_time,
-            flip_egui_y: self.backend_kind == BackendKind::Drm,
+            flip_egui_y: self.backend_kind == CompositorBackend::Drm,
             portal_capture: false,
         })
     }
@@ -4964,6 +5485,7 @@ impl DesktopState {
                         let work_width = frame_ctx.work.size.w.max(1) as f32;
                         let work_height = frame_ctx.work.size.h.max(1) as f32;
                         Some(focaldesk_ui::egui_panels::WorkspaceWindowPreview {
+                            id: window.id,
                             title: window.title(),
                             x: (clipped.loc.x - frame_ctx.work.loc.x) as f32 / work_width,
                             y: (clipped.loc.y - frame_ctx.work.loc.y) as f32 / work_height,
@@ -5079,14 +5601,14 @@ impl DesktopState {
         }
     }
 
-    fn egui_pointer_button(button: FlowMouseButton) -> Option<EguiPointerButton> {
+    fn egui_pointer_button(button: MouseButton) -> Option<EguiPointerButton> {
         match button {
-            FlowMouseButton::Left => Some(EguiPointerButton::Primary),
-            FlowMouseButton::Right => Some(EguiPointerButton::Secondary),
-            FlowMouseButton::Middle => Some(EguiPointerButton::Middle),
-            FlowMouseButton::Back => Some(EguiPointerButton::Extra1),
-            FlowMouseButton::Forward => Some(EguiPointerButton::Extra2),
-            FlowMouseButton::Other(_) => None,
+            MouseButton::Left => Some(EguiPointerButton::Primary),
+            MouseButton::Right => Some(EguiPointerButton::Secondary),
+            MouseButton::Middle => Some(EguiPointerButton::Middle),
+            MouseButton::Back => Some(EguiPointerButton::Extra1),
+            MouseButton::Forward => Some(EguiPointerButton::Extra2),
+            MouseButton::Other(_) => None,
         }
     }
 
@@ -5111,7 +5633,7 @@ impl DesktopState {
         }
     }
 
-    fn egui_text_for_keycode(keycode: u32, modifiers: FlowModifiers) -> Option<String> {
+    pub(crate) fn egui_text_for_keycode(keycode: u32, modifiers: Modifiers) -> Option<String> {
         if modifiers.ctrl || modifiers.alt || modifiers.super_key {
             return None;
         }
@@ -5467,12 +5989,14 @@ impl DesktopState {
             .is_some_and(|output| output.egui.wants_pointer_input())
     }
 
-    fn handle_egui_input(&mut self, event: &FlowInputEvent) -> bool {
+    fn handle_egui_input(&mut self, event: &InputEvent) -> bool {
         let output_id = match *event {
-            FlowInputEvent::PointerMoved { position, .. }
-            | FlowInputEvent::PointerButton { position, .. }
-            | FlowInputEvent::PointerScroll { position, .. } => self.output_under_pointer(position),
-            FlowInputEvent::PointerLeft | FlowInputEvent::Key { .. } => Some(self.focused_output),
+            InputEvent::PointerMoved { position, .. }
+            | InputEvent::PointerButton { position, .. }
+            | InputEvent::PointerScroll { position, .. } => {
+                self.output_under_pointer(position.into())
+            }
+            InputEvent::PointerLeft | InputEvent::Key { .. } => Some(self.focused_output),
             _ => None,
         };
         let Some(output_id) = output_id else {
@@ -5487,13 +6011,13 @@ impl DesktopState {
         }
 
         let egui_event = match *event {
-            FlowInputEvent::PointerMoved { .. } => {
+            InputEvent::PointerMoved { .. } => {
                 let Some(local) = self.pointer_relative_to_output_logical(output_id) else {
                     return false;
                 };
                 EguiInputEvent::PointerMoved { position: local }
             }
-            FlowInputEvent::PointerButton { button, state, .. } => {
+            InputEvent::PointerButton { button, state, .. } => {
                 let Some(button) = Self::egui_pointer_button(button) else {
                     return false;
                 };
@@ -5502,22 +6026,22 @@ impl DesktopState {
                 };
                 EguiInputEvent::PointerButton {
                     button,
-                    pressed: matches!(state, FlowKeyState::Pressed),
+                    pressed: matches!(state, KeyState::Pressed),
                     position: local,
                     modifiers: Self::egui_modifiers(self.input.modifiers),
                 }
             }
-            FlowInputEvent::PointerScroll { delta, .. } => {
+            InputEvent::PointerScroll { delta, .. } => {
                 let Some(local) = self.pointer_relative_to_output_logical(output_id) else {
                     return false;
                 };
                 let delta = match delta {
-                    FlowScrollDelta::Line { x, y } => EguiScrollDelta::Line { x, y },
-                    FlowScrollDelta::Pixel { x, y } => EguiScrollDelta::Point {
+                    ScrollDelta::Line { x, y } => EguiScrollDelta::Line { x, y },
+                    ScrollDelta::Pixel { x, y } => EguiScrollDelta::Point {
                         x: x as f32,
                         y: y as f32,
                     },
-                    FlowScrollDelta::Axis { x, y, .. } => EguiScrollDelta::Point {
+                    ScrollDelta::Axis { x, y, .. } => EguiScrollDelta::Point {
                         x: x as f32,
                         y: y as f32,
                     },
@@ -5528,8 +6052,8 @@ impl DesktopState {
                     modifiers: Self::egui_modifiers(self.input.modifiers),
                 }
             }
-            FlowInputEvent::PointerLeft => EguiInputEvent::PointerGone,
-            FlowInputEvent::Key {
+            InputEvent::PointerLeft => EguiInputEvent::PointerGone,
+            InputEvent::Key {
                 keycode,
                 state,
                 repeat,
@@ -5537,7 +6061,7 @@ impl DesktopState {
             } => EguiInputEvent::Key {
                 key: Self::egui_key(keycode),
                 text: Self::egui_text_for_keycode(keycode, modifiers),
-                pressed: matches!(state, FlowKeyState::Pressed),
+                pressed: matches!(state, KeyState::Pressed),
                 repeat,
                 modifiers: Self::egui_modifiers(modifiers),
             },
@@ -5557,14 +6081,14 @@ impl DesktopState {
             .unwrap_or(0)
     }
 
-    fn flow_mouse_to_evdev(button: FlowMouseButton) -> u32 {
+    fn flow_mouse_to_evdev(button: MouseButton) -> u32 {
         match button {
-            FlowMouseButton::Left => 0x110,
-            FlowMouseButton::Right => 0x111,
-            FlowMouseButton::Middle => 0x112,
-            FlowMouseButton::Back => 0x113,
-            FlowMouseButton::Forward => 0x114,
-            FlowMouseButton::Other(v) => v as u32,
+            MouseButton::Left => 0x110,
+            MouseButton::Right => 0x111,
+            MouseButton::Middle => 0x112,
+            MouseButton::Back => 0x113,
+            MouseButton::Forward => 0x114,
+            MouseButton::Other(v) => v as u32,
         }
     }
 
@@ -6111,6 +6635,20 @@ impl DesktopState {
         layer_order: &[smithay::wayland::shell::wlr_layer::Layer],
     ) -> Option<(PointerFocusTarget, Point<f64, Logical>)> {
         let output_id = self.output_under_pointer(pos)?;
+        self.pointer_layer_surface_under_on_output(pos, output_id, layer_order)
+    }
+
+    /// Layer-surface hit test pinned to a known physical output.
+    ///
+    /// A direct-touch control panel may intentionally overlap another output
+    /// in global logical coordinates, so its physical output must be chosen
+    /// before hit-testing its layer surfaces.
+    fn pointer_layer_surface_under_on_output(
+        &self,
+        pos: Point<f64, Logical>,
+        output_id: OutputId,
+        layer_order: &[smithay::wayland::shell::wlr_layer::Layer],
+    ) -> Option<(PointerFocusTarget, Point<f64, Logical>)> {
         let output = self.outputs.get(&output_id)?;
         let output_geo = self
             .space
@@ -6208,8 +6746,11 @@ impl DesktopState {
             }
         }
 
-        // XWayland/GTK can briefly have empty input regions while geometry catches up;
-        // fall back to bbox + surface_under (matches render visibility).
+        // XWayland/GTK can briefly have empty input regions while geometry catches up.
+        // A second `surface_under` call would make an otherwise visible topmost
+        // window transparent to clicks and focus the window beneath it instead.
+        // Once the regular input-region lookup found no target, prefer the
+        // topmost visible client's root surface inside its rendered bounds.
         for window in self.space.elements().rev() {
             let on_ws = self
                 .windows
@@ -6230,21 +6771,15 @@ impl DesktopState {
             }
             #[cfg(feature = "xwayland")]
             if let Some(x11) = window.x11_surface() {
-                if let Some((_, surf_loc)) =
-                    window.surface_under(pos - render_loc.to_f64(), WindowSurfaceType::ALL)
-                {
-                    return Some((
-                        PointerFocusTarget::Xwayland(x11.clone()),
-                        (surf_loc + render_loc).to_f64(),
-                    ));
-                }
-            }
-            if let Some((surface, surf_loc)) =
-                window.surface_under(pos - render_loc.to_f64(), WindowSurfaceType::ALL)
-            {
                 return Some((
-                    PointerFocusTarget::Wayland(surface),
-                    (surf_loc + render_loc).to_f64(),
+                    PointerFocusTarget::Xwayland(x11.clone()),
+                    render_loc.to_f64(),
+                ));
+            }
+            if let Some(surface) = window.wl_surface() {
+                return Some((
+                    PointerFocusTarget::Wayland(surface.into_owned()),
+                    render_loc.to_f64(),
                 ));
             }
         }
@@ -6271,6 +6806,9 @@ impl DesktopState {
 
     fn compositor_pointer_grab_active(&self) -> bool {
         self.toplevel_pointer.is_some()
+            || self
+                .workspace_transitions
+                .contains_key(&self.focused_output)
     }
 
     /// True when the seat pointer has an active click grab matching `serial` on `surface`.
@@ -6316,6 +6854,37 @@ impl DesktopState {
                     .map(|(target, surface_loc)| (target, surface_loc))
             ));
         }
+        let serial = SERIAL_COUNTER.next_serial();
+        pointer.motion(
+            self,
+            under,
+            &MotionEvent {
+                location: pos,
+                serial,
+                time: Self::wl_pointer_time_ms(),
+            },
+        );
+        pointer.frame(self);
+    }
+
+    /// Deliver pointer motion to a layer surface on one physical output.
+    /// This is used by the direct-touch companion dashboard, whose output
+    /// overlaps the ordinary desktop in the logical layout.
+    pub(crate) fn forward_pointer_to_clients_on_output(
+        &mut self,
+        pos: Point<f64, Logical>,
+        output_id: OutputId,
+    ) {
+        use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
+
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let under = self.pointer_layer_surface_under_on_output(
+            pos,
+            output_id,
+            &[WlrLayer::Overlay, WlrLayer::Top],
+        );
         let serial = SERIAL_COUNTER.next_serial();
         pointer.motion(
             self,
@@ -6420,6 +6989,12 @@ impl DesktopState {
             let Some(constraint) = constraint.filter(|constraint| !constraint.is_active()) else {
                 return;
             };
+            // See `PointerConstraintsHandler::new_constraint`: an unrequested
+            // cursor lock must never freeze desktop pointer motion.  Confining
+            // a pointer to a client-provided region remains supported.
+            if matches!(&*constraint, PointerConstraint::Locked(_)) {
+                return;
+            }
             let local = (position - surface_loc).to_i32_round();
             if constraint
                 .region()
@@ -6451,16 +7026,16 @@ impl DesktopState {
     fn forward_pointer_button(
         &mut self,
         _pos: Point<f64, Logical>,
-        button: FlowMouseButton,
-        state: FlowKeyState,
+        button: MouseButton,
+        state: KeyState,
     ) {
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
         let serial = SERIAL_COUNTER.next_serial();
         let smithay_state = match state {
-            FlowKeyState::Pressed => ButtonState::Pressed,
-            FlowKeyState::Released => ButtonState::Released,
+            KeyState::Pressed => ButtonState::Pressed,
+            KeyState::Released => ButtonState::Released,
         };
         pointer.button(
             self,
@@ -6474,26 +7049,26 @@ impl DesktopState {
         pointer.frame(self);
     }
 
-    fn forward_pointer_scroll(&mut self, delta: FlowScrollDelta) {
+    fn forward_pointer_scroll(&mut self, delta: ScrollDelta) {
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
         let time = Self::wl_pointer_time_ms();
         let mut frame = match delta {
-            FlowScrollDelta::Line { .. } => AxisFrame::new(time).source(AxisSource::Wheel),
-            FlowScrollDelta::Pixel { .. } => AxisFrame::new(time).source(AxisSource::Wheel),
-            FlowScrollDelta::Axis { source, .. } => {
+            ScrollDelta::Line { .. } => AxisFrame::new(time).source(AxisSource::Wheel),
+            ScrollDelta::Pixel { .. } => AxisFrame::new(time).source(AxisSource::Wheel),
+            ScrollDelta::Axis { source, .. } => {
                 let source = match source {
-                    FlowScrollSource::Finger => AxisSource::Finger,
-                    FlowScrollSource::Continuous => AxisSource::Continuous,
-                    FlowScrollSource::Wheel => AxisSource::Wheel,
-                    FlowScrollSource::WheelTilt => AxisSource::WheelTilt,
+                    ScrollSource::Finger => AxisSource::Finger,
+                    ScrollSource::Continuous => AxisSource::Continuous,
+                    ScrollSource::Wheel => AxisSource::Wheel,
+                    ScrollSource::WheelTilt => AxisSource::WheelTilt,
                 };
                 AxisFrame::new(time).source(source)
             }
         };
         match delta {
-            FlowScrollDelta::Line { x, y } => {
+            ScrollDelta::Line { x, y } => {
                 if x != 0.0 {
                     frame = frame.value(Axis::Horizontal, f64::from(x));
                 }
@@ -6501,7 +7076,7 @@ impl DesktopState {
                     frame = frame.value(Axis::Vertical, f64::from(y));
                 }
             }
-            FlowScrollDelta::Pixel { x, y } => {
+            ScrollDelta::Pixel { x, y } => {
                 if x != 0.0 {
                     frame = frame.value(Axis::Horizontal, x);
                 }
@@ -6509,7 +7084,7 @@ impl DesktopState {
                     frame = frame.value(Axis::Vertical, y);
                 }
             }
-            FlowScrollDelta::Axis {
+            ScrollDelta::Axis {
                 x,
                 y,
                 x_v120,
@@ -6624,6 +7199,10 @@ impl DesktopState {
                 self.set_focused_workspace(WorkspaceId(workspace));
             }
 
+            UiAction::MoveWindowToWorkspace(window_id, workspace) => {
+                self.move_window_to_workspace(window_id, WorkspaceId(workspace));
+            }
+
             UiAction::CreateWorkspace(name) => {
                 self.create_workspace_from_dialog(name);
             }
@@ -6634,6 +7213,16 @@ impl DesktopState {
 
             UiAction::SetSetting(setting, enabled) => {
                 self.set_system_setting(setting, enabled);
+            }
+
+            UiAction::SetNightLight(enabled) => {
+                let mut settings = load_settings();
+                settings.accessibility.night_light.enabled = enabled;
+                if let Err(error) = save_settings(&settings) {
+                    flog_warn!("could not save Night Light setting: {error}");
+                } else {
+                    self.reload_settings_from_disk();
+                }
             }
 
             UiAction::SetVolume(volume) => {
@@ -7134,6 +7723,126 @@ impl DesktopState {
         dbg_flush("SCREENSHOT ALL REQUEST SET");
     }
 
+    pub fn request_screenshot_selection(&mut self) {
+        let output_id = self
+            .output_under_pointer(self.pointer_pos)
+            .unwrap_or(self.focused_output);
+        let Some(output) = self.outputs.get(&output_id) else {
+            return;
+        };
+        let point = Point::from((
+            (self.pointer_pos.x as i32 - output.logical_origin.x).clamp(0, output.logical_size.w),
+            (self.pointer_pos.y as i32 - output.logical_origin.y).clamp(0, output.logical_size.h),
+        ));
+        self.screenshot_selection = Some((output_id, point, point));
+        self.screenshot_selection_dragging = false;
+        self.clear_client_pointer_focus(self.pointer_pos);
+        self.mark_output_full_damage(output_id, DamageSource::Unknown);
+    }
+
+    pub fn update_screenshot_selection(&mut self, position: Point<f64, Logical>) -> bool {
+        if !self.screenshot_selection_dragging {
+            return self.screenshot_selection.is_some();
+        }
+        let Some((output_id, _, current)) = self.screenshot_selection.as_mut() else {
+            return false;
+        };
+        let output_id = *output_id;
+        let Some(output) = self.outputs.get(&output_id) else {
+            self.screenshot_selection = None;
+            return false;
+        };
+        *current = Point::from((
+            (position.x as i32 - output.logical_origin.x).clamp(0, output.logical_size.w),
+            (position.y as i32 - output.logical_origin.y).clamp(0, output.logical_size.h),
+        ));
+        self.mark_output_full_damage(output_id, DamageSource::Unknown);
+        true
+    }
+
+    pub fn begin_screenshot_selection(&mut self, position: Point<f64, Logical>) -> bool {
+        let Some((output_id, start, current)) = self.screenshot_selection.as_mut() else {
+            return false;
+        };
+        let output_id = *output_id;
+        let Some(output) = self.outputs.get(&output_id) else {
+            self.screenshot_selection = None;
+            return false;
+        };
+        let point = Point::from((
+            (position.x as i32 - output.logical_origin.x).clamp(0, output.logical_size.w),
+            (position.y as i32 - output.logical_origin.y).clamp(0, output.logical_size.h),
+        ));
+        *start = point;
+        *current = point;
+        self.screenshot_selection_dragging = true;
+        self.mark_output_full_damage(output_id, DamageSource::Unknown);
+        true
+    }
+
+    pub fn finish_screenshot_selection(&mut self) -> bool {
+        let Some((output_id, start, current)) = self.screenshot_selection.take() else {
+            return false;
+        };
+        self.screenshot_selection_dragging = false;
+        let rect = Rectangle::from_loc_and_size(
+            (start.x.min(current.x), start.y.min(current.y)),
+            (
+                (start.x - current.x).unsigned_abs() as i32,
+                (start.y - current.y).unsigned_abs() as i32,
+            ),
+        );
+        self.mark_output_full_damage(output_id, DamageSource::Unknown);
+        if rect.size.w >= 2 && rect.size.h >= 2 {
+            self.screenshot_crop = Some((output_id, rect));
+            self.screenshot_requested = Some(output_id);
+        }
+        true
+    }
+
+    pub fn cancel_screenshot_selection(&mut self) -> bool {
+        let Some((output_id, _, _)) = self.screenshot_selection.take() else {
+            return false;
+        };
+        self.screenshot_selection_dragging = false;
+        self.mark_output_full_damage(output_id, DamageSource::Unknown);
+        true
+    }
+
+    pub fn screenshot_selection_rect(
+        &self,
+        output_id: OutputId,
+    ) -> Option<Rectangle<i32, Logical>> {
+        if !self.screenshot_selection_dragging {
+            return None;
+        }
+        let (selection_output, start, current) = self.screenshot_selection?;
+        (selection_output == output_id).then(|| {
+            Rectangle::from_loc_and_size(
+                (start.x.min(current.x), start.y.min(current.y)),
+                (
+                    (start.x - current.x).unsigned_abs() as i32,
+                    (start.y - current.y).unsigned_abs() as i32,
+                ),
+            )
+        })
+    }
+
+    pub fn screenshot_selection_active(&self, output_id: OutputId) -> bool {
+        self.screenshot_selection
+            .is_some_and(|(selection_output, _, _)| selection_output == output_id)
+    }
+
+    pub fn take_screenshot_crop(&mut self, output_id: OutputId) -> Option<Rectangle<i32, Logical>> {
+        let (crop_output, crop) = self.screenshot_crop?;
+        if crop_output == output_id {
+            self.screenshot_crop = None;
+            Some(crop)
+        } else {
+            None
+        }
+    }
+
     pub fn take_screenshot_request(&mut self) -> Option<OutputId> {
         self.screenshot_requested.take()
     }
@@ -7178,10 +7887,90 @@ impl DesktopState {
             .unwrap_or(self.active_workspace)
     }
 
+    fn apply_workspace_name_overrides(&mut self) {
+        for (index, name) in self.workspace_names.iter_mut().enumerate() {
+            if let Some(configured) = self.workspaces.workspace_names.get(&((index + 1) as u32)) {
+                let configured = configured.trim();
+                if !configured.is_empty() {
+                    *name = configured.chars().take(64).collect();
+                }
+            }
+        }
+    }
+
+    /// Apply the first configured rule for a newly-created window. Rules are
+    /// deliberately skipped for restored windows so a saved session remains
+    /// authoritative over current defaults.
+    pub(crate) fn apply_window_rule(
+        &mut self,
+        window_id: WindowId,
+        app_id: Option<&str>,
+        title: &str,
+    ) -> Option<WindowRule> {
+        let rule = self
+            .apps
+            .window_rules
+            .iter()
+            .find(|rule| rule.matches(app_id, title))
+            .cloned()?;
+        let output = rule.output.as_deref().and_then(|connector| {
+            self.outputs
+                .iter()
+                .find_map(|(id, output)| (output.handle.name() == connector).then_some(*id))
+        });
+        let workspace = rule
+            .workspace
+            .filter(|workspace| *workspace as usize <= self.workspace_names.len())
+            .map(WorkspaceId);
+
+        if let Some(window) = self.window_mut(window_id) {
+            if let Some(workspace) = workspace {
+                window.set_workspace(workspace);
+            }
+            if let Some(output) = output {
+                window.output = Some(output);
+            }
+            if let Some(floating) = rule.floating {
+                window.floating = floating;
+            }
+        }
+        Some(rule)
+    }
+
     pub fn set_focused_workspace(&mut self, workspace: WorkspaceId) {
         if workspace.0 == 0 || workspace.0 as usize > self.workspace_names.len() {
             return;
         }
+        let previous_workspace = self.focused_workspace();
+        if previous_workspace == workspace {
+            return;
+        }
+        let output_id = self.focused_output;
+        self.activate_focused_workspace(workspace);
+        if self.animations_enabled
+            && self.workspaces.transition_style != WorkspaceTransitionStyle::None
+        {
+            self.clear_client_pointer_focus(self.pointer_pos);
+            self.workspace_transitions.insert(
+                output_id,
+                WorkspaceTransition {
+                    from: previous_workspace,
+                    to: workspace,
+                    style: self.workspaces.transition_style,
+                    progress: 0.0,
+                    phase: WorkspaceTransitionPhase::Settling {
+                        started_at: Instant::now(),
+                        start_progress: 0.0,
+                        target_progress: 1.0,
+                        duration: WORKSPACE_TRANSITION_DURATION,
+                    },
+                },
+            );
+        }
+        self.mark_focused_output_full_damage(DamageSource::Unknown);
+    }
+
+    fn activate_focused_workspace(&mut self, workspace: WorkspaceId) {
         let previous_workspace = self.focused_workspace();
         if let Some(window_id) = self.focused_window {
             if self.window(window_id).is_some_and(|window| {
@@ -7198,6 +7987,109 @@ impl DesktopState {
         self.rebuild_ui_tree_for_output(self.focused_output);
         self.mark_focused_output_full_damage(DamageSource::Unknown);
         self.focus_top_window_on_focused_output(workspace);
+    }
+
+    pub(crate) fn workspace_render_views(
+        &mut self,
+        output_id: OutputId,
+        output_width: i32,
+        now: Instant,
+    ) -> Vec<WorkspaceRenderView> {
+        let active = self
+            .outputs
+            .get(&output_id)
+            .map(|output| output.active_workspace)
+            .unwrap_or(self.active_workspace);
+        let Some(transition) = self.workspace_transitions.get(&output_id).copied() else {
+            return vec![WorkspaceRenderView {
+                workspace: active,
+                offset_x: 0,
+                offset_y: 0,
+                opacity: 1.0,
+            }];
+        };
+        let (progress, complete) = transition.sampled_progress(now);
+        if complete {
+            self.workspace_transitions.remove(&output_id);
+            return vec![WorkspaceRenderView {
+                workspace: active,
+                offset_x: 0,
+                offset_y: 0,
+                opacity: 1.0,
+            }];
+        }
+        workspace_transition_views(transition, progress, output_width).to_vec()
+    }
+
+    pub(crate) fn has_workspace_transition(&self, output_id: OutputId) -> bool {
+        self.workspace_transitions.contains_key(&output_id)
+    }
+
+    pub(crate) fn forget_workspace_transition(&mut self, output_id: OutputId) {
+        self.workspace_transitions.remove(&output_id);
+    }
+
+    pub(crate) fn update_interactive_workspace_transition(&mut self, delta_x: f64, delta_y: f64) {
+        if !self.animations_enabled
+            || self.workspaces.transition_style == WorkspaceTransitionStyle::None
+            || delta_x.abs() < delta_y.abs() * 1.05
+        {
+            return;
+        }
+        let from = self.focused_workspace();
+        let to = if delta_x < 0.0 {
+            WorkspaceId(from.0.saturating_add(1))
+        } else {
+            WorkspaceId(from.0.saturating_sub(1))
+        };
+        if to.0 == 0 || to.0 as usize > self.workspace_names.len() {
+            self.workspace_transitions.remove(&self.focused_output);
+            return;
+        }
+        let distance = self.input_settings.workspace_swipe_distance.max(1.0);
+        let progress = (delta_x.abs() / (distance * 1.5)).clamp(0.0, 1.0);
+        if !self
+            .workspace_transitions
+            .contains_key(&self.focused_output)
+        {
+            self.clear_client_pointer_focus(self.pointer_pos);
+        }
+        self.workspace_transitions.insert(
+            self.focused_output,
+            WorkspaceTransition {
+                from,
+                to,
+                style: self.workspaces.transition_style,
+                progress,
+                phase: WorkspaceTransitionPhase::Interactive,
+            },
+        );
+        self.mark_focused_output_full_damage(DamageSource::Unknown);
+    }
+
+    pub(crate) fn settle_interactive_workspace_transition(&mut self, target: Option<WorkspaceId>) {
+        let output_id = self.focused_output;
+        let Some(mut transition) = self.workspace_transitions.get(&output_id).copied() else {
+            if let Some(target) = target {
+                self.set_focused_workspace(target);
+            }
+            return;
+        };
+        let commits = target == Some(transition.to);
+        if commits {
+            self.activate_focused_workspace(transition.to);
+        }
+        let target_progress = if commits { 1.0 } else { 0.0 };
+        let remaining = (target_progress - transition.progress).abs();
+        let duration = WORKSPACE_TRANSITION_DURATION.mul_f64(remaining.max(0.35));
+        transition.phase = WorkspaceTransitionPhase::Settling {
+            started_at: Instant::now(),
+            start_progress: transition.progress,
+            target_progress,
+            duration,
+        };
+        self.workspace_transitions.insert(output_id, transition);
+        self.mark_focused_output_full_damage(DamageSource::Unknown);
     }
 
     fn focus_top_window_on_focused_output(&mut self, workspace: WorkspaceId) {
@@ -7300,6 +8192,7 @@ impl DesktopState {
         if self.workspace_names.len() <= 1 {
             return;
         }
+        self.workspace_transitions.clear();
 
         let current = self.focused_workspace().0.max(1) as usize;
         let delete_index = current.min(self.workspace_names.len()) - 1;
@@ -7398,6 +8291,7 @@ impl DesktopState {
                 logical_origin,
                 scale_factor,
                 scale: Scale::from((scale_factor, scale_factor)),
+                role: OutputRole::Normal,
                 hdr_supported: false,
                 hdr_requested: false,
                 hdr_kms_applied: false,
@@ -7594,6 +8488,40 @@ impl DesktopState {
         }
     }
 
+    fn reflow_constrained_windows_for_output(&mut self, output_id: OutputId) {
+        let Some(work) = self.work_recess_for_output(output_id) else {
+            return;
+        };
+        let windows: Vec<_> = self
+            .windows
+            .iter()
+            .filter(|window| {
+                window.output == Some(output_id)
+                    && window.mapped
+                    && !window.minimized
+                    && (window.fullscreen || window.maximized)
+            })
+            .map(|window| window.window.clone())
+            .collect();
+
+        for window in windows {
+            let old_bbox = self.global_window_bbox(&window);
+            if let Some(toplevel) = window.toplevel() {
+                toplevel.with_pending_state(|state| state.size = Some(work.size));
+                toplevel.send_pending_configure();
+            }
+            if let Some(x11) = window.x11_surface() {
+                let _ = x11.configure(work);
+            }
+            self.map_window_bbox_location(window.clone(), work.loc, true);
+            if let Some(rect) = old_bbox {
+                self.mark_window_bbox_damage_source(rect, DamageSource::WindowResize);
+            }
+            self.mark_window_bbox_damage_source(work, DamageSource::WindowResize);
+        }
+        self.space.refresh();
+    }
+
     fn restore_displaced_split_windows(&mut self, outputs_by_name: &HashMap<String, OutputId>) {
         let candidates: Vec<_> = self
             .displaced_split_windows
@@ -7643,6 +8571,7 @@ impl DesktopState {
         }
         for (output_id, old_work) in changes {
             self.reflow_split_windows_for_output(output_id, old_work);
+            self.reflow_constrained_windows_for_output(output_id);
         }
 
         let outputs_by_name = self
@@ -7699,22 +8628,16 @@ impl DesktopState {
             .map(|output| output.active_workspace)
             .unwrap_or(self.active_workspace);
 
-        // Put the pointer on a real output before re-applying fullscreen/maximized
-        // state; those paths intentionally choose the output under the pointer first.
-        let clamp = self.logical_pointer_clamp_rect();
-        let max_x = (clamp.loc.x + clamp.size.w - 1).max(clamp.loc.x) as f64;
-        let max_y = (clamp.loc.y + clamp.size.h - 1).max(clamp.loc.y) as f64;
-        self.pointer_pos.x = self.pointer_pos.x.clamp(clamp.loc.x as f64, max_x);
-        self.pointer_pos.y = self.pointer_pos.y.clamp(clamp.loc.y as f64, max_y);
-        if self.output_under_pointer(self.pointer_pos).is_none() {
-            if let Some(output) = self.outputs.get(&focused) {
-                self.pointer_pos = Point::from((
-                    output.logical_origin.x as f64 + output.logical_size.w as f64 / 2.0,
-                    output.logical_origin.y as f64 + output.logical_size.h as f64 / 2.0,
-                ));
-            }
-        }
-        self.input.pointer_pos = self.pointer_pos;
+        // Preserve the nearest valid pointer position when outputs change.
+        // Centering the focused display here made a transient topology refresh
+        // feel like the mouse was repeatedly pulled to screen center.
+        let pointer_bounds = self
+            .outputs
+            .values()
+            .map(|output| Rectangle::from_loc_and_size(output.logical_origin, output.logical_size));
+        self.pointer_pos =
+            confine_pointer_to_output_bounds(self.pointer_pos, self.pointer_pos, pointer_bounds);
+        self.input.pointer_pos = self.pointer_pos.into();
 
         let fallback_workspace = self
             .outputs
@@ -7828,6 +8751,30 @@ impl DesktopState {
         }
 
         false
+    }
+
+    /// A control-panel output stays in the physical topology but is reserved
+    /// for FocalDesk's trusted controls instead of ordinary client windows.
+    pub(crate) fn output_accepts_windows(&self, output_id: OutputId) -> bool {
+        self.outputs
+            .get(&output_id)
+            .is_some_and(|output| output.role == OutputRole::Normal)
+    }
+
+    /// Select an application target which is not a control panel. Retain the
+    /// focused output as a recovery fallback if every connected output has
+    /// been configured as a control panel.
+    pub(crate) fn normal_output_for_windows(&self) -> OutputId {
+        if self.output_accepts_windows(self.focused_output) {
+            return self.focused_output;
+        }
+        if self.output_accepts_windows(self.primary_output) {
+            return self.primary_output;
+        }
+        self.outputs
+            .iter()
+            .find_map(|(id, output)| (output.role == OutputRole::Normal).then_some(*id))
+            .unwrap_or(self.focused_output)
     }
 
     pub fn output_owns_cursor(&self, output_id: OutputId) -> bool {
@@ -7967,7 +8914,7 @@ impl DesktopState {
     pub(crate) fn xwayland_output_id_for_window(&self, id: WindowId) -> OutputId {
         self.window(id)
             .and_then(|window| window.output)
-            .or_else(|| self.output_under_pointer(self.input.pointer_pos))
+            .or_else(|| self.output_under_pointer(self.input.pointer_pos.into()))
             .unwrap_or(self.focused_output)
     }
 
@@ -8724,6 +9671,7 @@ impl DesktopState {
         if let Some(rect) = new_focus_bbox {
             self.mark_window_bbox_damage_source(rect, DamageSource::Unknown);
         }
+        self.update_magnifier_keyboard_focus();
     }
 
     /// Honor an X11 `_NET_ACTIVE_WINDOW` request without letting a normal
@@ -8859,11 +9807,24 @@ impl DesktopState {
             .unwrap_or(len - 1);
 
         let next = (idx + delta).rem_euclid(len) as usize;
-        self.focus_window_id(ids[next]);
+        let next_id = ids[next];
+        let label = self
+            .window(next_id)
+            .map(|window| format!("{} — {}", window.display_name(), window.title()));
+        self.focus_window_id(next_id);
+        if let Some(label) = label {
+            notification_service_notify(
+                "Application switcher",
+                label,
+                Some(Duration::from_secs(2)),
+            );
+        }
     }
 
     pub fn new(init: DesktopInit) -> Self {
         let debug = init.debug.clone();
+        let keyboard_accessibility =
+            KeyboardAccessibilityFilter::new(init.input_settings.accessibility);
         apply_debug_log_level(debug.log_level);
         let (clipboard_capture_tx, clipboard_capture_rx) = mpsc::channel();
         let (microphone_detection_tx, microphone_detection_rx) = mpsc::channel();
@@ -8880,9 +9841,19 @@ impl DesktopState {
                 snapshot
                     .workspaces
                     .iter()
-                    .filter(|name| !name.trim().is_empty())
                     .take(32)
-                    .cloned()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        let name = name.trim();
+                        // Session state predates typed workspace metadata and
+                        // has, in the wild, contained a wallpaper path in this
+                        // field. A workspace title is never an absolute path.
+                        if name.is_empty() || name.starts_with('/') {
+                            format!("Workspace {}", index + 1)
+                        } else {
+                            name.chars().take(64).collect()
+                        }
+                    })
                     .collect::<Vec<_>>()
             })
             .filter(|names| !names.is_empty())
@@ -9039,7 +10010,15 @@ impl DesktopState {
             keybinds: init.keybinds,
             client_wayland_display: init.client_wayland_display,
             apps: init.apps,
+            animations_enabled: init.animations_enabled,
+            input_settings: init.input_settings,
+            keyboard_accessibility,
+            accessibility_settings: init.accessibility_settings,
+            magnifier_views: HashMap::new(),
+            libinput_devices: HashMap::new(),
             workspaces: init.workspaces,
+            workspace_swipe: None,
+            workspace_transitions: HashMap::new(),
             privacy: init.privacy,
             power: init.power,
             debug: debug.clone(),
@@ -9060,6 +10039,9 @@ impl DesktopState {
             cursor_owner_output: None,
             screenshot_requested: None,
             screenshot_all_requested: false,
+            screenshot_selection: None,
+            screenshot_selection_dragging: false,
+            screenshot_crop: None,
             screenshot_seq: 0,
             theme: init.theme_manager,
             surface_colors: HashMap::new(),
@@ -9074,7 +10056,8 @@ impl DesktopState {
             wp_color_surface_outputs: HashMap::new(),
             damage_debug_enabled: debug_damage_enabled(&debug),
             damage_source_counts: DamageSourceCounts::default(),
-            damage_last_logged_surface_commit: 0,
+            damage_last_logged_surface_commit: HashMap::new(),
+            damage_last_logged_frame: HashMap::new(),
             sidebar_pulse: None,
             topbar_pulse: None,
             clock_pulse: None,
@@ -9086,8 +10069,10 @@ impl DesktopState {
             next_dialog_id: 1,
             pending_ui_actions: Vec::new(),
             pending_egui_ops: Vec::new(),
+            pending_vui_quick_settings: None,
             pending_sidebar_dialogs: HashMap::new(),
             pending_app_launches: Vec::new(),
+            ready_shell_clients: HashSet::new(),
             pending_window_maps: Vec::new(),
             pending_focus_window: None,
             next_launch_trace_id: 1,
@@ -9095,9 +10080,12 @@ impl DesktopState {
         };
 
         state.apply_power_settings();
+        state.apply_workspace_name_overrides();
+        state.refresh_magnifier_targets();
         if let Some(snapshot) = restore_snapshot {
             state.queue_session_restore_launches(&snapshot);
         }
+        state.queue_startup_apps();
         state
     }
 
@@ -9105,6 +10093,21 @@ impl DesktopState {
         let id = self.next_window_id.0;
         self.next_window_id = WindowId(id.checked_add(1).expect("window id counter overflowed"));
         WindowId(id)
+    }
+
+    pub fn trusted_shell_ready_for_connector(&self, connector: &str) -> bool {
+        [
+            crate::core::wayland::trusted_shell::PANEL_NAMESPACE,
+            crate::core::wayland::trusted_shell::DOCK_NAMESPACE,
+        ]
+        .into_iter()
+        .all(|namespace| {
+            self.ready_shell_clients
+                .contains(&(namespace.to_owned(), connector.to_owned()))
+                || self
+                    .ready_shell_clients
+                    .contains(&(namespace.to_owned(), "*".to_owned()))
+        })
     }
 
     pub fn add_xdg_toplevel(&mut self, surface: ToplevelSurface) -> WindowId {
@@ -9132,7 +10135,8 @@ impl DesktopState {
         //self.space.map_element(window.clone(), (100, 100), false);
         //dbg_flush(&format!("after map space={}", self.space.elements().count()));
 
-        let managed = ManagedWindow::new_wayland(id, window.clone(), meta, workspace);
+        let mut managed = ManagedWindow::new_wayland(id, window.clone(), meta, workspace);
+        managed.set_output(Some(self.normal_output_for_windows()));
         self.windows.push(managed);
         trace!(
             target: "focaldesk",
@@ -9194,7 +10198,9 @@ impl DesktopState {
         )
         .entered();
         let window = Window::new_x11_window(surface.clone());
-        let workspace = self.focused_workspace();
+        let workspace = self
+            .xwayland_workspace_for_surface(&surface, None)
+            .unwrap_or_else(|| self.focused_workspace());
         let meta = XwaylandWindowMeta::from_surface(&surface)
             .with_override_redirect(override_redirect)
             .with_role(XwaylandSurfaceRole::from_surface(&surface));
@@ -9209,6 +10215,44 @@ impl DesktopState {
             "xwayland window added"
         );
         id
+    }
+
+    #[cfg(feature = "xwayland")]
+    fn xwayland_workspace_for_surface(
+        &self,
+        surface: &smithay::xwayland::X11Surface,
+        exclude: Option<WindowId>,
+    ) -> Option<WorkspaceId> {
+        if let Some(parent_xid) = surface.is_transient_for() {
+            if let Some(parent) = self.windows.iter().find(|managed| {
+                Some(managed.id) != exclude
+                    && managed
+                        .window
+                        .x11_surface()
+                        .is_some_and(|x11| x11.window_id() == parent_xid)
+            }) {
+                return Some(parent.workspace);
+            }
+        }
+
+        let pid = surface.pid().or_else(|| surface.get_client_pid().ok());
+        // Some X11 clients omit WM_TRANSIENT_FOR but use one process for the
+        // main window and its dialogs. Keep those windows together as well,
+        // including when the user has since moved the main window.
+        let process_workspace = pid.and_then(|pid| {
+            self.windows.iter().find_map(|managed| {
+                (Some(managed.id) != exclude
+                    && managed.window.x11_surface().and_then(|x11| x11.pid()) == Some(pid))
+                .then_some(managed.workspace)
+            })
+        });
+        if process_workspace.is_some() {
+            return process_workspace;
+        }
+
+        pid.and_then(workspace_from_process_env)
+            .filter(|workspace| *workspace as usize <= self.workspace_names.len())
+            .map(WorkspaceId)
     }
 
     #[cfg(feature = "xwayland")]
@@ -9265,6 +10309,11 @@ impl DesktopState {
         .entered();
 
         self.sync_xwayland_window_meta(&surface);
+        if let Some(workspace) = self.xwayland_workspace_for_surface(&surface, Some(id)) {
+            if let Some(window) = self.window_mut(id) {
+                window.set_workspace(workspace);
+            }
+        }
         let role = XwaylandSurfaceRole::from_surface(&surface);
         let min_size = surface.min_size().map(|size| (size.w, size.h));
         let max_size = surface.max_size().map(|size| (size.w, size.h));
@@ -9300,6 +10349,9 @@ impl DesktopState {
         let restored = restore_unresolved
             && !x11_class.trim().is_empty()
             && self.try_restore_window(id, SavedProtocol::Xwayland, &x11_class);
+        let rule = (!restored && !surface.is_override_redirect())
+            .then(|| self.apply_window_rule(id, Some(&x11_class), &surface.title()))
+            .flatten();
 
         if !surface.is_override_redirect() {
             let _ = surface.set_mapped(true);
@@ -9326,13 +10378,14 @@ impl DesktopState {
         let requested_geometry = surface.geometry();
         let output_id = self
             .window_id_for_x11_surface(&surface)
-            .map(|window_id| self.xwayland_output_id_for_window(window_id))
+            .and_then(|window_id| self.window(window_id).and_then(|window| window.output))
             .unwrap_or_else(|| {
-                self.output_under_pointer(self.input.pointer_pos)
+                self.output_under_pointer(self.input.pointer_pos.into())
                     .unwrap_or(self.primary_output)
             });
 
         let should_float = self.windows[idx].floating;
+        let rule_maximize = rule.and_then(|rule| rule.maximize);
         let restored_maximized = restored && self.windows[idx].maximized;
         let restored_fullscreen = restored && self.windows[idx].fullscreen;
         let restored_rect = restored
@@ -9342,9 +10395,12 @@ impl DesktopState {
             self.xwayland_request_fills_output(output_id, requested_geometry.size);
         let (bbox_location, configure_size, maximize_on_map) = if restored_fullscreen {
             let geometry = self
-                .outputs
-                .get(&output_id)
-                .and_then(|output| self.space.output_geometry(&output.handle))
+                .work_recess_for_output(output_id)
+                .or_else(|| {
+                    self.outputs
+                        .get(&output_id)
+                        .and_then(|output| self.space.output_geometry(&output.handle))
+                })
                 .unwrap_or(requested_geometry);
             (geometry.loc, geometry.size, false)
         } else if restored_maximized {
@@ -9367,7 +10423,7 @@ impl DesktopState {
             let geometry = Rectangle::from_loc_and_size(location, requested_geometry.size);
             let geometry = self.xwayland_clamp_to_output_geometry(output_id, geometry);
             (geometry.loc, geometry.size, false)
-        } else if requested_fills_output {
+        } else if requested_fills_output && rule_maximize != Some(false) {
             // Wine implements borderless "Fullscreen (Windowed)" with a normal
             // X11 toplevel whose initial geometry fills the monitor. Honor that
             // current request ahead of stale session geometry; otherwise every
@@ -9379,7 +10435,7 @@ impl DesktopState {
             (geometry.loc, geometry.size, true)
         } else if let Some(geometry) = restored_rect {
             (geometry.loc, geometry.size, false)
-        } else if self.workspaces.maximize_on_launch {
+        } else if rule_maximize.unwrap_or(self.workspaces.maximize_on_launch) {
             let work = self
                 .work_recess_for_output(output_id)
                 .unwrap_or(requested_geometry);
@@ -9478,6 +10534,27 @@ impl DesktopState {
                 SidebarDialogKind::DeleteWorkspace => {
                     if matches!(action, DialogAction::Confirm) {
                         self.delete_focused_workspace();
+                    }
+                }
+                SidebarDialogKind::ToggleStickyKeys => {
+                    if matches!(action, DialogAction::Confirm) {
+                        let enabled = !self.input_settings.accessibility.sticky_keys;
+                        let mut settings = load_settings();
+                        settings.input.accessibility.sticky_keys = enabled;
+                        if let Err(error) = save_settings(&settings) {
+                            flog_warn!("could not save Sticky Keys setting: {error}");
+                        } else {
+                            self.reload_settings_from_disk();
+                            notification_service_notify(
+                                "Keyboard accessibility",
+                                if enabled {
+                                    "Sticky Keys enabled"
+                                } else {
+                                    "Sticky Keys disabled"
+                                },
+                                Some(Duration::from_secs(3)),
+                            );
+                        }
                     }
                 }
             }
@@ -9690,7 +10767,7 @@ impl DesktopState {
         let mut mapped_window = false;
         if let Some(idx) = to_map.filter(|idx| !self.windows[*idx].minimized) {
             let output_id = self
-                .output_under_pointer(self.input.pointer_pos)
+                .output_under_pointer(self.input.pointer_pos.into())
                 .unwrap_or(self.primary_output);
 
             let map_loc = self.windows[idx]
@@ -9800,6 +10877,31 @@ impl DesktopState {
         let Ok(root) = find_popup_root_surface(&popup_kind) else {
             return;
         };
+        if let Some(layer) = self
+            .space
+            .layer_for_surface(&root, WindowSurfaceType::TOPLEVEL)
+        {
+            for output in self.space.outputs() {
+                let map = smithay::desktop::layer_map_for_output(output);
+                let Some(geometry) = map.layer_geometry(&layer) else {
+                    continue;
+                };
+                let Some(output_geometry) = self.space.output_geometry(output) else {
+                    continue;
+                };
+                // LayerMap geometry is output-local; xdg positioners use the
+                // parent surface's coordinates, including on non-origin outputs.
+                let bounds = Rectangle::from_loc_and_size(
+                    (-geometry.loc.x, -geometry.loc.y),
+                    output_geometry.size,
+                );
+                popup.with_pending_state(|state| {
+                    state.geometry = state.positioner.get_unconstrained_geometry(bounds);
+                });
+                return;
+            }
+            return;
+        }
         let Some(window) = self.window_for_wl_surface(&root) else {
             return;
         };
@@ -9973,6 +11075,8 @@ impl DesktopState {
                 );
             }
 
+            KeyAction::TakeScreenshotSelection => self.request_screenshot_selection(),
+
             KeyAction::LaunchBrowser => {
                 let launch_trace_id = self.launch_app(self.apps.browser.clone());
                 flog_info!(
@@ -10005,6 +11109,10 @@ impl DesktopState {
                 self.mark_all_outputs_full_damage(DamageSource::Unknown);
                 toggle_voice_capture(self.voice_capture_status_tx.clone());
             }
+            KeyAction::MagnifierZoomIn => self.adjust_magnifier_zoom(1),
+            KeyAction::MagnifierZoomOut => self.adjust_magnifier_zoom(-1),
+            KeyAction::ToggleNightLight => self.toggle_night_light(),
+            KeyAction::CycleColorFilter => self.cycle_color_filter(),
             KeyAction::SplitLeft => self.split_focused_window(SplitDirection::Left),
             KeyAction::SplitRight => self.split_focused_window(SplitDirection::Right),
             KeyAction::SplitTop => self.split_focused_window(SplitDirection::Top),
@@ -10167,6 +11275,34 @@ impl DesktopState {
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
     }
 
+    /// Move a window from the workspace overview without changing the active
+    /// workspace. Split groups remain together so their shared layout stays
+    /// valid on the destination workspace.
+    fn move_window_to_workspace(&mut self, window_id: WindowId, workspace: WorkspaceId) {
+        if workspace.0 == 0 || workspace.0 as usize > self.workspace_names.len() {
+            return;
+        }
+        let Some(window) = self.window(window_id) else {
+            return;
+        };
+        if !window.mapped || window.workspace == workspace {
+            return;
+        }
+        let output = window.output.unwrap_or(self.focused_output);
+        let window_ids = if window.tile_rect.is_some() {
+            self.split_group_window_ids(output, window.workspace)
+        } else {
+            vec![window_id]
+        };
+        for id in window_ids {
+            if let Some(window) = self.window_mut(id) {
+                window.set_workspace(workspace);
+                window.set_output(Some(output));
+            }
+        }
+        self.mark_all_outputs_full_damage(DamageSource::Unknown);
+    }
+
     fn update_focus(&mut self) {}
 
     pub fn launch_terminal(&mut self) {
@@ -10222,180 +11358,140 @@ impl DesktopState {
         let launch_trace_id = self.next_launch_trace_id;
         self.next_launch_trace_id = self.next_launch_trace_id.saturating_add(1);
         flog_info!("queue launch trace_id={} app={}", launch_trace_id, app);
+        let workspace = self.focused_workspace();
         self.pending_app_launches
-            .push((launch_trace_id, app, args, source));
+            .push((launch_trace_id, app, args, source, workspace));
         launch_trace_id
     }
 
-    pub fn handle_key_event(&mut self, keycode: u32, state: FlowKeyState) {
-        use smithay::backend::input::KeyState as SmithayKeyState;
-        use smithay::input::keyboard::ModifiersState;
-
-        let smithay_state = match state {
-            FlowKeyState::Pressed => SmithayKeyState::Pressed,
-            FlowKeyState::Released => SmithayKeyState::Released,
-        };
-
-        let serial = SERIAL_COUNTER.next_serial();
-        let time = 0;
-
-        let Some(keyboard) = self.seat.get_keyboard() else {
+    pub fn handle_key_event(&mut self, keycode: u32, state: KeyState) {
+        let Some(prepared) = self.prepare_key_event(keycode, state) else {
             flog_info!("no keyboard on seat");
             return;
         };
 
-        let keybinds = self.keybinds.clone();
-        let mut resolved_action = None;
+        self.dispatch_prepared_key_event(prepared);
+    }
 
-        keyboard.input(
-            self,
-            keycode.into(),
+    fn dispatch_prepared_key_event(&mut self, prepared: input::PreparedKeyEvent) {
+        let input::PreparedKeyEvent {
+            keycode,
+            state,
             smithay_state,
             serial,
             time,
-            |ds, mods: &ModifiersState, handle| {
-                let sym = handle.modified_sym().raw();
+            modifiers_changed,
+            symbol: sym,
+            modifiers,
+        } = prepared;
 
-                ds.input.modifiers = FlowModifiers {
-                    shift: mods.shift,
-                    ctrl: mods.ctrl,
-                    alt: mods.alt,
-                    super_key: mods.logo,
-                };
+        let keybinds = self.keybinds.clone();
+        flog(format!(
+            "KEY DEBUG: keycode={} sym={} state={:?} modifiers={:?}",
+            keycode, sym, state, modifiers.input
+        ));
 
-                let mut mask = ModMask::empty();
-                if mods.shift {
-                    mask |= ModMask::SHIFT;
-                }
-                if mods.ctrl {
-                    mask |= ModMask::CTRL;
-                }
-                if mods.alt {
-                    mask |= ModMask::ALT;
-                }
-                if mods.logo {
-                    mask |= ModMask::SUPER;
-                }
-
-                flog(format!(
-                    "KEY DEBUG: keycode={} sym={} state={:?} mods={:?}",
-                    keycode, sym, state, mods
-                ));
-
-                // Modal dialogs: keyboard still updates XKB via `keyboard.input`, but compositor
-                // shortcuts stay disabled and Wayland clients do not receive these events.
-                if let Some(did) = ds.active_dialog {
-                    if let Some(dialog) = ds.dialogs.iter().find(|d| d.id == did) {
-                        match smithay_state {
-                            SmithayKeyState::Pressed => {
-                                if sym == keysyms::KEY_Escape && dialog.dismissible {
-                                    ds.close_dialog(did);
-                                    return FilterResult::<()>::Intercept(());
-                                }
-                                if sym == keysyms::KEY_Return || sym == keysyms::KEY_KP_Enter {
-                                    let choice = dialog
-                                        .buttons
-                                        .iter()
-                                        .find(|b| matches!(b.action, DialogAction::Confirm))
-                                        .map(|b| b.action)
-                                        .or_else(|| dialog.buttons.first().map(|b| b.action))
-                                        .unwrap_or(DialogAction::Cancel);
-                                    ds.handle_dialog_action(did, choice);
-                                    return FilterResult::<()>::Intercept(());
-                                }
-                                // Other keys don't trigger compositor actions while open.
-                                return FilterResult::<()>::Intercept(());
-                            }
-                            SmithayKeyState::Released => {
-                                return FilterResult::<()>::Intercept(());
-                            }
-                        }
+        // XKB has already been updated by `prepare_key_event`; modal input and
+        // compositor shortcuts can now intercept without applying the key twice.
+        if let Some(did) = self.active_dialog {
+            if let Some(dialog) = self.dialogs.iter().find(|d| d.id == did) {
+                if matches!(state, KeyState::Pressed) {
+                    if sym == keysyms::KEY_Escape && dialog.dismissible {
+                        self.close_dialog(did);
+                        return;
+                    }
+                    if sym == keysyms::KEY_Return || sym == keysyms::KEY_KP_Enter {
+                        let choice = dialog
+                            .buttons
+                            .iter()
+                            .find(|b| matches!(b.action, DialogAction::Confirm))
+                            .map(|b| b.action)
+                            .or_else(|| dialog.buttons.first().map(|b| b.action))
+                            .unwrap_or(DialogAction::Cancel);
+                        self.handle_dialog_action(did, choice);
                     }
                 }
+                return;
+            }
+        }
 
-                // Once shell navigation is entered with Ctrl+Alt+Tab, ordinary Tab navigation and
-                // activation stay in the compositor until Escape or activation exits the mode.
-                // Outside this mode these keys continue to reach the focused client normally.
-                if ds.ui.focused.is_some() {
-                    let navigation_key = matches!(
-                        sym,
-                        keysyms::KEY_Tab
-                            | keysyms::KEY_ISO_Left_Tab
-                            | keysyms::KEY_Return
-                            | keysyms::KEY_KP_Enter
-                            | keysyms::KEY_space
-                            | keysyms::KEY_Escape
+        if self.ui.focused.is_some() {
+            let navigation_key = matches!(
+                sym,
+                keysyms::KEY_Tab
+                    | keysyms::KEY_ISO_Left_Tab
+                    | keysyms::KEY_Return
+                    | keysyms::KEY_KP_Enter
+                    | keysyms::KEY_space
+                    | keysyms::KEY_Escape
+            );
+            if navigation_key {
+                if matches!(state, KeyState::Pressed) {
+                    match sym {
+                        keysyms::KEY_Tab | keysyms::KEY_ISO_Left_Tab => {
+                            if modifiers.input.shift || sym == keysyms::KEY_ISO_Left_Tab {
+                                self.ui.focus_previous();
+                            } else {
+                                self.ui.focus_next();
+                            }
+                        }
+                        keysyms::KEY_Return | keysyms::KEY_KP_Enter | keysyms::KEY_space => {
+                            let action = self.ui.focused_action();
+                            self.ui.clear_focus();
+                            if let Some(action) = action {
+                                self.dispatch_ui_action(action);
+                            }
+                        }
+                        keysyms::KEY_Escape => self.ui.clear_focus(),
+                        _ => {}
+                    }
+                    self.publish_accessibility_tree();
+                    self.mark_focused_output_full_damage(DamageSource::Unknown);
+                }
+                return;
+            }
+        }
+
+        if matches!(state, KeyState::Pressed)
+            && matches!(sym, keysyms::KEY_XF86PowerOff | keysyms::KEY_XF86Sleep)
+        {
+            self.dispatch_power_button_action();
+            return;
+        }
+
+        match input::shortcut_dispatch(
+            &keybinds,
+            KeySymbol::from_raw(sym),
+            modifiers.shortcuts,
+            state,
+        ) {
+            input::ShortcutDispatch::Forward => {
+                if let Some(keyboard) = self.seat.get_keyboard() {
+                    keyboard.input_forward(
+                        self,
+                        keycode.into(),
+                        smithay_state,
+                        serial,
+                        time,
+                        modifiers_changed,
                     );
-                    if navigation_key {
-                        if matches!(smithay_state, SmithayKeyState::Pressed) {
-                            match sym {
-                                keysyms::KEY_Tab | keysyms::KEY_ISO_Left_Tab => {
-                                    if mods.shift || sym == keysyms::KEY_ISO_Left_Tab {
-                                        ds.ui.focus_previous();
-                                    } else {
-                                        ds.ui.focus_next();
-                                    }
-                                }
-                                keysyms::KEY_Return
-                                | keysyms::KEY_KP_Enter
-                                | keysyms::KEY_space => {
-                                    let action = ds.ui.focused_action();
-                                    ds.ui.clear_focus();
-                                    if let Some(action) = action {
-                                        ds.dispatch_ui_action(action);
-                                    }
-                                }
-                                keysyms::KEY_Escape => ds.ui.clear_focus(),
-                                _ => {}
-                            }
-                            ds.publish_accessibility_tree();
-                            ds.mark_focused_output_full_damage(DamageSource::Unknown);
-                        }
-                        return FilterResult::<()>::Intercept(());
-                    }
                 }
-
-                if sym == keysyms::KEY_Print && matches!(state, FlowKeyState::Released) {
-                    if mask.contains(ModMask::SHIFT) {
-                        resolved_action = Some(KeyAction::TakeScreenshotAll);
-                    } else {
-                        resolved_action = Some(KeyAction::TakeScreenshot);
-                    }
-                    return FilterResult::<()>::Intercept(());
-                }
-
-                if matches!(state, FlowKeyState::Pressed)
-                    && matches!(sym, keysyms::KEY_XF86PowerOff | keysyms::KEY_XF86Sleep)
-                {
-                    ds.dispatch_power_button_action();
-                    return FilterResult::<()>::Intercept(());
-                }
-
-                if matches!(state, FlowKeyState::Pressed) {
-                    resolved_action = keybinds.resolve(sym, mask);
-                    if resolved_action.is_some() {
-                        return FilterResult::<()>::Intercept(());
-                    }
-                }
-
-                FilterResult::<()>::Forward
-            },
-        );
-
-        if let Some(action) = resolved_action {
-            flog(format!("ACTION={:?}", action,));
-
-            self.handle_action(action);
+            }
+            input::ShortcutDispatch::Intercept => {}
+            input::ShortcutDispatch::Trigger(action) => {
+                flog(format!("ACTION={action:?}"));
+                self.handle_action(action);
+            }
         }
     }
 
-    fn handle_lock_key_event(&mut self, keycode: u32, state: FlowKeyState) {
+    fn handle_lock_key_event(&mut self, keycode: u32, state: KeyState) {
         use smithay::backend::input::KeyState as SmithayKeyState;
         use smithay::input::keyboard::ModifiersState;
 
         let smithay_state = match state {
-            FlowKeyState::Pressed => SmithayKeyState::Pressed,
-            FlowKeyState::Released => SmithayKeyState::Released,
+            KeyState::Pressed => SmithayKeyState::Pressed,
+            KeyState::Released => SmithayKeyState::Released,
         };
         let serial = SERIAL_COUNTER.next_serial();
         let time = 0;
@@ -10411,12 +11507,7 @@ impl DesktopState {
             serial,
             time,
             |ds, mods: &ModifiersState, handle| {
-                ds.input.modifiers = FlowModifiers {
-                    shift: mods.shift,
-                    ctrl: mods.ctrl,
-                    alt: mods.alt,
-                    super_key: mods.logo,
-                };
+                ds.input.modifiers = input::keyboard_modifiers(mods).input;
 
                 if !matches!(smithay_state, SmithayKeyState::Pressed) {
                     return FilterResult::<()>::Intercept(());
@@ -10486,7 +11577,9 @@ impl DesktopState {
                     // well as a workspace. Hand that association over while the pointer
                     // crosses an output boundary so the dragged window remains visible
                     // throughout the grab instead of disappearing until button release.
-                    let target_output = self.output_under_pointer(pos);
+                    let target_output = self
+                        .output_under_pointer(pos)
+                        .filter(|output| self.output_accepts_windows(*output));
                     let target_workspace = target_output
                         .and_then(|id| self.outputs.get(&id))
                         .map(|output| output.active_workspace);
@@ -10602,11 +11695,11 @@ impl DesktopState {
         false
     }
 
-    fn process_toplevel_pointer_button(&mut self, button: FlowMouseButton, state: FlowKeyState) {
-        if !matches!(button, FlowMouseButton::Left) {
+    fn process_toplevel_pointer_button(&mut self, button: MouseButton, state: KeyState) {
+        if !matches!(button, MouseButton::Left) {
             return;
         }
-        if !matches!(state, FlowKeyState::Released) {
+        if !matches!(state, KeyState::Released) {
             return;
         }
         let snap_preview = self.snap_preview.take();
@@ -10654,7 +11747,9 @@ impl DesktopState {
                 // workspace that output is currently showing; otherwise it keeps the source
                 // workspace number and becomes invisible on every output (including the one
                 // it was dragged from, since it no longer sits within that output's bounds).
-                let target_output = self.output_under_pointer(self.pointer_pos);
+                let target_output = self
+                    .output_under_pointer(self.pointer_pos)
+                    .filter(|output| self.output_accepts_windows(*output));
                 let target_workspace = self.workspace_under_pointer(self.pointer_pos);
                 if let Some(managed) = self.window_mut(window_id) {
                     if target_output.is_some()
@@ -10687,572 +11782,7 @@ impl DesktopState {
         self.mark_focused_output_full_damage(DamageSource::Unknown);
     }
 
-    pub fn handle_input(&mut self, event: FlowInputEvent) {
-        if self.debug.show_input_events {
-            focaldesk_logging::logging::flog(FLogLevel::Debug, format!("input event: {event:?}"));
-        }
-
-        if !self.lock_screen.active
-            && matches!(
-                event,
-                FlowInputEvent::Key { .. }
-                    | FlowInputEvent::PointerMoved { .. }
-                    | FlowInputEvent::PointerButton { .. }
-                    | FlowInputEvent::PointerScroll { .. }
-                    | FlowInputEvent::PointerEntered
-                    | FlowInputEvent::PointerLeft
-            )
-        {
-            self.record_user_activity();
-        }
-
-        if self.lock_screen.active {
-            match event {
-                FlowInputEvent::Key { keycode, state, .. } => {
-                    self.handle_lock_key_event(keycode, state);
-                }
-                FlowInputEvent::PointerMoved { position, .. } => {
-                    self.input.pointer_pos = position;
-                    self.pointer_pos = position;
-                    self.cursor_manager.move_to(position.x, position.y);
-                    self.clear_client_pointer_focus(position);
-                }
-                FlowInputEvent::PointerButton {
-                    button,
-                    state,
-                    position,
-                } => {
-                    self.input.pointer_pos = position;
-                    self.pointer_pos = position;
-                    self.cursor_manager.move_to(position.x, position.y);
-                    self.clear_client_pointer_focus(position);
-                    if matches!(
-                        (button, state),
-                        (FlowMouseButton::Left, FlowKeyState::Pressed)
-                    ) {
-                        self.toggle_lock_password_visibility_at(position);
-                    }
-                }
-                FlowInputEvent::PointerScroll { position, .. } => {
-                    self.input.pointer_pos = position;
-                    self.pointer_pos = position;
-                    self.cursor_manager.move_to(position.x, position.y);
-                    self.clear_client_pointer_focus(position);
-                }
-                FlowInputEvent::PointerEntered => {
-                    self.cursor_manager.set_visible(true);
-                }
-                FlowInputEvent::PointerLeft => {
-                    self.cursor_manager.set_visible(false);
-                }
-                FlowInputEvent::Resized {
-                    output_id,
-                    width,
-                    height,
-                    scale_factor,
-                } => {
-                    let size = Size::<i32, Physical>::from((width as i32, height as i32));
-                    self.update_output_size(output_id, size, scale_factor);
-                }
-                FlowInputEvent::CloseRequested => {
-                    self.running = false;
-                }
-            }
-
-            self.pending_compositor_move = None;
-            self.pending_xdg_move = None;
-            self.toplevel_pointer = None;
-            self.split_divider_drag = None;
-            self.input.pointer_left_down = false;
-            self.mark_all_outputs_full_damage(DamageSource::Unknown);
-            return;
-        }
-
-        match event {
-            FlowInputEvent::Key { keycode, state, .. } => {
-                if matches!(state, FlowKeyState::Pressed)
-                    && keycode == 1
-                    && self.egui_open_on_output(self.focused_output)
-                {
-                    if let Some(output) = self.desktop_outputs.get_mut(&self.focused_output) {
-                        output.egui.close_all_panels();
-                    }
-                    self.pending_split_assist = None;
-                    self.mark_egui_damage(self.focused_output);
-                    return;
-                }
-                if self.handle_egui_input(&event) {
-                    self.mark_egui_damage(self.focused_output);
-                    return;
-                }
-                // Modal dialogs intercept inside `keyboard.input` (still updates XKB / modifier state).
-                self.handle_key_event(keycode, state);
-                self.mark_focused_output_full_damage(DamageSource::Unknown);
-            }
-
-            FlowInputEvent::PointerMoved {
-                position,
-                delta,
-                delta_unaccel,
-            } => {
-                let previous_pos = self.pointer_pos;
-                let pointer_locked = self.pointer_lock_active_at(previous_pos);
-                let position = self.constrained_pointer_position(previous_pos, position);
-                let position = self.confine_pointer_to_outputs(previous_pos, position);
-                self.input.pointer_pos = position;
-                self.pointer_pos = position;
-                if let Some(id) = self.output_under_pointer(position) {
-                    self.set_focused_output(id);
-                }
-                // Keep the visible cursor in lockstep with the compositor's
-                // logical pointer before an overlay gets a chance to consume
-                // the event. The old ordering returned from the egui branch
-                // first, leaving the KMS/software cursor frozen at the panel
-                // edge while egui received an invisible moving pointer.
-                self.cursor_manager.move_to(position.x, position.y);
-                self.drm_submit_hw_cursor = true;
-                let cursor_owner_damage = self.update_cursor_owner_damage();
-                let stale_cursor_damage = self.clear_stale_software_cursor_damage();
-                if self.egui_open_on_output(self.focused_output) {
-                    let _ = self.handle_egui_input(&event);
-                    if self.egui_wants_pointer_on_output(self.focused_output) {
-                        self.clear_client_pointer_focus(self.pointer_pos);
-                        self.mark_egui_damage(self.focused_output);
-                        return;
-                    }
-                } else if self.handle_egui_input(&event) {
-                    self.clear_client_pointer_focus(self.pointer_pos);
-                    self.mark_egui_damage(self.focused_output);
-                    return;
-                }
-                if self.handle_dialog_input(&event) {
-                    self.clear_client_pointer_focus(self.pointer_pos);
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
-                    return;
-                }
-                if self.input.pointer_left_down {
-                    if let Some(drag) = self.split_divider_drag {
-                        self.resize_split_grid_divider(drag.divider, position);
-                        self.clear_client_pointer_focus(position);
-                        self.update_pointer_cursor(position);
-                        self.mark_output_full_damage(
-                            drag.divider.output,
-                            DamageSource::WindowResize,
-                        );
-                        return;
-                    }
-                }
-                const DRAG_THRESHOLD_SQ: f64 = 5.0 * 5.0;
-                if self.input.pointer_left_down {
-                    if let Some((id, start)) = self.pending_xdg_move {
-                        let d = position - start;
-                        if d.x * d.x + d.y * d.y >= DRAG_THRESHOLD_SQ {
-                            self.pending_xdg_move = None;
-                            self.request_move(id);
-                        }
-                    }
-                    if let Some((id, start)) = self.pending_compositor_move {
-                        let d = position - start;
-                        if d.x * d.x + d.y * d.y >= DRAG_THRESHOLD_SQ {
-                            self.pending_compositor_move = None;
-                            self.try_begin_compositor_move(id);
-                        }
-                    }
-                } else {
-                    self.pending_xdg_move = None;
-                    if matches!(
-                        self.toplevel_pointer,
-                        Some(ToplevelPointerInteraction::Move { .. })
-                    ) {
-                        self.toplevel_pointer = None;
-                        self.forward_pointer_to_clients(self.pointer_pos);
-                    }
-                }
-                let precise_toplevel_damage = self.process_toplevel_pointer_motion(position);
-                let precise_hover_damage = self.update_ui_hover_for_output(self.focused_output);
-                self.update_pointer_cursor(position);
-                if !self.compositor_pointer_grab_active() {
-                    if let (Some(delta), Some(delta_unaccel)) = (delta, delta_unaccel) {
-                        self.forward_pointer_relative_motion(position, delta, delta_unaccel);
-                    }
-                    if pointer_locked {
-                        if let Some(pointer) = self.seat.get_pointer() {
-                            pointer.frame(self);
-                        }
-                    } else {
-                        // Relative motion belongs to the same logical event and
-                        // must precede the wl_pointer frame emitted here.
-                        self.forward_pointer_to_clients(position);
-                        self.activate_pointer_constraint_at(position);
-                    }
-                }
-                let precise_cursor_damage =
-                    self.software_cursor_damage_pending_for_output(self.focused_output);
-                if !precise_toplevel_damage
-                    && !precise_hover_damage
-                    && !precise_cursor_damage
-                    && !stale_cursor_damage
-                    && !cursor_owner_damage
-                {
-                    // A hardware cursor still needs a render/present cycle so KMS can move its
-                    // cursor plane, but the primary plane has not visually changed. Queue the
-                    // smallest possible cursor-classified damage instead of invalidating the
-                    // entire retained wallpaper/chrome base on every pointer motion event.
-                    self.mark_output_damage_source(
-                        self.focused_output,
-                        Rectangle::from_loc_and_size((0, 0), (1, 1)),
-                        DamageSource::Cursor,
-                    );
-                }
-            }
-
-            FlowInputEvent::PointerButton {
-                button,
-                state,
-                position,
-                ..
-            } => {
-                if matches!(state, FlowKeyState::Pressed) && self.ui.focused.is_some() {
-                    self.ui.clear_focus();
-                    self.publish_accessibility_tree();
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
-                }
-                self.input.pointer_pos = position;
-                self.pointer_pos = position;
-
-                if let Some(id) = self.output_under_pointer(position) {
-                    self.set_focused_output(id);
-                }
-                // Rendering rebuilds the compositor's single UiTree once per
-                // output. Resolve this click against the output that actually
-                // received it, not whichever output happened to render last.
-                self.rebuild_ui_tree_for_output(self.focused_output);
-                let cursor_owner_damage = self.update_cursor_owner_damage();
-                let stale_cursor_damage = self.clear_stale_software_cursor_damage();
-
-                if self.egui_open_on_output(self.focused_output) {
-                    let _ = self.handle_egui_input(&event);
-                } else if self.handle_egui_input(&event) {
-                    self.clear_client_pointer_focus(self.pointer_pos);
-                    self.mark_egui_damage(self.focused_output);
-                    return;
-                }
-
-                if self.handle_dialog_input(&event) {
-                    self.clear_client_pointer_focus(self.pointer_pos);
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
-                    return;
-                }
-
-                if matches!(button, FlowMouseButton::Right)
-                    && matches!(state, FlowKeyState::Pressed)
-                {
-                    if let Some(divider) = self.split_divider_at(position) {
-                        if !self.focused_window.is_some_and(|id| {
-                            divider.before.contains(&Some(id)) || divider.after.contains(&Some(id))
-                        }) {
-                            if let Some(id) = divider
-                                .before
-                                .into_iter()
-                                .chain(divider.after)
-                                .flatten()
-                                .next()
-                            {
-                                self.focus_window_id(id);
-                            }
-                        }
-                        self.dispatch_ui_action(UiAction::OpenPanel(PanelKind::SplitGroup));
-                        self.clear_client_pointer_focus(position);
-                        self.mark_output_full_damage(divider.output, DamageSource::Egui);
-                        return;
-                    }
-                }
-
-                if matches!(button, FlowMouseButton::Left) {
-                    match state {
-                        FlowKeyState::Pressed => {
-                            if let Some(divider) = self.split_divider_at(position) {
-                                self.input.pointer_left_down = true;
-                                self.record_split_undo(
-                                    divider.before.into_iter().chain(divider.after).flatten(),
-                                );
-                                self.split_divider_drag = Some(SplitDividerDrag { divider });
-                                self.pending_compositor_move = None;
-                                self.pending_xdg_move = None;
-                                self.clear_client_pointer_focus(position);
-                                self.update_pointer_cursor(position);
-                                self.mark_output_full_damage(
-                                    divider.output,
-                                    DamageSource::WindowResize,
-                                );
-                                return;
-                            }
-                        }
-                        FlowKeyState::Released => {
-                            if let Some(drag) = self.split_divider_drag.take() {
-                                if let Some(pair) = self.split_pair_for_output(drag.divider.output)
-                                {
-                                    self.remember_split_ratio(pair);
-                                }
-                                self.input.pointer_left_down = false;
-                                self.clear_client_pointer_focus(position);
-                                self.update_pointer_cursor(position);
-                                self.mark_output_full_damage(
-                                    drag.divider.output,
-                                    DamageSource::WindowResize,
-                                );
-                                return;
-                            }
-                        }
-                    }
-                }
-
-                if matches!(button, FlowMouseButton::Left)
-                    && matches!(state, FlowKeyState::Released)
-                    && self.suppress_next_left_release
-                {
-                    self.suppress_next_left_release = false;
-                    self.input.pointer_left_down = false;
-                    self.pending_compositor_move = None;
-                    self.pending_xdg_move = None;
-                    self.update_pointer_cursor(position);
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
-                    return;
-                }
-
-                if matches!(button, FlowMouseButton::Left)
-                    && self.peek_ui_action_at_pointer().is_some()
-                {
-                    let mut damaged_precisely = false;
-                    match state {
-                        FlowKeyState::Pressed => {
-                            self.input.pointer_left_down = true;
-                            let pressed_element = self
-                                .ui_element_at_pointer_for_output(self.focused_output)
-                                .map(|el| (el.id, el.kind));
-                            self.ui.pressed = pressed_element.map(|(id, _)| id);
-                            self.clear_client_pointer_focus(position);
-                            damaged_precisely = match pressed_element {
-                                Some((_, UiElementKind::SidebarButton)) => {
-                                    self.trigger_sidebar_pulse_at_pointer(self.focused_output)
-                                }
-                                Some((
-                                    _,
-                                    UiElementKind::TopbarIndicator | UiElementKind::TopbarButton,
-                                )) => self.trigger_topbar_pulse_at_pointer(self.focused_output),
-                                Some((_, UiElementKind::Clock)) => {
-                                    self.trigger_clock_pulse_at_pointer(self.focused_output)
-                                }
-                                _ => false,
-                            };
-                        }
-                        FlowKeyState::Released => {
-                            self.input.pointer_left_down = false;
-                            if let Some(pressed_id) = self.ui.pressed.take() {
-                                let clicked = self
-                                    .ui_element_at_pointer_for_output(self.focused_output)
-                                    .is_some_and(|el| el.id == pressed_id && el.enabled);
-                                if clicked && self.click_ui_at_pointer() {
-                                    self.mark_focused_output_full_damage(DamageSource::Unknown);
-                                }
-                            }
-                            self.pending_compositor_move = None;
-                        }
-                    }
-                    self.update_pointer_cursor(position);
-                    if !damaged_precisely
-                        && !matches!(state, FlowKeyState::Released)
-                        && self.sidebar_pulse.is_none()
-                        && self.topbar_pulse.is_none()
-                        && self.clock_pulse.is_none()
-                    {
-                        self.mark_focused_output_full_damage(DamageSource::Unknown);
-                    }
-                    return;
-                }
-
-                if matches!(button, FlowMouseButton::Left)
-                    && matches!(state, FlowKeyState::Released)
-                    && self.ui.pressed.is_some()
-                {
-                    self.input.pointer_left_down = false;
-                    self.ui.pressed = None;
-                    self.pending_compositor_move = None;
-                    self.clear_client_pointer_focus(position);
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
-                    return;
-                }
-
-                if self.egui_open_on_output(self.focused_output)
-                    && matches!(button, FlowMouseButton::Left)
-                    && matches!(state, FlowKeyState::Pressed | FlowKeyState::Released)
-                {
-                    self.process_egui_actions();
-                    if matches!(state, FlowKeyState::Released)
-                        && self.egui_wants_pointer_on_output(self.focused_output)
-                    {
-                        self.clear_client_pointer_focus(self.pointer_pos);
-                        self.mark_egui_damage(self.focused_output);
-                        return;
-                    }
-                }
-
-                if matches!(button, FlowMouseButton::Left) {
-                    match state {
-                        FlowKeyState::Pressed => {
-                            self.input.pointer_left_down = true;
-                        }
-                        FlowKeyState::Released => {
-                            self.input.pointer_left_down = false;
-                            self.pending_compositor_move = None;
-                            self.pending_xdg_move = None;
-                        }
-                    }
-                }
-
-                if let Some(id) = self.output_under_pointer(position) {
-                    self.set_focused_output(id);
-                }
-                self.cursor_manager.move_to(position.x, position.y);
-                let precise_toplevel_damage = self.process_toplevel_pointer_motion(position);
-                let precise_hover_damage = self.update_ui_hover_for_output(self.focused_output);
-                if matches!(state, FlowKeyState::Pressed) {
-                    if matches!(button, FlowMouseButton::Left)
-                        && self.pointer_on_chrome_host_drag_region(position)
-                    {
-                        self.host_window_drag_requested = true;
-                        self.pending_compositor_move = None;
-                    } else if matches!(button, FlowMouseButton::Left)
-                        && self.handle_xwayland_titlebar_press(position)
-                    {
-                        self.clear_client_pointer_focus(position);
-                        self.update_pointer_cursor(position);
-                        self.mark_focused_output_full_damage(DamageSource::Unknown);
-                        return;
-                    } else {
-                        self.focus_window_at(position);
-                        if matches!(button, FlowMouseButton::Left)
-                            && self.pointer_in_work_recess(position)
-                        {
-                            if let Some((id, edges)) = self.top_window_resize_edge_at(position) {
-                                self.pending_compositor_move = None;
-                                if let Ok(edge) = ResizeEdge::try_from(edges) {
-                                    self.try_begin_compositor_resize(id, edge);
-                                }
-                            }
-                        }
-                    }
-                }
-                if self.compositor_pointer_grab_active() {
-                    if matches!(button, FlowMouseButton::Left)
-                        && matches!(state, FlowKeyState::Released)
-                    {
-                        self.process_toplevel_pointer_button(button, state);
-                        self.forward_pointer_button(position, button, state);
-                    }
-                } else {
-                    self.forward_pointer_to_clients(position);
-                    self.forward_pointer_button(position, button, state);
-                    self.process_toplevel_pointer_button(button, state);
-                }
-                self.update_pointer_cursor(position);
-                let precise_cursor_damage =
-                    self.software_cursor_damage_pending_for_output(self.focused_output);
-                if !precise_toplevel_damage
-                    && !precise_hover_damage
-                    && !precise_cursor_damage
-                    && !stale_cursor_damage
-                    && !cursor_owner_damage
-                {
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
-                }
-            }
-
-            FlowInputEvent::PointerScroll {
-                position, delta, ..
-            } => {
-                self.input.pointer_pos = position;
-                self.pointer_pos = position;
-                if let Some(id) = self.output_under_pointer(position) {
-                    self.set_focused_output(id);
-                }
-                self.update_cursor_owner_damage();
-                self.clear_stale_software_cursor_damage();
-                if self.egui_open_on_output(self.focused_output) {
-                    let _ = self.handle_egui_input(&event);
-                    if self.egui_wants_pointer_on_output(self.focused_output) {
-                        self.clear_client_pointer_focus(self.pointer_pos);
-                        self.mark_egui_damage(self.focused_output);
-                        return;
-                    }
-                } else if self.handle_egui_input(&event) {
-                    self.clear_client_pointer_focus(self.pointer_pos);
-                    self.mark_egui_damage(self.focused_output);
-                    return;
-                }
-                if self.handle_dialog_input(&event) {
-                    self.clear_client_pointer_focus(self.pointer_pos);
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
-                    return;
-                }
-                self.cursor_manager.move_to(position.x, position.y);
-                if !self.compositor_pointer_grab_active() {
-                    self.forward_pointer_to_clients(position);
-                    self.forward_pointer_scroll(delta);
-                }
-                if self.egui_open_on_output(self.focused_output) {
-                    self.mark_egui_damage(self.focused_output);
-                } else {
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
-                }
-            }
-
-            FlowInputEvent::PointerEntered => {
-                self.cursor_manager.set_visible(true);
-                self.update_cursor_owner_damage();
-                self.mark_focused_output_full_damage(DamageSource::Cursor);
-            }
-
-            FlowInputEvent::PointerLeft => {
-                let _ = self.handle_egui_input(&event);
-                self.process_toplevel_pointer_button(FlowMouseButton::Left, FlowKeyState::Released);
-                self.input.pointer_left_down = false;
-                self.pending_compositor_move = None;
-                self.pending_xdg_move = None;
-                self.split_divider_drag = None;
-                self.cursor_manager.set_visible(false);
-                self.update_cursor_owner_damage();
-                self.clear_all_software_cursor_damage();
-                self.mark_focused_output_full_damage(DamageSource::Cursor);
-            }
-
-            FlowInputEvent::Resized {
-                output_id,
-                width,
-                height,
-                scale_factor,
-            } => {
-                //let id = OutputId(1);
-                let size = Size::<i32, Physical>::from((width as i32, height as i32));
-                self.update_output_size(output_id, size, scale_factor);
-
-                // if let Some(output) = self.outputs.get_mut(&id) {
-                //     output.scale_factor = scale_factor;
-                //     output.scale = Scale::from((scale_factor, scale_factor));
-                //     output.physical_size = size;
-                //     let logical_w = (size.w as f64 / scale_factor).round() as i32;
-                //     let logical_h = (size.h as f64 / scale_factor).round() as i32;
-                //     output.logical_size = Size::<i32, Logical>::from((logical_w, logical_h));
-                // }
-            }
-
-            FlowInputEvent::CloseRequested => {
-                self.running = false;
-            }
-        }
-    }
-
-    fn handle_dialog_input(&mut self, event: &FlowInputEvent) -> bool {
+    fn handle_dialog_input(&mut self, event: &InputEvent) -> bool {
         let Some(dialog_id) = self.active_dialog else {
             return false;
         };
@@ -11269,8 +11799,8 @@ impl DesktopState {
         let layout = layout_dialog(dialog, screen);
 
         match event {
-            FlowInputEvent::PointerButton { state, .. } => {
-                if !matches!(state, FlowKeyState::Pressed) {
+            InputEvent::PointerButton { state, .. } => {
+                if !matches!(state, KeyState::Pressed) {
                     return true;
                 }
 
@@ -11300,11 +11830,11 @@ impl DesktopState {
                 true
             }
 
-            FlowInputEvent::PointerMoved { .. } => true,
+            InputEvent::PointerMoved { .. } => true,
 
-            FlowInputEvent::PointerScroll { .. } => true,
+            InputEvent::PointerScroll { .. } => true,
 
-            FlowInputEvent::Key { .. } => false,
+            InputEvent::Key { .. } => false,
 
             _ => false,
         }
@@ -11384,6 +11914,7 @@ impl DesktopState {
         }
         if let Some(old_work) = old_work {
             self.reflow_split_windows_for_output(output_id, old_work);
+            self.reflow_constrained_windows_for_output(output_id);
         }
         if let Some(work) = self.work_recess_for_output(output_id) {
             self.split_work_areas.insert(output_id, work);
@@ -11410,6 +11941,7 @@ impl DesktopState {
             || self.split_resize_hud.is_some_and(|hud| {
                 now.saturating_duration_since(hud.started_at) < SPLIT_RESIZE_HUD_DURATION
             })
+            || !self.workspace_transitions.is_empty()
             || self.lock_screen.active
     }
 
@@ -11425,6 +11957,7 @@ impl DesktopState {
             || self
                 .split_resize_percent_for_output(output_id, now)
                 .is_some()
+            || self.workspace_transitions.contains_key(&output_id)
             || self.lock_screen.active
     }
 
@@ -11571,6 +12104,7 @@ impl DesktopState {
         post_area_percent: i64,
         full_damage: bool,
         redraw_all: bool,
+        regions: &[Rectangle<i32, Physical>],
     ) {
         if !self.damage_debug_enabled {
             return;
@@ -11578,13 +12112,31 @@ impl DesktopState {
 
         let c = self.damage_source_counts;
         let surface = self.surface_damage_metrics;
-        let surface_changed = surface.tree_commits != self.damage_last_logged_surface_commit;
-        if !surface_changed && !self.render.frame_no.is_multiple_of(120) {
+        let last_logged_commit = self
+            .damage_last_logged_surface_commit
+            .get(&output_id)
+            .copied()
+            .unwrap_or_default();
+        let surface_changed = surface.tree_commits != last_logged_commit;
+        let last_logged_frame = self.damage_last_logged_frame.get(&output_id).copied();
+        let movement_active = c.window_move > 0 || c.window_resize > 0;
+        let movement_sample_due = movement_active
+            && last_logged_frame.is_none_or(|last| self.render.frame_no.saturating_sub(last) >= 12);
+        if !surface_changed && !movement_sample_due && !self.render.frame_no.is_multiple_of(120) {
             return;
         }
-        self.damage_last_logged_surface_commit = surface.tree_commits;
+        self.damage_last_logged_surface_commit
+            .insert(output_id, surface.tree_commits);
+        self.damage_last_logged_frame
+            .insert(output_id, self.render.frame_no);
+        let regions_truncated = regions.len() > 16;
+        let regions = regions
+            .iter()
+            .take(16)
+            .map(|rect| [rect.loc.x, rect.loc.y, rect.size.w, rect.size.h])
+            .collect::<Vec<_>>();
         flog(format!(
-            "damage output={:?} frame={} rects={}->{} area={}%%->{}%% full={} redraw_all={} src(move={}, resize={}, cursor={}, egui={}, shader={}, hover={}, commit={}, full_fallback={}, unknown={}) surface(trees={}, precise={}, unchanged={}, callback_only={}, fallback={}, rects={}, destroyed={})",
+            "damage output={:?} frame={} rects={}->{} area={}%%->{}%% full={} redraw_all={} regions={:?}{} src(move={}, resize={}, cursor={}, egui={}, shader={}, hover={}, commit={}, full_fallback={}, unknown={}) surface(trees={}, precise={}, unchanged={}, callback_only={}, fallback={}, rects={}, destroyed={})",
             output_id,
             self.render.frame_no,
             pre_rects,
@@ -11593,6 +12145,8 @@ impl DesktopState {
             post_area_percent,
             full_damage,
             redraw_all,
+            regions,
+            if regions_truncated { " (first 16)" } else { "" },
             c.window_move,
             c.window_resize,
             c.cursor,
@@ -11692,6 +12246,7 @@ impl DesktopState {
                     logical_origin: Point::<i32, Logical>::from((0, 0)),
                     scale_factor: scale,
                     scale: Scale::from((scale, scale)),
+                    role: OutputRole::Normal,
                     hdr_supported: false,
                     hdr_requested: false,
                     hdr_kms_applied: false,
@@ -11734,7 +12289,7 @@ impl DesktopState {
         self.restore_registered_output(id);
 
         self.cursor_manager
-            .set_base_size_and_scale(24, scale as f32);
+            .set_base_size_and_scale(self.cursor_base_size(), scale as f32);
         self.refresh_all_fractional_scales();
     }
 
@@ -11748,6 +12303,8 @@ impl DesktopState {
 
     pub fn tick_layout(&mut self) {
         self.popups.cleanup();
+        self.tick_keyboard_accessibility();
+        self.tick_magnifier();
         self.refresh_ai_flow_mode();
         self.reconcile_split_work_areas();
     }
@@ -13289,6 +13846,9 @@ impl DesktopState {
         target: Rectangle<i32, Logical>,
         direction: SplitDirection,
     ) -> bool {
+        if !self.output_accepts_windows(output_id) {
+            return false;
+        }
         if !self.workspaces.split_screen_enabled {
             return false;
         }
@@ -13826,17 +14386,24 @@ impl DesktopState {
             })
             .or(self.windows[idx].output)
             .or_else(|| self.output_under_pointer(self.pointer_pos))
-            .unwrap_or(self.focused_output);
+            .filter(|output| self.output_accepts_windows(*output))
+            .unwrap_or_else(|| self.normal_output_for_windows());
 
         if fullscreen {
             let rect = self
-                .outputs
-                .get(&output_id)
-                .and_then(|output| self.space.output_geometry(&output.handle))
+                .work_recess_for_output(output_id)
                 .or_else(|| {
                     self.outputs
-                        .get(&self.primary_output)
+                        .get(&output_id)
                         .and_then(|output| self.space.output_geometry(&output.handle))
+                })
+                .or_else(|| {
+                    self.work_recess_for_output(self.primary_output)
+                        .or_else(|| {
+                            self.outputs
+                                .get(&self.primary_output)
+                                .and_then(|output| self.space.output_geometry(&output.handle))
+                        })
                 });
 
             let Some(rect) = rect else {
@@ -13941,7 +14508,7 @@ impl DesktopState {
         let output_scale_factor = desk_output.scale_factor;
         let previous_cursor_rect = desk_output.last_sw_cursor_rect;
         self.cursor_manager
-            .set_base_size_and_scale(24, output_scale_factor as f32);
+            .set_base_size_and_scale(self.cursor_base_size(), output_scale_factor as f32);
         self.cursor_manager
             .move_to(self.pointer_pos.x, self.pointer_pos.y);
 
@@ -14211,7 +14778,7 @@ fn notification_service_unread_count() -> Option<usize> {
     }
 }
 
-fn notification_service_notify(
+pub(crate) fn notification_service_notify(
     title: impl Into<String>,
     body: impl Into<String>,
     timeout: Option<Duration>,
@@ -14382,6 +14949,7 @@ fn spawn_app_detached(
     app: String,
     extra_args: Vec<String>,
     source: LaunchSource,
+    workspace: WorkspaceId,
 ) {
     let app_name = app.clone();
     let chrome_like = is_chrome_like(&app_name);
@@ -14444,6 +15012,7 @@ fn spawn_app_detached(
             browser_backend: browser_backend_for_launch(browser_backend),
             hdr_output_active,
             auto_hdr: focal_launch_shared::auto_hdr_app_enabled(&candidate),
+            workspace: Some(workspace.0),
             source,
         };
 
@@ -14592,9 +15161,10 @@ mod tests {
         session_power_command, set_surface_root_membership, should_wait_for_lid_open_on_resume,
         snap_target_for_pointer, split_assist_targets, split_direction_for_rect, split_preset_rect,
         split_rect, split_swap_allowed, surface_buffer_damage_to_logical, surface_color_changed,
-        topbar_pulse_target_at, workspace_for_slot, ClientBufferEncoding, DamageSource, Fourcc,
-        OutputId, PowerActionInteraction, SplitAxis, SplitDirection, TopbarPulseTarget,
-        UnattendedSuspendState, UNATTENDED_SUSPEND_PREPARE_TIMEOUT,
+        topbar_pulse_target_at, workspace_for_slot, workspace_transition_views,
+        ClientBufferEncoding, DamageSource, Fourcc, OutputId, PowerActionInteraction, SplitAxis,
+        SplitDirection, TopbarPulseTarget, UnattendedSuspendState, WorkspaceTransition,
+        WorkspaceTransitionPhase, UNATTENDED_SUSPEND_PREPARE_TIMEOUT,
     };
     use crate::core::color::{ColorDescription, RenderingIntent, SurfaceColorRenderState};
     use focaldesk_ai::AiDaemonStatus;
@@ -14673,6 +15243,29 @@ mod tests {
                 && self.awaiting_connector
                 && self.apply_work_area(work, minimum)
         }
+    }
+
+    #[test]
+    fn workspace_transition_offsets_join_at_the_output_edge() {
+        let transition = WorkspaceTransition {
+            from: WorkspaceId(1),
+            to: WorkspaceId(2),
+            style: focaldesk_settings_core::WorkspaceTransitionStyle::Slide,
+            progress: 0.0,
+            phase: WorkspaceTransitionPhase::Interactive,
+        };
+        let views = workspace_transition_views(transition, 0.25, 1_000);
+        assert_eq!(views[0].offset_x, -250);
+        assert_eq!(views[1].offset_x, 750);
+
+        let reverse = WorkspaceTransition {
+            from: WorkspaceId(2),
+            to: WorkspaceId(1),
+            ..transition
+        };
+        let views = workspace_transition_views(reverse, 0.25, 1_000);
+        assert_eq!(views[0].offset_x, 250);
+        assert_eq!(views[1].offset_x, -750);
     }
 
     #[test]
@@ -15102,6 +15695,7 @@ mod tests {
             default_provider: "test".into(),
             provider_count: 1,
             provider_telemetry: Vec::new(),
+            latest_chat: None,
         };
         assert_eq!(
             ai_flow_mode_from_status(&status),
@@ -15474,7 +16068,7 @@ mod tests {
         let recovered = confine_pointer_to_output_bounds(
             (1100.0, 500.0).into(),
             (1150.0, 500.0).into(),
-            [left, right].into_iter(),
+            [left, right],
         );
 
         assert_eq!(recovered, (1200.0, 500.0).into());

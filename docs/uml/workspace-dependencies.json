@@ -1,0 +1,1484 @@
+{
+  "edges": [
+    {
+      "alias": "keywrap",
+      "from": "focald-secrets",
+      "optional": false,
+      "target": null,
+      "to": "focald-secrets-keywrap"
+    },
+    {
+      "alias": "keywrap",
+      "from": "pam-focald-secrets",
+      "optional": false,
+      "target": null,
+      "to": "focald-secrets-keywrap"
+    },
+    {
+      "alias": null,
+      "from": "focal-launch-shared",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focal-launchd",
+      "optional": false,
+      "target": null,
+      "to": "focal-launch-shared"
+    },
+    {
+      "alias": null,
+      "from": "focal-launchd",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focal-launchd",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-logging"
+    },
+    {
+      "alias": null,
+      "from": "focal-launchd",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-settings-core"
+    },
+    {
+      "alias": null,
+      "from": "focald-connectors",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ai"
+    },
+    {
+      "alias": null,
+      "from": "focald-connectors",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-calendar"
+    },
+    {
+      "alias": null,
+      "from": "focald-connectors",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focald-connectors",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-secrets-client"
+    },
+    {
+      "alias": null,
+      "from": "focald-mic",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focald-mic",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-voice"
+    },
+    {
+      "alias": null,
+      "from": "focald-speech",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focald-voice",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focald-voice",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-settings-core"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ai",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ai",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-memory"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ai",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-permissions"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ai",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-secrets-client"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ai-console",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ai"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ai-console",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-config"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ai-console",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-gtk"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ai-console",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ai-console",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-settings-core"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ai-console",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-themes"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ai-console",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-voice"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ai-registry",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ai"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ai-registry",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-secrets-client"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-automation",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-automation",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-logging"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-automation-studio",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-automation"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-browser-bridge",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ai"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-calendar-app",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ai"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-calendar-app",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-cli",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ai"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-cli",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-diagnostics"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-cli",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-cli",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-settings-core"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-companion-dashboard",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-shell-gtk"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-config",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-themes"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-controlsd",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-bluetooth"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-controlsd",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-controlsd",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-logging"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-desktop",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-engine"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-desktop",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-logging"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-desktop",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ui"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-diagnostics",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-logging"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-dialogd",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-dialogd",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-logging"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-dialogd",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-permissions"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-engine",
+      "optional": false,
+      "target": null,
+      "to": "focal-launch-shared"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-engine",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ai"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-engine",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-audio"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-engine",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-config"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-engine",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-cursor"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-engine",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-input"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-engine",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-engine",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-logging"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-engine",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-network"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-engine",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-notifications"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-engine",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-permissions"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-engine",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-power"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-engine",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-remote-protocol"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-engine",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-resources"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-engine",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-settings-core"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-engine",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-shortcuts"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-engine",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-sounds"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-engine",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-themes"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-engine",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-types"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-engine",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ui"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-engine",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-updates"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-engine",
+      "optional": true,
+      "target": null,
+      "to": "focaldesk-render"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-files",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-config"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-files",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-gtk"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-files",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-launcher-state"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-files",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-logging"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-files",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-settings-core"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-files",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-themes"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-greeter",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-logging"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ipc",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-config"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ipc",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-logging"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ipc",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-notifications"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ipc",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-power"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ipc",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-settings-core"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ipc",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-themes"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ipc",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-updates"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-launcher",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-config"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-launcher",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-gtk"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-launcher",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-launcher",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-launcher-state"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-launcher",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-logging"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-launcher",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-settings-core"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-launcher",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-themes"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-mcp",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-mcp",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-logging"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-notificationsd",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-notificationsd",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-logging"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-notificationsd",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-notifications"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-notificationsd",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-settings-core"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-polkitd",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-polkitd",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-logging"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-portal",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-portal",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-settings-core"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-powerd",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-powerd",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-logging"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-powerd",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-power"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-recorder",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-recorder",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-remote-protocol"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-remote-diagnostic",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-remote-protocol"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-remoted",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-remote-protocol"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-resources",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-sounds"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-server",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ai"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-server",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-engine"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-server",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-server",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-logging"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-server",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-mcp"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-server",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-memory"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-settings",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ai"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-settings",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-bluetooth"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-settings",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-config"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-settings",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-gtk"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-settings",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-settings",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-launcher-state"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-settings",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-logging"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-settings",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-permissions"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-settings",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-power"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-settings",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-settings-core"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-settings",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-sounds"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-settings",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-themes"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-shell-client",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-config"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-shell-client",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-shell-client",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-logging"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-shell-client",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-shell-gtk"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-shell-client",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-themes"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-shell-gtk",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ai"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-shell-gtk",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-config"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-shell-gtk",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-shell-gtk",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-logging"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-shell-gtk",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-settings-core"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-shell-gtk",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-themes"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-system-rail",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-shell-client"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-task-shelf",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-shell-client"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ui",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ai"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ui",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-config"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ui",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ui",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-logging"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ui",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-network"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ui",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-notifications"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ui",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-permissions"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ui",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-power"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ui",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-settings-core"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ui",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-themes"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ui",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-types"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-ui",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-updates"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-updatesd",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-ipc"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-updatesd",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-logging"
+    },
+    {
+      "alias": null,
+      "from": "focaldesk-updatesd",
+      "optional": false,
+      "target": null,
+      "to": "focaldesk-updates"
+    }
+  ],
+  "nodes": [
+    {
+      "group": "crates",
+      "manifest": "crates/focal-launch-shared/Cargo.toml",
+      "name": "focal-launch-shared"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focal-launchd/Cargo.toml",
+      "name": "focal-launchd"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focald-connectors/Cargo.toml",
+      "name": "focald-connectors"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focald-mic/Cargo.toml",
+      "name": "focald-mic"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focald-secrets/daemon/Cargo.toml",
+      "name": "focald-secrets"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focald-secrets/keywrap/Cargo.toml",
+      "name": "focald-secrets-keywrap"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focald-speech/Cargo.toml",
+      "name": "focald-speech"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focald-voice/Cargo.toml",
+      "name": "focald-voice"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-ai/Cargo.toml",
+      "name": "focaldesk-ai"
+    },
+    {
+      "group": "apps",
+      "manifest": "apps/focaldesk-ai-console/Cargo.toml",
+      "name": "focaldesk-ai-console"
+    },
+    {
+      "group": "services",
+      "manifest": "services/focaldesk-ai-registry/Cargo.toml",
+      "name": "focaldesk-ai-registry"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-audio/Cargo.toml",
+      "name": "focaldesk-audio"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-automation/Cargo.toml",
+      "name": "focaldesk-automation"
+    },
+    {
+      "group": "apps",
+      "manifest": "apps/focaldesk-automation-studio/Cargo.toml",
+      "name": "focaldesk-automation-studio"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-bluetooth/Cargo.toml",
+      "name": "focaldesk-bluetooth"
+    },
+    {
+      "group": "apps",
+      "manifest": "apps/focaldesk-browser-bridge/Cargo.toml",
+      "name": "focaldesk-browser-bridge"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-calendar/Cargo.toml",
+      "name": "focaldesk-calendar"
+    },
+    {
+      "group": "apps",
+      "manifest": "apps/focaldesk-calendar/Cargo.toml",
+      "name": "focaldesk-calendar-app"
+    },
+    {
+      "group": "apps",
+      "manifest": "apps/focaldesk-cli/Cargo.toml",
+      "name": "focaldesk-cli"
+    },
+    {
+      "group": "apps",
+      "manifest": "apps/focaldesk-color-tag-test/Cargo.toml",
+      "name": "focaldesk-color-tag-test"
+    },
+    {
+      "group": "apps",
+      "manifest": "apps/focaldesk-companion/Cargo.toml",
+      "name": "focaldesk-companion-dashboard"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-config/Cargo.toml",
+      "name": "focaldesk-config"
+    },
+    {
+      "group": "services",
+      "manifest": "services/focaldesk-controlsd/Cargo.toml",
+      "name": "focaldesk-controlsd"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-cursor/Cargo.toml",
+      "name": "focaldesk-cursor"
+    },
+    {
+      "group": "apps",
+      "manifest": "apps/focaldesk-desktop/Cargo.toml",
+      "name": "focaldesk-desktop"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-diagnostics/Cargo.toml",
+      "name": "focaldesk-diagnostics"
+    },
+    {
+      "group": "services",
+      "manifest": "services/focaldesk-dialogd/Cargo.toml",
+      "name": "focaldesk-dialogd"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-engine/Cargo.toml",
+      "name": "focaldesk-engine"
+    },
+    {
+      "group": "apps",
+      "manifest": "apps/focaldesk-files/Cargo.toml",
+      "name": "focaldesk-files"
+    },
+    {
+      "group": "apps",
+      "manifest": "apps/focaldesk-greeter/Cargo.toml",
+      "name": "focaldesk-greeter"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-gtk/Cargo.toml",
+      "name": "focaldesk-gtk"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-input/Cargo.toml",
+      "name": "focaldesk-input"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-ipc/Cargo.toml",
+      "name": "focaldesk-ipc"
+    },
+    {
+      "group": "apps",
+      "manifest": "apps/focaldesk-launcher/Cargo.toml",
+      "name": "focaldesk-launcher"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-launcher-state/Cargo.toml",
+      "name": "focaldesk-launcher-state"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-logging/Cargo.toml",
+      "name": "focaldesk-logging"
+    },
+    {
+      "group": "services",
+      "manifest": "services/focaldesk-mcp/Cargo.toml",
+      "name": "focaldesk-mcp"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-memory/Cargo.toml",
+      "name": "focaldesk-memory"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-network/Cargo.toml",
+      "name": "focaldesk-network"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-notifications/Cargo.toml",
+      "name": "focaldesk-notifications"
+    },
+    {
+      "group": "services",
+      "manifest": "services/focaldesk-notificationsd/Cargo.toml",
+      "name": "focaldesk-notificationsd"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-permissions/Cargo.toml",
+      "name": "focaldesk-permissions"
+    },
+    {
+      "group": "services",
+      "manifest": "services/focaldesk-polkitd/Cargo.toml",
+      "name": "focaldesk-polkitd"
+    },
+    {
+      "group": "apps",
+      "manifest": "apps/focaldesk-portal/Cargo.toml",
+      "name": "focaldesk-portal"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-power/Cargo.toml",
+      "name": "focaldesk-power"
+    },
+    {
+      "group": "services",
+      "manifest": "services/focaldesk-powerd/Cargo.toml",
+      "name": "focaldesk-powerd"
+    },
+    {
+      "group": "services",
+      "manifest": "services/focaldesk-recorder/Cargo.toml",
+      "name": "focaldesk-recorder"
+    },
+    {
+      "group": "apps",
+      "manifest": "apps/focaldesk-remote-diagnostic/Cargo.toml",
+      "name": "focaldesk-remote-diagnostic"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-remote-protocol/Cargo.toml",
+      "name": "focaldesk-remote-protocol"
+    },
+    {
+      "group": "services",
+      "manifest": "services/focaldesk-remoted/Cargo.toml",
+      "name": "focaldesk-remoted"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-render/Cargo.toml",
+      "name": "focaldesk-render"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-resources/Cargo.toml",
+      "name": "focaldesk-resources"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-secrets-client/Cargo.toml",
+      "name": "focaldesk-secrets-client"
+    },
+    {
+      "group": "services",
+      "manifest": "services/focaldesk-server/Cargo.toml",
+      "name": "focaldesk-server"
+    },
+    {
+      "group": "apps",
+      "manifest": "apps/focaldesk-settings/Cargo.toml",
+      "name": "focaldesk-settings"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-settings-core/Cargo.toml",
+      "name": "focaldesk-settings-core"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-shell-client/Cargo.toml",
+      "name": "focaldesk-shell-client"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-shell-gtk/Cargo.toml",
+      "name": "focaldesk-shell-gtk"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-shortcuts/Cargo.toml",
+      "name": "focaldesk-shortcuts"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-sounds/Cargo.toml",
+      "name": "focaldesk-sounds"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-spawn/Cargo.toml",
+      "name": "focaldesk-spawn"
+    },
+    {
+      "group": "apps",
+      "manifest": "apps/focal-panel/Cargo.toml",
+      "name": "focaldesk-system-rail"
+    },
+    {
+      "group": "apps",
+      "manifest": "apps/focal-dock/Cargo.toml",
+      "name": "focaldesk-task-shelf"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-themes/Cargo.toml",
+      "name": "focaldesk-themes"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-types/Cargo.toml",
+      "name": "focaldesk-types"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-ui/Cargo.toml",
+      "name": "focaldesk-ui"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-updates/Cargo.toml",
+      "name": "focaldesk-updates"
+    },
+    {
+      "group": "services",
+      "manifest": "services/focaldesk-updatesd/Cargo.toml",
+      "name": "focaldesk-updatesd"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focaldesk-voice/Cargo.toml",
+      "name": "focaldesk-voice"
+    },
+    {
+      "group": "apps",
+      "manifest": "apps/focaldesk-wp-color-test/Cargo.toml",
+      "name": "focaldesk-wp-color-test"
+    },
+    {
+      "group": "apps",
+      "manifest": "apps/focaldm-greeter/Cargo.toml",
+      "name": "focaldm-greeter"
+    },
+    {
+      "group": "apps",
+      "manifest": "apps/focaldmd/Cargo.toml",
+      "name": "focaldmd"
+    },
+    {
+      "group": "apps",
+      "manifest": "apps/focalmail/Cargo.toml",
+      "name": "focalmail"
+    },
+    {
+      "group": "crates",
+      "manifest": "crates/focald-secrets/pam-module/Cargo.toml",
+      "name": "pam-focald-secrets"
+    }
+  ],
+  "schema_version": 1,
+  "scope": "declared normal workspace dependencies"
+}

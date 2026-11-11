@@ -1,0 +1,9 @@
+[package]
+name = "focaldesk-shortcuts"
+version = "0.1.0"
+edition = "2024"
+description = "Keyboard shortcut actions, parsing, and default bindings for FocalDesk"
+
+[dependencies]
+bitflags = "2"
+xkbcommon.workspace = true

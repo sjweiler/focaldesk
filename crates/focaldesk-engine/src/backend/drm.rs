@@ -25,12 +25,12 @@ use smithay::backend::renderer::element::{
     render_elements, texture::TextureRenderElement, Id, Kind,
 };
 
-use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_logging::flog_warn;
 use focaldesk_settings_core::{
     load_exclusive_hdr_state, save_exclusive_hdr_state, DisplayColorProfile, ExclusiveHdrPhase,
-    ExclusiveHdrState, HdrAppearance,
+    ExclusiveHdrState, HdrAppearance, OutputRole,
 };
+use focaldesk_types::CompositorBackend;
 
 // DRM/KMS backend for FocalDesk.
 //
@@ -54,8 +54,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::backend::common::translate_backend_input;
 use calloop::{EventLoop, LoopHandle, RegistrationToken};
+use focaldesk_input::translate_backend_input;
 use focaldesk_logging::flog;
 use focaldesk_resources::RenderResources;
 use focaldesk_types::OutputId;
@@ -156,6 +156,8 @@ pub struct DisplayConfig {
 
     pub primary: bool,
     pub transform: DisplayTransform,
+    #[serde(default)]
+    pub role: OutputRole,
 
     #[serde(default)]
     pub hdr_supported: bool,
@@ -492,6 +494,7 @@ struct DrmModeCandidate {
     width: u16,
     height: u16,
     refresh_hz: u32,
+    pixel_clock_khz: u32,
     preferred: bool,
 }
 
@@ -542,11 +545,24 @@ fn select_requested_drm_mode_index(
     requested: (i32, i32, i32),
 ) -> Option<usize> {
     let (width, height, refresh_mhz) = requested;
-    candidates.iter().position(|candidate| {
-        i32::from(candidate.width) == width
-            && i32::from(candidate.height) == height
-            && (i64::from(candidate.refresh_hz) * 1000 - i64::from(refresh_mhz)).abs() <= 1000
-    })
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            i32::from(candidate.width) == width
+                && i32::from(candidate.height) == height
+                && (i64::from(candidate.refresh_hz) * 1000 - i64::from(refresh_mhz)).abs() <= 1000
+        })
+        // EDID can advertise multiple timings for the same resolution/refresh.
+        // Prefer the closest refresh, then the timing with less link bandwidth
+        // rather than depending on the monitor's enumeration order.
+        .min_by_key(|(_, candidate)| {
+            (
+                (i64::from(candidate.refresh_hz) * 1000 - i64::from(refresh_mhz)).abs(),
+                candidate.pixel_clock_khz,
+            )
+        })
+        .map(|(index, _)| index)
 }
 
 pub(crate) fn select_connector_mode(
@@ -561,6 +577,7 @@ pub(crate) fn select_connector_mode(
                 width,
                 height,
                 refresh_hz: mode.vrefresh(),
+                pixel_clock_khz: mode.clock(),
                 preferred: mode
                     .mode_type()
                     .contains(drm::control::ModeTypeFlags::PREFERRED),
@@ -775,7 +792,7 @@ fn display_config_path() -> PathBuf {
 pub(crate) fn load_display_config() -> Vec<DisplayConfig> {
     let path = display_config_path();
 
-    match std::fs::read_to_string(&path) {
+    let mut displays = match std::fs::read_to_string(&path) {
         Ok(text) => match serde_json::from_str(&text) {
             Ok(displays) => displays,
             Err(err) => {
@@ -795,6 +812,29 @@ pub(crate) fn load_display_config() -> Vec<DisplayConfig> {
                 err
             ));
             Vec::new()
+        }
+    };
+    apply_saved_display_positions(
+        &mut displays,
+        &focaldesk_settings_core::load_settings().displays.outputs,
+    );
+    displays
+}
+
+// Inventory can lag a settings edit made outside the compositor session.
+// Positions belong to connectors, so use canonical layout settings rather than
+// restoring a stale inventory position that can strand the pointer behind a gap.
+fn apply_saved_display_positions(
+    displays: &mut [DisplayConfig],
+    outputs: &[focaldesk_settings_core::OutputConfig],
+) {
+    for display in displays {
+        if let Some(output) = outputs
+            .iter()
+            .find(|output| output.connector == display.name)
+        {
+            display.logical_x = output.x;
+            display.logical_y = output.y;
         }
     }
 }
@@ -1323,10 +1363,33 @@ fn save_offscreen_screenshot(
     surface: &mut DrmSurfaceState,
     output_name: &str,
     seq: u64,
+    crop: Option<(Rectangle<i32, Logical>, Size<i32, Logical>)>,
 ) -> Result<PathBuf> {
-    let size = surface.size;
-
-    let pixels = capture_surface_pixels(renderer, surface)?;
+    let mut size = surface.size;
+    let mut pixels = capture_surface_pixels(renderer, surface)?;
+    if let Some((crop, logical_size)) = crop {
+        let scale_x = size.w as f64 / logical_size.w.max(1) as f64;
+        let scale_y = size.h as f64 / logical_size.h.max(1) as f64;
+        let x = (crop.loc.x as f64 * scale_x).floor().max(0.0) as u32;
+        let y = (crop.loc.y as f64 * scale_y).floor().max(0.0) as u32;
+        let right = ((crop.loc.x + crop.size.w) as f64 * scale_x)
+            .ceil()
+            .max(0.0) as u32;
+        let bottom = ((crop.loc.y + crop.size.h) as f64 * scale_y)
+            .ceil()
+            .max(0.0) as u32;
+        let (width, height, cropped) = crate::core::screenshot::crop_rgb16(
+            &pixels,
+            size.w as u32,
+            size.h as u32,
+            x,
+            y,
+            right.saturating_sub(x),
+            bottom.saturating_sub(y),
+        )?;
+        size = Size::from((width as i32, height as i32));
+        pixels = cropped;
+    }
 
     let screenshot_dir =
         PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
@@ -1353,6 +1416,9 @@ fn remove_drm_device(
 
         for surface in device.surfaces.into_values() {
             data.core.state.space.unmap_output(&surface.output);
+            data.core
+                .state
+                .forget_workspace_transition(surface.output_id);
             data.core.state.outputs.shift_remove(&surface.output_id);
             data.core
                 .state
@@ -1494,13 +1560,25 @@ fn reinitialize_drm_device(
     ));
 
     let topology = data.core.state.snapshot_output_topology();
+    // libseat/logind already owns this device for the current session.
+    // Opening it again can fail with EINVAL, so retain the shared DRM fd
+    // across output/renderer teardown instead of issuing another seat open.
+    let fd = data
+        .backend
+        .devices
+        .get(&node)
+        .ok_or_else(|| anyhow!("cannot rebuild unknown DRM device {node:?}"))?
+        .drm_output_manager
+        .device()
+        .device_fd()
+        .clone();
     // Destroy painter resources while the old EGL context is still alive, and
     // make every other compositor cache rebuild against the replacement
-    // renderer created by device_added().
+    // renderer created by initialize_drm_device().
     data.core.state.invalidate_gpu_state();
     data.core.ui_state.chrome.invalidate_gpu_state();
     remove_drm_device(data, loop_handle, node);
-    device_added(data, loop_handle, node, &path)?;
+    initialize_drm_device(data, loop_handle, node, &path, fd)?;
     data.core.state.restore_output_topology(topology);
     refresh_portal_services(&data.core.state.client_wayland_display);
     data.core
@@ -1614,13 +1692,20 @@ fn resume_drm_session(
         }
     }
     for (node, device) in &mut data.backend.devices {
-        if let Err(err) = device.drm_output_manager.lock().activate(true) {
+        let activation = device.drm_output_manager.lock().activate(true);
+        if let Err(err) = activation {
             flog_warn!(
                 "Failed to reactivate DRM device {:?} after resume: {err}; scheduling retry",
                 node
             );
             all_devices_ready = false;
         } else {
+            for crtc in device.surfaces.keys() {
+                if let Err(err) = reset_crtc_gamma(device.drm_output_manager.device(), *crtc) {
+                    flog_warn!("Failed to reset hardware gamma after resume: {err}");
+                    all_devices_ready = false;
+                }
+            }
             flog_warn!(
                 "DRM lifecycle t_ms={} event=DRM device resumed node={node:?} connectors_and_planes_reset=true",
                 data.core.start.elapsed().as_millis(),
@@ -1780,6 +1865,30 @@ fn should_defer_drm_topology_change(session_active: bool, resume_pending: bool) 
 /// requires explicit driver and topology overrides because earlier commits froze.
 const HDR_LIVE_KMS_APPLY_ENABLED: bool = true;
 
+/// Color correction is performed in shaders. Never inherit a previous session's
+/// hardware gamma ramp: in HDR it alters already PQ-encoded scanout values.
+pub(super) fn reset_crtc_gamma(
+    device: &impl drm::control::Device,
+    crtc: crtc::Handle,
+) -> anyhow::Result<()> {
+    let size = device.get_crtc(crtc)?.gamma_length() as usize;
+    if size < 2 {
+        return Ok(());
+    }
+    let ramp = identity_gamma_ramp(size);
+    device.set_gamma(crtc, &ramp, &ramp, &ramp)?;
+    flog(&format!(
+        "Reset hardware gamma to identity: crtc={crtc:?} entries={size}"
+    ));
+    Ok(())
+}
+
+fn identity_gamma_ramp(size: usize) -> Vec<u16> {
+    (0..size)
+        .map(|i| ((i as u64 * u16::MAX as u64 + (size as u64 - 1) / 2) / (size as u64 - 1)) as u16)
+        .collect()
+}
+
 /// Live scanout/connector HDR changes honor the settings toggle. Set `FOCALDESK_HDR=0` to block.
 fn hdr_runtime_apply_enabled(any_output_hdr_requested: bool) -> bool {
     HDR_LIVE_KMS_APPLY_ENABLED
@@ -1931,7 +2040,9 @@ mod hdr_tests {
         DRM_SCANOUT_FORMAT_PREFERENCE, HDR_FRAME_TIMEOUT, HDR_SCANOUT_FORMATS, HDR_VERIFY_DURATION,
         HDR_VERIFY_VBLANKS, OUTPUT_MAX_REFRESH_HZ, PCI_VENDOR_NVIDIA,
     };
-    use focaldesk_settings_core::{DisplayColorProfile, ExclusiveHdrPhase, HdrAppearance};
+    use focaldesk_settings_core::{
+        DisplayColorProfile, ExclusiveHdrPhase, HdrAppearance, OutputRole,
+    };
     use std::time::{Duration, Instant};
 
     fn display_config(hdr_requested: bool, hdr_enabled: bool) -> DisplayConfig {
@@ -1952,6 +2063,7 @@ mod hdr_tests {
             physical_height_mm: None,
             primary: true,
             transform: DisplayTransform::Normal,
+            role: OutputRole::Normal,
             hdr_supported: true,
             hdr_max_luminance_nits: None,
             hdr_max_fall_nits: None,
@@ -1961,6 +2073,38 @@ mod hdr_tests {
             color_profile: DisplayColorProfile::Auto,
             icc_profile_path: None,
         }
+    }
+
+    #[test]
+    fn saved_layout_overrides_stale_inventory_gap() {
+        let mut left = display_config(false, false);
+        left.name = "DP-3".into();
+        left.logical_x = 1920;
+        let mut right = left.clone();
+        right.name = "DP-4".into();
+        right.logical_x = 5760;
+        let mut displays = vec![left, right];
+        let output = focaldesk_settings_core::OutputConfig {
+            connector: "DP-4".into(),
+            enabled: true,
+            x: 4480,
+            y: -20,
+            width: 2560,
+            height: 1440,
+            refresh_mhz: 165_000,
+            scale: 1.0,
+            transform: focaldesk_settings_core::DisplayTransform::Normal,
+            role: OutputRole::Normal,
+            primary: false,
+            color_profile: DisplayColorProfile::Auto,
+            icc_profile_path: None,
+            hdr_requested: false,
+            hdr_enabled: false,
+            hdr_appearance: HdrAppearance::default(),
+        };
+        super::apply_saved_display_positions(&mut displays, &[output]);
+        assert_eq!(displays[0].logical_x, 1920);
+        assert_eq!((displays[1].logical_x, displays[1].logical_y), (4480, -20));
     }
 
     #[test]
@@ -2200,23 +2344,60 @@ mod hdr_tests {
                 width: 2560,
                 height: 1440,
                 refresh_hz: 165,
+                pixel_clock_khz: 0,
                 preferred: true,
             },
             DrmModeCandidate {
                 width: 2560,
                 height: 1440,
                 refresh_hz: OUTPUT_MAX_REFRESH_HZ,
+                pixel_clock_khz: 0,
                 preferred: false,
             },
             DrmModeCandidate {
                 width: 2560,
                 height: 1440,
                 refresh_hz: 60,
+                pixel_clock_khz: 0,
                 preferred: false,
             },
         ];
 
         assert_eq!(select_drm_mode_index(&candidates), Some(1));
+    }
+
+    #[test]
+    fn configured_4k120_prefers_lower_clock_regardless_of_edid_order() {
+        // TCL 32R84 DP-4 advertises both of these 3840x2160@120 timings.
+        let high_clock = DrmModeCandidate {
+            width: 3840,
+            height: 2160,
+            refresh_hz: 120,
+            pixel_clock_khz: 1_186_810,
+            preferred: false,
+        };
+        let low_clock = DrmModeCandidate {
+            pixel_clock_khz: 1_066_600,
+            ..high_clock
+        };
+        for candidates in [[high_clock, low_clock], [low_clock, high_clock]] {
+            let selected = select_requested_drm_mode_index(&candidates, (3840, 2160, 120_000))
+                .expect("advertised 4K120 mode");
+            assert_eq!(candidates[selected], low_clock);
+            assert_eq!(
+                select_requested_drm_mode_index(&candidates, (2560, 1440, 120_000)),
+                None
+            );
+        }
+        let near_refresh = DrmModeCandidate {
+            refresh_hz: 119,
+            pixel_clock_khz: 1,
+            ..low_clock
+        };
+        assert_eq!(
+            select_requested_drm_mode_index(&[near_refresh, low_clock], (3840, 2160, 120_000)),
+            Some(1)
+        );
     }
 
     #[test]
@@ -2226,12 +2407,14 @@ mod hdr_tests {
                 width: 2560,
                 height: 1440,
                 refresh_hz: 165,
+                pixel_clock_khz: 0,
                 preferred: true,
             },
             DrmModeCandidate {
                 width: 2560,
                 height: 1440,
                 refresh_hz: 120,
+                pixel_clock_khz: 0,
                 preferred: false,
             },
         ];
@@ -2248,18 +2431,21 @@ mod hdr_tests {
                 width: 3840,
                 height: 2160,
                 refresh_hz: 144,
+                pixel_clock_khz: 0,
                 preferred: true,
             },
             DrmModeCandidate {
                 width: 2560,
                 height: 1440,
                 refresh_hz: 120,
+                pixel_clock_khz: 0,
                 preferred: false,
             },
             DrmModeCandidate {
                 width: 3840,
                 height: 2160,
                 refresh_hz: 60,
+                pixel_clock_khz: 0,
                 preferred: false,
             },
         ];
@@ -2603,6 +2789,7 @@ pub(crate) fn collect_display_configs(
             primary,
 
             transform: DisplayTransform::from_smithay(surface.output.current_transform()),
+            role: core_output.map(|output| output.role).unwrap_or_default(),
 
             hdr_supported,
             hdr_max_luminance_nits: core_output
@@ -3479,11 +3666,31 @@ pub(crate) fn dispatch_backend_input_event<B: smithay::backend::input::InputBack
     state: &mut DesktopState,
     input: &smithay::backend::input::InputEvent<B>,
 ) {
+    if let Some(event) = translate_backend_input_event(state, input) {
+        state.handle_input(event);
+    }
+}
+
+pub(crate) fn translate_backend_input_event<B: smithay::backend::input::InputBackend>(
+    state: &DesktopState,
+    input: &smithay::backend::input::InputEvent<B>,
+) -> Option<focaldesk_input::InputEvent> {
     use smithay::backend::input::InputEvent;
 
-    let output_id = state
+    let pointer_output = state
         .output_at_logical_point(state.pointer_pos)
         .unwrap_or(state.focused_output);
+    // A dedicated control-panel output is compositor-native UI, not a
+    // Wayland client. A single attached touch panel therefore targets it
+    // directly instead of following the mouse/keyboard-focused display.
+    // Do not guess when multiple panels exist: that needs explicit device
+    // mapping.
+    let output_id = match input {
+        InputEvent::TouchDown { .. } | InputEvent::TouchMotion { .. } => {
+            state.sole_control_panel_output().unwrap_or(pointer_output)
+        }
+        _ => pointer_output,
+    };
     let scale = state
         .outputs
         .get(&output_id)
@@ -3495,43 +3702,25 @@ pub(crate) fn dispatch_backend_input_event<B: smithay::backend::input::InputBack
         .map(|output| output.handle.current_transform())
         .unwrap_or(Transform::Normal);
 
-    // Absolute devices (for example, a tablet in absolute mode) must transform against the
-    // focused output's geometry, not the combined desktop bounds (anvil/smallvil pattern).
+    // Absolute devices (for example, a tablet or touchscreen) must transform against their
+    // target output's geometry, not the combined desktop bounds (anvil/smallvil pattern).
     let clamp_rect = match input {
-        InputEvent::PointerMotionAbsolute { .. } => {
-            state.pointer_transform_rect_for_output(output_id)
-        }
+        InputEvent::PointerMotionAbsolute { .. }
+        | InputEvent::TouchDown { .. }
+        | InputEvent::TouchMotion { .. } => state.pointer_transform_rect_for_output(output_id),
         _ => state.logical_pointer_clamp_rect(),
     };
 
-    if let Some(mut event) = translate_backend_input(
+    translate_backend_input(
         input,
-        state.input.pointer_pos,
+        state.input.pointer_pos.into(),
         clamp_rect,
         output_transform,
         scale,
         state.input.modifiers,
-    ) {
-        if matches!(input, InputEvent::PointerMotion { .. }) {
-            if let crate::core::input::FlowInputEvent::PointerMoved { position, .. } = &mut event {
-                let scale = scale.max(1.0);
-                let old_pos = state.input.pointer_pos;
-                let scaled = Point::<f64, Logical>::from((
-                    old_pos.x + (position.x - old_pos.x) / scale,
-                    old_pos.y + (position.y - old_pos.y) / scale,
-                ));
-                let min_x = clamp_rect.loc.x as f64;
-                let min_y = clamp_rect.loc.y as f64;
-                let max_x = (clamp_rect.loc.x + clamp_rect.size.w) as f64 - f64::EPSILON;
-                let max_y = (clamp_rect.loc.y + clamp_rect.size.h) as f64 - f64::EPSILON;
-                *position = Point::from((
-                    scaled.x.clamp(min_x, max_x.max(min_x)),
-                    scaled.y.clamp(min_y, max_y.max(min_y)),
-                ));
-            }
-        }
-        state.handle_input(event);
-    }
+        state.input_settings.pointer_speed,
+        state.input_settings.natural_scroll,
+    )
 }
 
 pub fn run() -> Result<(), Box<dyn Error>> {
@@ -3548,7 +3737,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     //
     // Shared compositor state
     //
-    let desktop = bootstrap_compositor_core(None, BackendKind::Drm)?;
+    let desktop = bootstrap_compositor_core(None, CompositorBackend::Drm)?;
 
     //
     // Pick primary KMS device (same node udev will report for the card — open only in `device_added`).
@@ -3618,6 +3807,16 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     };
 
     let _libinput_token = loop_handle.insert_source(libinput_backend, |event, _, data| {
+        match &event {
+            InputEvent::DeviceAdded { device } => {
+                data.core.state.register_libinput_device(device.clone());
+            }
+            InputEvent::DeviceRemoved { device } => {
+                data.core.state.unregister_libinput_device(device);
+            }
+            _ => {}
+        }
+
         if let InputEvent::Keyboard { event, .. } = &event {
             let keycode = event.key_code();
             let key_state = event.state();
@@ -4442,13 +4641,29 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     if wants_screenshot {
                         data.core.state.screenshot_seq += 1;
                         let seq = data.core.state.screenshot_seq;
-                        let output_name = format!("output-{}", surface.output_id.0);
+                        let crop = data
+                            .core
+                            .state
+                            .take_screenshot_crop(surface.output_id)
+                            .and_then(|rect| {
+                                data.core
+                                    .state
+                                    .outputs
+                                    .get(&surface.output_id)
+                                    .map(|output| (rect, output.logical_size))
+                            });
+                        let output_name = if crop.is_some() {
+                            format!("selection-{}", surface.output_id.0)
+                        } else {
+                            format!("output-{}", surface.output_id.0)
+                        };
 
                         match save_offscreen_screenshot(
                             &mut device.renderer,
                             surface,
                             &output_name,
                             seq,
+                            crop,
                         ) {
                             Ok(path) => {
                                 flog(&format!("Screenshot saved to {}", path.display()));
@@ -4476,14 +4691,17 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         (surface.size.w as f64 / output_scale).round() as i32,
                         (surface.size.h as f64 / output_scale).round() as i32,
                     ));
+                    let magnifier_view =
+                        data.core.state.magnifier_view_for_output(surface.output_id);
+                    let magnifier_src = magnifier_view.source_rect(surface.size);
                     let present_src = Rectangle::<f64, Logical>::from_loc_and_size(
-                        (0.0, 0.0),
-                        (surface.size.w as f64, surface.size.h as f64),
+                        (magnifier_src.loc.x, magnifier_src.loc.y),
+                        (magnifier_src.size.w, magnifier_src.size.h),
                     );
                     let force_hdr_verification_present =
                         exclusive_hdr_frame && surface.hdr_verify_started_at.is_some();
                     let present_frame_damage: Vec<Rectangle<i32, Buffer>> =
-                        if force_hdr_verification_present {
+                        if force_hdr_verification_present || magnifier_view.zoom > 1.001 {
                             // The FP16/PQ targets are retained textures. Resetting the
                             // DamageBag every frame made its commit counter repeatedly
                             // return to 1, so Smithay compared commit 1 with commit 1,
@@ -4549,6 +4767,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                                 .unwrap_or(data.core.state.pointer_pos);
                             let phys: Point<i32, Physical> =
                                 rel.to_physical_precise_round::<f64, i32>(scale);
+                            let cursor_position = magnifier_view
+                                .transform_point([phys.x as f32, phys.y as f32], surface.size);
                             let (hx, hy) = data.core.state.render.sw_cursor_hotspot;
                             let (tw, th) = data.core.state.render.sw_cursor_tex_size;
                             let cursor_logical_size = Size::<i32, Logical>::from((
@@ -4563,8 +4783,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                                 data.core.state.drm_cursor_render_id.clone(),
                                 device.renderer.context_id(),
                                 Point::<f64, Physical>::from((
-                                    (phys.x - hx) as f64,
-                                    (phys.y - hy) as f64,
+                                    f64::from(cursor_position[0]) - f64::from(hx),
+                                    f64::from(cursor_position[1]) - f64::from(hy),
                                 )),
                                 ct.clone(),
                                 1,
@@ -5016,9 +5236,19 @@ fn device_added(
 
     flog("Device-added DRM node open succeeded");
 
-    let gpu_vendor_id = drm_card_vendor_id(path);
-
     let fd = DrmDeviceFd::new(DeviceFd::from(fd));
+
+    initialize_drm_device(data, loop_handle, node, path, fd)
+}
+
+fn initialize_drm_device(
+    data: &mut DrmLoopData,
+    loop_handle: &LoopHandle<'_, DrmLoopData>,
+    node: DrmNode,
+    path: &Path,
+    fd: DrmDeviceFd,
+) -> Result<()> {
+    let gpu_vendor_id = drm_card_vendor_id(path);
 
     let (drm, notifier) =
         DrmDevice::new(fd.clone(), true).context("Failed to create DrmDevice for added node")?;
@@ -5452,6 +5682,8 @@ fn device_added(
                 continue;
             };
 
+            reset_crtc_gamma(drm_output_manager.device(), crtc)
+                .context("Failed to reset inherited hardware gamma")?;
             used_crtcs.insert(crtc);
 
             let planes = drm_output_manager
@@ -5559,6 +5791,9 @@ fn device_added(
                     .map(|display| display.hdr_appearance)
                     .and_then(|appearance| appearance.validate().ok())
                     .unwrap_or_else(|| hdr_appearance_from_support(&hdr_support));
+                out.role = saved_monitor
+                    .map(|display| display.role)
+                    .unwrap_or_default();
             }
 
             data.core.state.set_output_monitor_identity(
@@ -6007,11 +6242,30 @@ fn device_added(
         flog(&format!("Failed to write display config: {err}"));
     }
 
-    if !displays.is_empty() {
-        refresh_portal_services(&data.core.state.client_wayland_display);
-    }
-
     data.backend.devices.insert(node, temp_device);
 
+    // The portal dispatcher can survive a compositor/session restart while its
+    // wlr backend is stopped with the prior session.  Refresh it after the DRM
+    // device is live, regardless of whether persisted display configuration
+    // happened to contain an entry during this initial probe.
+    refresh_portal_services(&data.core.state.client_wayland_display);
+
     Ok(())
+}
+
+#[cfg(test)]
+mod hardware_gamma_tests {
+    #[test]
+    fn identity_ramp_preserves_endpoints_and_midtones() {
+        for size in [256, 1024] {
+            let ramp = super::identity_gamma_ramp(size);
+            assert_eq!(ramp[0], 0);
+            assert_eq!(ramp[size - 1], u16::MAX);
+            assert!(ramp.windows(2).all(|v| v[0] < v[1]));
+            for (i, value) in ramp.iter().enumerate() {
+                let expected = i as f64 * 65535.0 / (size - 1) as f64;
+                assert!((*value as f64 - expected).abs() <= 0.5);
+            }
+        }
+    }
 }

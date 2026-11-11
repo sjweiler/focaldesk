@@ -58,11 +58,47 @@ The main settings model currently includes:
 - Appearance: theme, accent, shell sizing, icons, and animations.
 - Displays: connector, mode, position, scale, primary output, color profile,
   ICC profile, requested HDR state, and per-output HDR appearance values.
-- Input: pointer speed, natural scrolling, XKB layout options, and validated
-  compositor shortcut overrides.
+- Input: pointer speed, natural scrolling, configurable three- or four-finger
+  workspace swipes, persistent capability-aware libinput device overrides,
+  XKB layout options, validated compositor shortcut overrides, and keyboard
+  accessibility filters. Per-device overrides preserve libinput defaults until
+  a control is changed.
 - Applications: preferred terminal, browser, browser backend, and file manager.
+  It also supports ordered window rules for new (non-restored) Wayland and X11
+  windows. Each rule matches a Wayland app ID or X11 class, optionally narrows
+  by title text, and can select a workspace, output connector, floating state,
+  and maximized state. The first match wins. For example:
+
+  ```json
+  {
+    "apps": {
+      "window_rules": [{
+        "app_id": "org.example.Editor",
+        "title_contains": "Project",
+        "workspace": 2,
+        "output": "HDMI-A-1",
+        "floating": false,
+        "maximize": true
+      }]
+    }
+  }
+  ```
+
+  Omit any placement field to preserve the regular launch behavior. Session
+  restore takes precedence over rules, and unknown output connectors are
+  ignored without preventing the rest of the rule from applying.
+
+  **Startup Applications** are separate from session restore. Enabled entries
+  start once after a new FocalDesk session begins. Commands and arguments are
+  passed directly to the launcher, not interpreted by a shell; use a script's
+  absolute path when a custom script is needed.
 - Workspaces: session restore, launch maximization, and visible workspace slots.
 - Privacy, power, diagnostic logging, and desktop chrome layout.
+
+The Privacy page's **Recent activity** switch controls whether successful
+application launches and file opens are added to the Launcher's local search
+history. **Clear recent activity** removes both lists without changing pinned
+favorites.
 
 Use the Settings application for ordinary changes. If you edit JSON or TOML by
 hand, stop the component that owns the file first and validate the syntax before
@@ -77,6 +113,30 @@ Common shortcuts are editable on the Keyboard page. Advanced overrides use the
 `input.keybindings` object in `settings.json`; see
 [Default Keybindings](keybindings.md#configuration-syntax) for action names and
 shortcut syntax.
+
+The Accessibility page configures compositor-wide Sticky Keys, Slow Keys, and
+Bounce Keys. Slow Keys accepts a held key after a 100–2,000 ms delay; Bounce
+Keys rejects a repeated press for a 100–2,000 ms interval. These bounds are
+also enforced when settings are loaded or saved. Pressing Shift five times can
+open a confirmation dialog before Sticky Keys is toggled, and that shortcut or
+its visual modifier feedback can be disabled independently.
+
+The same page provides a compositor-native 1×–8× screen magnifier and a 24–96
+pixel pointer size. Magnification follows pointer movement and, when enabled,
+keyboard window focus. `Super++` and `Super+-` adjust the focused display in
+0.25× steps and persist a connector-specific zoom level. Disabling animations
+in Appearance makes magnifier zoom and panning changes immediate.
+
+Accessibility also includes display-only Night Light and color-vision filters.
+Night Light supports a 1,000–6,500 K white point, manual control, custom
+local-clock hours (default 7 PM–7 AM), or local sunset-to-sunrise scheduling.
+The latter calculates solar times locally from the user-supplied coordinates;
+it does not contact a location service and falls back to custom hours until
+coordinates are provided. Scheduled Night Light transitions can fade over
+0–60 minutes at each boundary (30 minutes by default). Grayscale, protanopia,
+deuteranopia, and tritanopia filters are applied after output calibration, so
+they do not alter screenshots or screen-sharing color data. Individual output
+connectors can opt out through `accessibility.display_comfort_disabled_outputs`.
 
 The `privacy.location_services` setting controls the standard XDG Location
 portal. See [Location services](location-services.md) for the request flow,

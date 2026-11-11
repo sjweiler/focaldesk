@@ -1,32 +1,41 @@
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine as _;
 use focaldesk_ai::{
     AiIpcRequest, AiIpcResponse, ConnectorStatus, EventFabricSnapshot, EventSource, send_ai_request,
 };
+use focaldesk_calendar::{CalendarEvent, CalendarProvider, CalendarStore, SyncBatch};
 use focaldesk_ipc::{
-    ConnectorHostIpcRequest, ConnectorHostIpcResponse, ConnectorRuntimeStatus, IpcRequest,
-    IpcResponse, NotificationIpcRequest, NotificationIpcResponse, connector_host_socket_path,
-    send_desktop_request, send_notification_request, transport,
+    CalendarAccountSnapshot, CalendarAvailableSnapshot, CalendarEventSnapshot,
+    CalendarOAuthSnapshot, ConnectorHostIpcRequest, ConnectorHostIpcResponse,
+    ConnectorRuntimeStatus, IpcRequest, IpcResponse, NotificationIpcRequest,
+    NotificationIpcResponse, connector_host_socket_path, send_desktop_request,
+    send_notification_request, transport,
 };
-use serde::Deserialize;
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::net::ToSocketAddrs;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
+use zeroize::Zeroizing;
 
 const SUPERVISOR_TICK: Duration = Duration::from_secs(1);
 const REGISTRY_REFRESH_SECONDS: u64 = 5;
 const BUILTIN_POLL_SECONDS: u64 = 15;
 const MAX_CONNECTOR_OUTPUT_BYTES: usize = 64 * 1024;
 const QUARANTINE_FAILURES: u32 = 5;
+static CALENDAR_STORE: OnceLock<Arc<CalendarStore>> = OnceLock::new();
 
 #[derive(Default)]
 struct ManagedRuntime {
@@ -41,6 +50,7 @@ struct ManagedRuntime {
 struct HostState {
     paused: bool,
     runtimes: BTreeMap<String, ManagedRuntime>,
+    oauth_flows: BTreeMap<String, CalendarOAuthSnapshot>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,8 +60,63 @@ struct ConnectorOutput {
     payload: Value,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CalendarAccountsDocument {
+    version: u16,
+    #[serde(default)]
+    accounts: Vec<CalendarAccount>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CalendarAccount {
+    id: String,
+    provider: CalendarProvider,
+    #[serde(default)]
+    enabled: bool,
+    client_id: String,
+    #[serde(default = "primary_calendar")]
+    calendar_id: String,
+    #[serde(default)]
+    calendar_ids: Vec<String>,
+    #[serde(default = "default_reminder_minutes")]
+    reminder_minutes: u32,
+    #[serde(default = "common_tenant")]
+    tenant: String,
+}
+
+fn primary_calendar() -> String {
+    "primary".into()
+}
+const fn default_reminder_minutes() -> u32 {
+    10
+}
+
+fn selected_calendar_ids(account: &CalendarAccount) -> Vec<String> {
+    if account.calendar_ids.is_empty() {
+        vec![account.calendar_id.clone()]
+    } else {
+        account.calendar_ids.clone()
+    }
+}
+fn common_tenant() -> String {
+    "common".into()
+}
+
+#[derive(Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
+    let calendar = Arc::new(CalendarStore::open(calendar_state_path())?);
+    CALENDAR_STORE
+        .set(calendar)
+        .map_err(|_| anyhow!("calendar store was initialized more than once"))?;
     let state = Arc::new(Mutex::new(HostState::default()));
     serve_control_socket(state.clone())?;
     info!("FocalDesk connector host started; all connector consent remains service-owned");
@@ -75,6 +140,7 @@ fn main() -> Result<()> {
         if let Some(fabric) = &fabric {
             supervise_once(&state, &connectors, fabric, now);
         }
+        dispatch_due_reminders(now);
         thread::sleep(SUPERVISOR_TICK);
     }
 }
@@ -183,8 +249,948 @@ fn run_connector(connector: &ConnectorStatus, state: &Arc<Mutex<HostState>>) -> 
         "service-health" => run_service_health_adapter(connector, state),
         "notifications" => run_notification_adapter(connector, state),
         "local-calendar" => run_calendar_adapter(connector, state),
+        "google-calendar" => run_cloud_calendar(connector, CalendarProvider::Google),
+        "microsoft-calendar" => run_cloud_calendar(connector, CalendarProvider::Microsoft),
         _ => run_external_connector(connector),
     }
+}
+
+fn run_cloud_calendar(connector: &ConnectorStatus, provider: CalendarProvider) -> Result<u64> {
+    if !connector.network_allowed {
+        bail!("calendar provider network access has not been granted");
+    }
+    let document = load_calendar_accounts()?;
+    let accounts = document
+        .accounts
+        .into_iter()
+        .filter(|account| account.enabled && account.provider == provider);
+    let http = focaldesk_calendar::CalendarHttpClient::new()?;
+    let token_client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let store = CALENDAR_STORE.get().context("calendar store unavailable")?;
+    let mut delivered = 0;
+    for account in accounts {
+        validate_account(&account)?;
+        let refresh_handle = format!("calendar/{}/refresh-token", account.id);
+        let refresh_token = focaldesk_secrets_client::get(&refresh_handle)?;
+        let tokens = refresh_access_token(&token_client, &account, &refresh_token)?;
+        if let Some(rotated) = tokens.refresh_token.as_deref()
+            && rotated != refresh_token.as_str()
+        {
+            focaldesk_secrets_client::set(
+                &refresh_handle,
+                rotated,
+                &format!("{} calendar refresh token", account.id),
+            )?;
+        }
+        let access_token = Zeroizing::new(tokens.access_token);
+        for calendar_id in selected_calendar_ids(&account) {
+            // Periodic full sync rolls the bounded provider window forward and
+            // recovers from changes that invalidate an opaque provider cursor.
+            let cursor =
+                store.fresh_cursor(&account.id, &calendar_id, unix_now() as i64, 7 * 86_400)?;
+            let batch = match provider {
+                CalendarProvider::Google => match http.sync_google(
+                    &account.id,
+                    &calendar_id,
+                    &access_token,
+                    cursor.as_deref(),
+                ) {
+                    Err(error) if error.to_string().contains("google_sync_cursor_expired") => {
+                        store.clear_calendar(&account.id, &calendar_id)?;
+                        http.sync_google(&account.id, &calendar_id, &access_token, None)?
+                    }
+                    result => result?,
+                },
+                CalendarProvider::Microsoft => {
+                    let now = chrono::Utc::now();
+                    let start = (now - chrono::Duration::days(30))
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                    let end = (now + chrono::Duration::days(365))
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                    http.sync_microsoft(
+                        &account.id,
+                        &calendar_id,
+                        &access_token,
+                        cursor.as_deref(),
+                        &start,
+                        &end,
+                    )?
+                }
+                CalendarProvider::Local => unreachable!(),
+            };
+            for event in &batch.events {
+                publish_managed(
+                    connector,
+                    EventSource::Calendar,
+                    json!({
+                        "event": "calendar meeting", "title": event.title,
+                        "start_time": event.start_time, "end_time": event.end_time,
+                        "organizer": event.organizer,
+                    }),
+                )?;
+                delivered += 1;
+            }
+            store.apply_sync(&account.id, &calendar_id, &batch)?;
+        }
+    }
+    Ok(delivered)
+}
+
+fn calendar_accounts_path() -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("focaldesk/calendar-accounts.json")
+}
+
+fn save_calendar_account(account: CalendarAccount) -> Result<()> {
+    let path = calendar_accounts_path();
+    let mut document = load_calendar_accounts()?;
+    document.accounts.retain(|item| item.id != account.id);
+    document.accounts.push(account);
+    let parent = path
+        .parent()
+        .context("calendar account path has no parent")?;
+    fs::create_dir_all(parent)?;
+    let temporary = path.with_extension("json.new");
+    fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(&json!({"version": 1, "accounts": document.accounts}))?,
+    )?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn calendar_account_snapshots(
+    state: &Arc<Mutex<HostState>>,
+) -> Result<Vec<CalendarAccountSnapshot>> {
+    let document = load_calendar_accounts()?;
+    let locked = state
+        .lock()
+        .map_err(|_| anyhow!("connector state unavailable"))?;
+    let store = CALENDAR_STORE.get().context("calendar store unavailable")?;
+    document
+        .accounts
+        .into_iter()
+        .map(|account| {
+            let connector_id = match account.provider {
+                CalendarProvider::Google => "google-calendar",
+                CalendarProvider::Microsoft => "microsoft-calendar",
+                CalendarProvider::Local => "local-calendar",
+            };
+            let runtime = locked
+                .runtimes
+                .get(connector_id)
+                .and_then(|item| item.status.as_ref());
+            Ok(CalendarAccountSnapshot {
+                account_id: account.id.clone(),
+                provider: account.provider.as_str().into(),
+                connected: focaldesk_secrets_client::get(&format!(
+                    "calendar/{}/refresh-token",
+                    account.id
+                ))
+                .is_ok(),
+                enabled: account.enabled,
+                cached_events: store.account_event_count(&account.id)?,
+                sync_state: runtime
+                    .map(|item| item.state.clone())
+                    .unwrap_or_else(|| "connector unavailable".into()),
+                calendar_ids: selected_calendar_ids(&account),
+                reminder_minutes: account.reminder_minutes,
+                last_sync_at_unix: runtime.and_then(|item| item.last_run_at_unix),
+                last_error: runtime.and_then(|item| item.last_error.clone()),
+            })
+        })
+        .collect()
+}
+
+fn disconnect_calendar_account(account_id: &str, delete_local_data: bool) -> Result<()> {
+    let mut document = load_calendar_accounts()?;
+    let account = document
+        .accounts
+        .iter_mut()
+        .find(|item| item.id == account_id)
+        .context("unknown calendar account")?;
+    account.enabled = false;
+    save_calendar_account(account.clone())?;
+    focaldesk_secrets_client::delete(&format!("calendar/{account_id}/refresh-token"))?;
+    let _ = focaldesk_secrets_client::delete(&format!("calendar/{account_id}/client-secret"));
+    if delete_local_data {
+        CALENDAR_STORE
+            .get()
+            .context("calendar store unavailable")?
+            .clear_account(account_id)?;
+    }
+    Ok(())
+}
+
+fn update_calendar_preferences(
+    account_id: &str,
+    calendar_ids: Vec<String>,
+    reminder_minutes: u32,
+) -> Result<()> {
+    let mut document = load_calendar_accounts()?;
+    let account = document
+        .accounts
+        .iter_mut()
+        .find(|item| item.id == account_id)
+        .context("unknown calendar account")?;
+    let previous = selected_calendar_ids(account)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    account.calendar_ids = calendar_ids;
+    account.reminder_minutes = reminder_minutes;
+    validate_account(account)?;
+    let next = selected_calendar_ids(account)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    save_calendar_account(account.clone())?;
+    let store = CALENDAR_STORE.get().context("calendar store unavailable")?;
+    for removed in previous.difference(&next) {
+        store.clear_calendar(account_id, removed)?;
+    }
+    Ok(())
+}
+
+fn calendar_access_token(account: &CalendarAccount) -> Result<Zeroizing<String>> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let handle = format!("calendar/{}/refresh-token", account.id);
+    let refresh = focaldesk_secrets_client::get(&handle)?;
+    let tokens = refresh_access_token(&client, account, &refresh)?;
+    if let Some(rotated) = tokens.refresh_token.as_deref()
+        && rotated != refresh.as_str()
+    {
+        focaldesk_secrets_client::set(
+            &handle,
+            rotated,
+            &format!("{} calendar refresh token", account.id),
+        )?;
+    }
+    Ok(Zeroizing::new(tokens.access_token))
+}
+
+// Provider writes run inside the connector host so credentials never reach the UI.
+fn write_calendar_event(event: &CalendarEventSnapshot, delete: bool) -> Result<()> {
+    let document = load_calendar_accounts()?;
+    let account = document
+        .accounts
+        .iter()
+        .find(|a| a.id == event.account_id && a.enabled)
+        .context("calendar account is unavailable or disabled")?;
+    if !selected_calendar_ids(account).contains(&event.calendar_id) {
+        bail!("calendar is not selected for this account");
+    }
+    if delete && event.event_id.is_empty() {
+        bail!("event ID is required");
+    }
+    if !delete {
+        if event.title.trim().is_empty() || event.title.len() > 4096 {
+            bail!("event title is required and must be at most 4096 bytes");
+        }
+        let start = chrono::DateTime::parse_from_rfc3339(&event.start_time)?;
+        let end = chrono::DateTime::parse_from_rfc3339(&event.end_time)?;
+        if end <= start {
+            bail!("event end must follow its start");
+        }
+        if event.all_day
+            && (start.time() != chrono::NaiveTime::MIN || end.time() != chrono::NaiveTime::MIN)
+        {
+            bail!("all-day event boundaries must be midnight");
+        }
+    }
+    let connector_id = match account.provider {
+        CalendarProvider::Google => "google-calendar",
+        CalendarProvider::Microsoft => "microsoft-calendar",
+        CalendarProvider::Local => bail!("local provider writes are unsupported"),
+    };
+    match send_ai_request(&AiIpcRequest::ListConnectors)? {
+        AiIpcResponse::Connectors { connectors }
+            if connectors
+                .iter()
+                .any(|c| c.manifest.id == connector_id && c.enabled && c.network_allowed) => {}
+        _ => bail!("enable this calendar connector and grant network access in AI Console first"),
+    }
+    let access = calendar_access_token(account)?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let url = calendar_event_url(account.provider, event)?;
+    let method = if delete {
+        reqwest::Method::DELETE
+    } else if event.event_id.is_empty() {
+        reqwest::Method::POST
+    } else {
+        reqwest::Method::PATCH
+    };
+    let mut request = client.request(method, url).bearer_auth(access.as_str());
+    if !delete {
+        let body = calendar_write_body(account.provider, event)?;
+        request = request.json(&body);
+    }
+    let response = request.send()?;
+    if !response.status().is_success() {
+        let status = response.status();
+        if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::UNAUTHORIZED {
+            bail!(
+                "provider denied calendar changes ({status}); reconnect with calendar write permission and check calendar ownership"
+            );
+        }
+        bail!("calendar provider could not save changes ({status})");
+    }
+    let store = CALENDAR_STORE.get().context("calendar store unavailable")?;
+    if delete {
+        store.apply_sync(
+            &event.account_id,
+            &event.calendar_id,
+            &SyncBatch {
+                deleted_event_ids: vec![event.event_id.clone()],
+                ..Default::default()
+            },
+        )?;
+    } else {
+        let body: Value = response.json()?;
+        let batch = match account.provider {
+            CalendarProvider::Google => focaldesk_calendar::google_batch(
+                &event.account_id,
+                &event.calendar_id,
+                &json!({"items": [body]}),
+            )?,
+            CalendarProvider::Microsoft => focaldesk_calendar::microsoft_batch(
+                &event.account_id,
+                &event.calendar_id,
+                &json!({"value": [body]}),
+            )?,
+            CalendarProvider::Local => unreachable!(),
+        };
+        store.apply_sync(&event.account_id, &event.calendar_id, &batch)?;
+    }
+    Ok(())
+}
+
+fn calendar_event_url(
+    provider: CalendarProvider,
+    event: &CalendarEventSnapshot,
+) -> Result<url::Url> {
+    let mut url = match provider {
+        CalendarProvider::Google => {
+            url::Url::parse("https://www.googleapis.com/calendar/v3/calendars/")?
+        }
+        CalendarProvider::Microsoft => {
+            url::Url::parse("https://graph.microsoft.com/v1.0/me/calendars/")?
+        }
+        CalendarProvider::Local => {
+            bail!("local calendar writes are not supported by this endpoint")
+        }
+    };
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| anyhow!("invalid provider URL"))?;
+        segments.pop_if_empty();
+        // Microsoft primary is an alias rather than a calendar ID.
+        if provider == CalendarProvider::Microsoft && event.calendar_id == "primary" {
+            segments.pop();
+        } else {
+            segments.push(&event.calendar_id);
+        }
+        segments.push("events");
+        if !event.event_id.is_empty() {
+            segments.push(&event.event_id);
+        }
+    }
+    if provider == CalendarProvider::Google {
+        url.query_pairs_mut().append_pair("sendUpdates", "all");
+    }
+    Ok(url)
+}
+
+fn calendar_write_body(provider: CalendarProvider, event: &CalendarEventSnapshot) -> Result<Value> {
+    let start = chrono::DateTime::parse_from_rfc3339(&event.start_time)?;
+    let end = chrono::DateTime::parse_from_rfc3339(&event.end_time)?;
+    Ok(match provider {
+        CalendarProvider::Google => {
+            let boundary = |time: chrono::DateTime<chrono::FixedOffset>| {
+                if event.all_day {
+                    json!({"date": time.format("%Y-%m-%d").to_string()})
+                } else {
+                    json!({"dateTime": time.to_rfc3339()})
+                }
+            };
+            json!({"summary": event.title, "start": boundary(start), "end": boundary(end)})
+        }
+        CalendarProvider::Microsoft => json!({
+            "subject": event.title, "isAllDay": event.all_day,
+            "start": {"dateTime": start.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%S").to_string(), "timeZone": "UTC"},
+            "end": {"dateTime": end.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%S").to_string(), "timeZone": "UTC"}
+        }),
+        CalendarProvider::Local => bail!("unsupported provider"),
+    })
+}
+
+fn discover_calendars(account_id: &str) -> Result<Vec<CalendarAvailableSnapshot>> {
+    let document = load_calendar_accounts()?;
+    let account = document
+        .accounts
+        .into_iter()
+        .find(|item| item.id == account_id)
+        .context("unknown calendar account")?;
+    validate_account(&account)?;
+    let access = calendar_access_token(&account)?;
+    let selected = selected_calendar_ids(&account)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let mut calendars = Vec::new();
+    let mut next = match account.provider {
+        CalendarProvider::Google => Some(
+            "https://www.googleapis.com/calendar/v3/users/me/calendarList?maxResults=250"
+                .to_string(),
+        ),
+        CalendarProvider::Microsoft => Some(
+            "https://graph.microsoft.com/v1.0/me/calendars?$select=id,name,isDefaultCalendar"
+                .to_string(),
+        ),
+        CalendarProvider::Local => bail!("local calendars are not discovered through OAuth"),
+    };
+    for _ in 0..20 {
+        let Some(url) = next.take() else { break };
+        let parsed = url::Url::parse(&url)?;
+        let allowed_host = match account.provider {
+            CalendarProvider::Google => "www.googleapis.com",
+            CalendarProvider::Microsoft => "graph.microsoft.com",
+            CalendarProvider::Local => unreachable!(),
+        };
+        if parsed.scheme() != "https" || parsed.host_str() != Some(allowed_host) {
+            bail!("calendar discovery pagination escaped the provider host");
+        }
+        let response = client.get(parsed).bearer_auth(access.as_str()).send()?;
+        let body = calendar_discovery_response(response, account.provider)?;
+        let items = body
+            .get("items")
+            .or_else(|| body.get("value"))
+            .and_then(Value::as_array)
+            .context("calendar provider returned no calendar list")?;
+        for item in items {
+            let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+            if id.is_empty() || id.len() > 512 || calendars.len() >= 500 {
+                continue;
+            }
+            let name = item
+                .get("summary")
+                .or_else(|| item.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("Calendar");
+            calendars.push(CalendarAvailableSnapshot {
+                id: id.into(),
+                name: name.chars().take(200).collect(),
+                primary: item
+                    .get("primary")
+                    .or_else(|| item.get("isDefaultCalendar"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                selected: selected.contains(id)
+                    || (selected.contains("primary")
+                        && item
+                            .get("primary")
+                            .or_else(|| item.get("isDefaultCalendar"))
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)),
+            });
+        }
+        next = body
+            .get("nextPageToken")
+            .and_then(Value::as_str)
+            .map(|token| format!("https://www.googleapis.com/calendar/v3/users/me/calendarList?maxResults=250&pageToken={}", url::form_urlencoded::byte_serialize(token.as_bytes()).collect::<String>()))
+            .or_else(|| body.get("@odata.nextLink").and_then(Value::as_str).map(str::to_owned));
+    }
+    calendars.sort_by_key(|calendar| (!calendar.primary, calendar.name.to_ascii_lowercase()));
+    Ok(calendars)
+}
+
+fn calendar_discovery_response(
+    response: reqwest::blocking::Response,
+    provider: CalendarProvider,
+) -> Result<Value> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response.json()?);
+    }
+
+    // reqwest's error_for_status deliberately omits the response body. Microsoft
+    // Graph puts the useful diagnosis (for example, a mailbox or tenant-policy
+    // code) in that body, so expose a bounded, non-secret summary in Settings.
+    let body = response.text().unwrap_or_default();
+    if provider == CalendarProvider::Microsoft {
+        let parsed = serde_json::from_str::<Value>(&body).ok();
+        let code = parsed
+            .as_ref()
+            .and_then(|value| value.pointer("/error/code"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown_error");
+        let message = parsed
+            .as_ref()
+            .and_then(|value| value.pointer("/error/message"))
+            .and_then(Value::as_str)
+            .unwrap_or("Microsoft Graph did not return an error message");
+        bail!(
+            "Microsoft Graph calendar discovery failed ({status}): {code}: {}",
+            message.chars().take(500).collect::<String>()
+        );
+    }
+    bail!("calendar discovery failed ({status})")
+}
+
+fn random_urlsafe(bytes: usize) -> String {
+    let mut value = vec![0_u8; bytes];
+    rand::thread_rng().fill_bytes(&mut value);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value)
+}
+
+fn set_oauth_state(
+    state: &Arc<Mutex<HostState>>,
+    flow_id: &str,
+    next: &str,
+    message: Option<String>,
+) {
+    if let Ok(mut state) = state.lock()
+        && let Some(flow) = state.oauth_flows.get_mut(flow_id)
+    {
+        flow.state = next.into();
+        flow.message = message;
+    }
+}
+
+/// Extract the authorization code only from the loopback callback URI that we
+/// gave to the provider.  A loopback listener is still an HTTP server, so do
+/// not treat an arbitrary request received on it as an OAuth callback.
+fn authorization_code_from_loopback_callback(
+    request: &str,
+    redirect_uri: &str,
+    expected_state: &str,
+) -> Result<String> {
+    let mut lines = request.lines();
+    let request_line = lines.next().context("invalid OAuth callback")?;
+    let mut request_parts = request_line.split_whitespace();
+    if request_parts.next() != Some("GET") {
+        bail!("OAuth callback must use GET");
+    }
+    let target = request_parts
+        .next()
+        .context("invalid OAuth callback target")?;
+    if request_parts.next() != Some("HTTP/1.1")
+        || request_parts.next().is_some()
+        || !target.starts_with('/')
+        || target.starts_with("//")
+    {
+        bail!("OAuth callback target is invalid");
+    }
+
+    let redirect = url::Url::parse(redirect_uri).context("invalid OAuth redirect URI")?;
+    if redirect.scheme() != "http"
+        || redirect.host_str() != Some("localhost")
+        || redirect.port().is_none()
+        || redirect.query().is_some()
+        || redirect.fragment().is_some()
+    {
+        bail!("OAuth redirect URI must be a loopback URL");
+    }
+    let expected_host = format!("localhost:{}", redirect.port().unwrap_or_default());
+    let hosts = lines
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("host"))
+        .map(|(_, value)| value.trim())
+        .collect::<Vec<_>>();
+    if hosts.len() != 1 || hosts[0] != expected_host {
+        bail!("OAuth callback host does not match redirect URI");
+    }
+
+    let callback = url::Url::parse(&format!("http://{expected_host}{target}"))
+        .context("invalid OAuth callback target")?;
+    if callback.path() != redirect.path() {
+        bail!("OAuth callback path does not match redirect URI");
+    }
+
+    let mut state = None;
+    let mut code = None;
+    for (name, value) in callback.query_pairs() {
+        match name.as_ref() {
+            "state" => {
+                if state.replace(value.into_owned()).is_some() {
+                    bail!("OAuth callback contains multiple state values");
+                }
+            }
+            "code" if code.replace(value.into_owned()).is_some() => {
+                bail!("OAuth callback contains multiple authorization codes");
+            }
+            _ => {}
+        }
+    }
+    if state.as_deref() != Some(expected_state) {
+        bail!("OAuth state mismatch");
+    }
+    code.context("authorization was declined")
+}
+
+fn start_calendar_oauth(
+    state: &Arc<Mutex<HostState>>,
+    provider: String,
+    account_id: String,
+    client_id: String,
+    client_secret: Option<String>,
+    tenant: Option<String>,
+) -> Result<CalendarOAuthSnapshot> {
+    let provider_kind = match provider.as_str() {
+        "google" => CalendarProvider::Google,
+        "microsoft" => CalendarProvider::Microsoft,
+        _ => bail!("unsupported calendar provider"),
+    };
+    let account = CalendarAccount {
+        id: account_id,
+        provider: provider_kind,
+        enabled: true,
+        client_id,
+        calendar_id: "primary".into(),
+        calendar_ids: vec!["primary".into()],
+        reminder_minutes: default_reminder_minutes(),
+        tenant: tenant.unwrap_or_else(common_tenant),
+    };
+    validate_account(&account)?;
+    let flow_id = random_urlsafe(18);
+    if provider_kind == CalendarProvider::Google {
+        let listener = TcpListener::bind("localhost:0")?;
+        let redirect_uri = format!("http://localhost:{}/", listener.local_addr()?.port());
+        let verifier = random_urlsafe(48);
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(Sha256::digest(verifier.as_bytes()));
+        let csrf = random_urlsafe(24);
+        let mut url = url::Url::parse("https://accounts.google.com/o/oauth2/v2/auth")?;
+        url.query_pairs_mut()
+            .append_pair("client_id", &account.client_id)
+            .append_pair("redirect_uri", &redirect_uri)
+            .append_pair("response_type", "code")
+            .append_pair("scope", "https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/calendar.events")
+            .append_pair("access_type", "offline")
+            .append_pair("prompt", "consent")
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("state", &csrf);
+        let snapshot = CalendarOAuthSnapshot {
+            flow_id: flow_id.clone(),
+            provider,
+            state: "waiting_for_browser".into(),
+            verification_uri: Some(url.into()),
+            user_code: None,
+            message: None,
+        };
+        state
+            .lock()
+            .map_err(|_| anyhow!("connector state unavailable"))?
+            .oauth_flows
+            .insert(flow_id.clone(), snapshot.clone());
+        let state = state.clone();
+        thread::spawn(move || {
+            let result = complete_google_oauth(
+                listener,
+                &account,
+                client_secret.as_deref(),
+                &redirect_uri,
+                &verifier,
+                &csrf,
+            );
+            match result {
+                Ok(()) => set_oauth_state(
+                    &state,
+                    &flow_id,
+                    "connected",
+                    Some("Google Calendar connected".into()),
+                ),
+                Err(error) => set_oauth_state(&state, &flow_id, "error", Some(error.to_string())),
+            }
+        });
+        Ok(snapshot)
+    } else {
+        // Microsoft supports public-client authorization-code flow on a loopback
+        // redirect URI. Bind before opening the browser so the callback cannot
+        // race the listener, and never persist the verifier or CSRF state.
+        let listener = TcpListener::bind("localhost:0")?;
+        let redirect_uri = format!("http://localhost:{}/", listener.local_addr()?.port());
+        let verifier = random_urlsafe(48);
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(Sha256::digest(verifier.as_bytes()));
+        let csrf = random_urlsafe(24);
+        let mut url = url::Url::parse(&format!(
+            "https://login.microsoftonline.com/{}/oauth2/v2.0/authorize",
+            account.tenant
+        ))?;
+        url.query_pairs_mut()
+            .append_pair("client_id", &account.client_id)
+            .append_pair("redirect_uri", &redirect_uri)
+            .append_pair("response_type", "code")
+            .append_pair("response_mode", "query")
+            .append_pair("scope", "offline_access Calendars.ReadWrite")
+            // Do not silently reuse an unrelated browser SSO session. The local
+            // FocalDesk account label is intentionally independent of the
+            // Microsoft identity, so make that identity an explicit choice.
+            .append_pair("prompt", "select_account")
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("state", &csrf);
+        let snapshot = CalendarOAuthSnapshot {
+            flow_id: flow_id.clone(),
+            provider,
+            state: "waiting_for_browser".into(),
+            verification_uri: Some(url.into()),
+            user_code: None,
+            message: Some("Finish signing in with Microsoft in your browser".into()),
+        };
+        state
+            .lock()
+            .map_err(|_| anyhow!("connector state unavailable"))?
+            .oauth_flows
+            .insert(flow_id.clone(), snapshot.clone());
+        let state = state.clone();
+        thread::spawn(move || {
+            let result =
+                complete_microsoft_oauth(listener, &account, &redirect_uri, &verifier, &csrf);
+            match result {
+                Ok(()) => set_oauth_state(
+                    &state,
+                    &flow_id,
+                    "connected",
+                    Some("Microsoft 365 Calendar connected".into()),
+                ),
+                Err(error) => set_oauth_state(&state, &flow_id, "error", Some(error.to_string())),
+            }
+        });
+        Ok(snapshot)
+    }
+}
+
+fn complete_google_oauth(
+    listener: TcpListener,
+    account: &CalendarAccount,
+    client_secret: Option<&str>,
+    redirect_uri: &str,
+    verifier: &str,
+    csrf: &str,
+) -> Result<()> {
+    listener.set_nonblocking(true)?;
+    let deadline = Instant::now() + Duration::from_secs(10 * 60);
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(connection) => break connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    bail!("Google authorization expired");
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let mut bytes = vec![0_u8; 8192];
+    let count = stream.read(&mut bytes)?;
+    let request = std::str::from_utf8(&bytes[..count])?;
+    let code = authorization_code_from_loopback_callback(request, redirect_uri, csrf)
+        .context("Google OAuth callback validation failed")?;
+    let html = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<h1>FocalDesk connected</h1><p>You can close this tab.</p>";
+    stream.write_all(html.as_bytes())?;
+    let client = reqwest::blocking::Client::new();
+    let mut form = vec![
+        ("client_id", account.client_id.as_str()),
+        ("code", code.as_str()),
+        ("code_verifier", verifier),
+        ("redirect_uri", redirect_uri),
+        ("grant_type", "authorization_code"),
+    ];
+    if let Some(secret) = client_secret {
+        form.push(("client_secret", secret));
+    }
+    let token: TokenResponse = client
+        .post("https://oauth2.googleapis.com/token")
+        .form(&form)
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let refresh = token
+        .refresh_token
+        .context("Google returned no refresh token")?;
+    focaldesk_secrets_client::set(
+        &format!("calendar/{}/refresh-token", account.id),
+        &refresh,
+        "Google Calendar refresh token",
+    )?;
+    if let Some(secret) = client_secret {
+        focaldesk_secrets_client::set(
+            &format!("calendar/{}/client-secret", account.id),
+            secret,
+            "Google OAuth client secret",
+        )?;
+    }
+    save_calendar_account(account.clone())
+}
+
+fn complete_microsoft_oauth(
+    listener: TcpListener,
+    account: &CalendarAccount,
+    redirect_uri: &str,
+    verifier: &str,
+    csrf: &str,
+) -> Result<()> {
+    listener.set_nonblocking(true)?;
+    let deadline = Instant::now() + Duration::from_secs(10 * 60);
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(connection) => break connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    bail!("Microsoft authorization expired");
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let mut bytes = vec![0_u8; 8192];
+    let count = stream.read(&mut bytes)?;
+    let request = std::str::from_utf8(&bytes[..count])?;
+    let code = authorization_code_from_loopback_callback(request, redirect_uri, csrf)
+        .context("Microsoft OAuth callback validation failed")?;
+    let html = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<h1>FocalDesk connected</h1><p>You can close this tab.</p>";
+    stream.write_all(html.as_bytes())?;
+    let client = reqwest::blocking::Client::new();
+    let endpoint = format!(
+        "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
+        account.tenant
+    );
+    let token: TokenResponse = client
+        .post(endpoint)
+        .form(&[
+            ("client_id", account.client_id.as_str()),
+            ("code", code.as_str()),
+            ("code_verifier", verifier),
+            ("redirect_uri", redirect_uri),
+            ("grant_type", "authorization_code"),
+            ("scope", "offline_access Calendars.ReadWrite"),
+        ])
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let refresh = token
+        .refresh_token
+        .context("Microsoft returned no refresh token")?;
+    focaldesk_secrets_client::set(
+        &format!("calendar/{}/refresh-token", account.id),
+        &refresh,
+        "Microsoft Calendar refresh token",
+    )?;
+    save_calendar_account(account.clone())
+}
+
+fn load_calendar_accounts() -> Result<CalendarAccountsDocument> {
+    let path = calendar_accounts_path();
+    if !path.exists() {
+        return Ok(CalendarAccountsDocument {
+            version: 1,
+            accounts: Vec::new(),
+        });
+    }
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.file_type().is_file() || metadata.len() > 128 * 1024 {
+        bail!("calendar account configuration must be a regular file no larger than 128 KiB");
+    }
+    let document: CalendarAccountsDocument = serde_json::from_slice(&fs::read(&path)?)?;
+    if document.version != 1 {
+        bail!("unsupported calendar account configuration version");
+    }
+    Ok(document)
+}
+
+fn validate_account(account: &CalendarAccount) -> Result<()> {
+    let calendar_ids = selected_calendar_ids(account);
+    let unique_calendar_ids = calendar_ids.iter().collect::<BTreeSet<_>>();
+    let valid_id = !account.id.is_empty()
+        && account.id.len() <= 64
+        && account
+            .id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
+    if !valid_id
+        || account.client_id.trim().is_empty()
+        || account.client_id.len() > 256
+        || calendar_ids.is_empty()
+        || calendar_ids.len() > 32
+        || unique_calendar_ids.len() != calendar_ids.len()
+        || calendar_ids
+            .iter()
+            .any(|id| id.is_empty() || id.len() > 512)
+        || !matches!(account.reminder_minutes, 0 | 5 | 10 | 15 | 30 | 60)
+    {
+        bail!("calendar account configuration is invalid");
+    }
+    if account.tenant.is_empty()
+        || account.tenant.len() > 128
+        || !account
+            .tenant
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.'))
+    {
+        bail!("calendar account tenant is invalid");
+    }
+    Ok(())
+}
+
+fn refresh_access_token(
+    client: &reqwest::blocking::Client,
+    account: &CalendarAccount,
+    refresh_token: &str,
+) -> Result<TokenResponse> {
+    let response = match account.provider {
+        CalendarProvider::Google => {
+            let secret_handle = format!("calendar/{}/client-secret", account.id);
+            let client_secret = focaldesk_secrets_client::get(&secret_handle).ok();
+            let mut form = vec![
+                ("client_id", account.client_id.as_str()),
+                ("refresh_token", refresh_token),
+                ("grant_type", "refresh_token"),
+            ];
+            if let Some(secret) = client_secret.as_deref() {
+                form.push(("client_secret", secret));
+            }
+            client
+                .post("https://oauth2.googleapis.com/token")
+                .form(&form)
+                .send()?
+        }
+        CalendarProvider::Microsoft => {
+            let endpoint = format!(
+                "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
+                account.tenant
+            );
+            client
+                .post(endpoint)
+                .form(&[
+                    ("client_id", account.client_id.as_str()),
+                    ("refresh_token", refresh_token),
+                    ("grant_type", "refresh_token"),
+                ])
+                .send()?
+        }
+        CalendarProvider::Local => bail!("local calendars do not use OAuth"),
+    };
+    Ok(response.error_for_status()?.json()?)
 }
 
 fn run_desktop_adapter(connector: &ConnectorStatus, state: &Arc<Mutex<HostState>>) -> Result<u64> {
@@ -325,7 +1331,31 @@ fn run_calendar_adapter(connector: &ConnectorStatus, state: &Arc<Mutex<HostState
     }
     let text = fs::read_to_string(&path)?;
     let mut delivered = 0;
-    for event in parse_ics_events(&text) {
+    let events = parse_ics_events(&text);
+    let normalized = events
+        .iter()
+        .filter_map(|event| match normalize_ics_event(event) {
+            Ok(event) => Some(event),
+            Err(error) => {
+                warn!(%error, event_id = %event.id, "skipping unsupported local calendar event");
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    if let Some(store) = CALENDAR_STORE.get() {
+        // An ICS file is a complete snapshot rather than an incremental feed.
+        // Remove vanished events before inserting the newly parsed snapshot.
+        store.clear_calendar("local-calendar", "local")?;
+        store.apply_sync(
+            "local-calendar",
+            "local",
+            &SyncBatch {
+                events: normalized,
+                ..Default::default()
+            },
+        )?;
+    }
+    for event in events {
         if has_seen(state, &connector.manifest.id, &event.id) {
             continue;
         }
@@ -345,6 +1375,76 @@ fn run_calendar_adapter(connector: &ConnectorStatus, state: &Arc<Mutex<HostState
         delivered += 1;
     }
     Ok(delivered)
+}
+
+fn normalize_ics_event(event: &IcsEvent) -> Result<CalendarEvent> {
+    Ok(CalendarEvent {
+        account_id: "local-calendar".into(),
+        provider: CalendarProvider::Local,
+        calendar_id: "local".into(),
+        event_id: event.id.clone(),
+        title: event.title.clone(),
+        start_time: normalize_ics_time(&event.start)?,
+        end_time: normalize_ics_time(&event.end)?,
+        organizer: event.organizer.clone(),
+        all_day: event.start.len() == 8,
+        cancelled: false,
+    })
+}
+
+fn normalize_ics_time(value: &str) -> Result<String> {
+    let value = value.trim();
+    let parsed = if value.len() == 8 {
+        chrono::NaiveDate::parse_from_str(value, "%Y%m%d")?
+            .and_hms_opt(0, 0, 0)
+            .context("invalid all-day ICS timestamp")?
+            .and_utc()
+    } else if value.ends_with('Z') {
+        chrono::NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M%SZ")?.and_utc()
+    } else {
+        bail!("floating and TZID-based ICS timestamps are not yet supported")
+    };
+    Ok(parsed.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
+fn calendar_state_path() -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("focaldesk/calendar.db")
+}
+
+fn dispatch_due_reminders(now: u64) {
+    let Some(store) = CALENDAR_STORE.get() else {
+        return;
+    };
+    let reminder_minutes = load_calendar_accounts()
+        .map(|document| {
+            document
+                .accounts
+                .into_iter()
+                .filter(|account| account.enabled)
+                .map(|account| (account.id, account.reminder_minutes))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let Ok(reminders) = store.claim_due_reminders(now as i64, 15 * 60, &reminder_minutes) else {
+        return;
+    };
+    for reminder in reminders {
+        let starts = reminder
+            .event
+            .start_time
+            .replace('T', " ")
+            .trim_end_matches('Z')
+            .to_string();
+        let _ = send_notification_request(&NotificationIpcRequest::Notify {
+            title: format!("Upcoming: {}", reminder.event.title),
+            body: format!("Starts at {starts}"),
+            timeout_ms: None,
+        });
+    }
 }
 
 fn run_external_connector(connector: &ConnectorStatus) -> Result<u64> {
@@ -594,6 +1694,12 @@ fn finish_run(
 }
 
 fn poll_interval(connector: &ConnectorStatus) -> u64 {
+    if matches!(
+        connector.manifest.id.as_str(),
+        "google-calendar" | "microsoft-calendar"
+    ) {
+        return 300;
+    }
     connector
         .manifest
         .runtime
@@ -719,7 +1825,11 @@ fn serve_control_socket(state: Arc<Mutex<HostState>>) -> Result<()> {
 }
 
 fn handle_control_client(stream: &mut UnixStream, state: &Arc<Mutex<HostState>>) {
-    if transport::require_authorized_peer(stream, transport::CONNECTOR_HOST_POLICY).is_err() {
+    // The socket itself is owner-only (0600), and SO_PEERCRED rejects a
+    // different UID.  Do not require /proc/<pid>/exe here: Yama denies that
+    // lookup between sibling user services on hardened desktops.
+    if let Err(error) = transport::require_same_user(stream) {
+        tracing::warn!(%error, "rejected connector-host IPC peer");
         return;
     }
     let response = transport::read_limited(stream)
@@ -733,6 +1843,10 @@ fn handle_control_client(stream: &mut UnixStream, state: &Arc<Mutex<HostState>>)
             message: Some(error.to_string()),
             paused: state.lock().map(|state| state.paused).unwrap_or(true),
             connectors: Vec::new(),
+            calendar_events: Vec::new(),
+            oauth: None,
+            calendar_accounts: Vec::new(),
+            available_calendars: Vec::new(),
         });
     if let Ok(encoded) = transport::encode_message(&response) {
         let _ = stream.write_all(&encoded);
@@ -740,10 +1854,176 @@ fn handle_control_client(stream: &mut UnixStream, state: &Arc<Mutex<HostState>>)
 }
 
 fn apply_control_request(
-    state: &Arc<Mutex<HostState>>,
+    host_state: &Arc<Mutex<HostState>>,
     request: ConnectorHostIpcRequest,
 ) -> ConnectorHostIpcResponse {
-    let mut state = match state.lock() {
+    if let ConnectorHostIpcRequest::CalendarSaveEvent { ref event }
+    | ConnectorHostIpcRequest::CalendarDeleteEvent { ref event } = request
+    {
+        let delete = matches!(request, ConnectorHostIpcRequest::CalendarDeleteEvent { .. });
+        let result = write_calendar_event(event, delete);
+        let mut response = error_control_response("");
+        response.status = if result.is_ok() { "ok" } else { "error" }.into();
+        response.message = result.err().map(|e| e.to_string());
+        return response;
+    }
+    if let ConnectorHostIpcRequest::CalendarConnect {
+        provider,
+        account_id,
+        client_id,
+        client_secret,
+        tenant,
+    } = request
+    {
+        return match start_calendar_oauth(
+            host_state,
+            provider,
+            account_id,
+            client_id,
+            client_secret,
+            tenant,
+        ) {
+            Ok(flow) => ConnectorHostIpcResponse {
+                status: "ok".into(),
+                message: None,
+                paused: host_state.lock().map(|s| s.paused).unwrap_or(true),
+                connectors: Vec::new(),
+                calendar_events: Vec::new(),
+                oauth: Some(flow),
+                calendar_accounts: Vec::new(),
+                available_calendars: Vec::new(),
+            },
+            Err(error) => ConnectorHostIpcResponse {
+                status: "error".into(),
+                message: Some(error.to_string()),
+                paused: host_state.lock().map(|s| s.paused).unwrap_or(true),
+                connectors: Vec::new(),
+                calendar_events: Vec::new(),
+                oauth: None,
+                calendar_accounts: Vec::new(),
+                available_calendars: Vec::new(),
+            },
+        };
+    }
+    if let ConnectorHostIpcRequest::CalendarOAuthStatus { flow_id } = request {
+        let (paused, oauth) = host_state
+            .lock()
+            .map(|s| (s.paused, s.oauth_flows.get(&flow_id).cloned()))
+            .unwrap_or((true, None));
+        return ConnectorHostIpcResponse {
+            status: if oauth.is_some() { "ok" } else { "error" }.into(),
+            message: oauth
+                .is_none()
+                .then(|| "unknown calendar OAuth flow".into()),
+            paused,
+            connectors: Vec::new(),
+            calendar_events: Vec::new(),
+            oauth,
+            calendar_accounts: Vec::new(),
+            available_calendars: Vec::new(),
+        };
+    }
+    if matches!(request, ConnectorHostIpcRequest::CalendarAccounts) {
+        let result = calendar_account_snapshots(host_state);
+        return ConnectorHostIpcResponse {
+            status: if result.is_ok() { "ok" } else { "error" }.into(),
+            message: result.as_ref().err().map(ToString::to_string),
+            paused: host_state.lock().map(|s| s.paused).unwrap_or(true),
+            connectors: Vec::new(),
+            calendar_events: Vec::new(),
+            oauth: None,
+            calendar_accounts: result.unwrap_or_default(),
+            available_calendars: Vec::new(),
+        };
+    }
+    if let ConnectorHostIpcRequest::CalendarDiscover { account_id } = request {
+        let result = discover_calendars(&account_id);
+        return ConnectorHostIpcResponse {
+            status: if result.is_ok() { "ok" } else { "error" }.into(),
+            message: result.as_ref().err().map(ToString::to_string),
+            paused: host_state.lock().map(|s| s.paused).unwrap_or(true),
+            connectors: Vec::new(),
+            calendar_events: Vec::new(),
+            oauth: None,
+            calendar_accounts: Vec::new(),
+            available_calendars: result.unwrap_or_default(),
+        };
+    }
+    if let ConnectorHostIpcRequest::CalendarUpdatePreferences {
+        account_id,
+        calendar_ids,
+        reminder_minutes,
+    } = request
+    {
+        let result = update_calendar_preferences(&account_id, calendar_ids, reminder_minutes);
+        return ConnectorHostIpcResponse {
+            status: if result.is_ok() { "ok" } else { "error" }.into(),
+            message: result.err().map(|error| error.to_string()),
+            paused: host_state.lock().map(|s| s.paused).unwrap_or(true),
+            connectors: Vec::new(),
+            calendar_events: Vec::new(),
+            oauth: None,
+            calendar_accounts: Vec::new(),
+            available_calendars: Vec::new(),
+        };
+    }
+    if let ConnectorHostIpcRequest::CalendarSyncNow { account_id } = request {
+        let connector_id = load_calendar_accounts().and_then(|document| {
+            document
+                .accounts
+                .into_iter()
+                .find(|account| account.id == account_id)
+                .map(|account| match account.provider {
+                    CalendarProvider::Google => "google-calendar",
+                    CalendarProvider::Microsoft => "microsoft-calendar",
+                    CalendarProvider::Local => "local-calendar",
+                })
+                .context("unknown calendar account")
+        });
+        let mut state = match host_state.lock() {
+            Ok(state) => state,
+            Err(_) => return error_control_response("connector host state unavailable"),
+        };
+        let mut message = connector_id.as_ref().err().map(ToString::to_string);
+        if let Ok(connector_id) = connector_id {
+            if let Some(runtime) = state.runtimes.get_mut(connector_id) {
+                runtime.force_poll = true;
+                if let Some(status) = runtime.status.as_mut() {
+                    status.next_run_at_unix = Some(0);
+                }
+            } else {
+                message = Some("calendar connector unavailable".into());
+            }
+        }
+        return ConnectorHostIpcResponse {
+            status: if message.is_some() { "error" } else { "ok" }.into(),
+            message,
+            paused: state.paused,
+            connectors: Vec::new(),
+            calendar_events: Vec::new(),
+            oauth: None,
+            calendar_accounts: Vec::new(),
+            available_calendars: Vec::new(),
+        };
+    }
+    if let ConnectorHostIpcRequest::CalendarDisconnect {
+        account_id,
+        delete_local_data,
+    } = request
+    {
+        let result = disconnect_calendar_account(&account_id, delete_local_data);
+        return ConnectorHostIpcResponse {
+            status: if result.is_ok() { "ok" } else { "error" }.into(),
+            message: result.err().map(|e| e.to_string()),
+            paused: host_state.lock().map(|s| s.paused).unwrap_or(true),
+            connectors: Vec::new(),
+            calendar_events: Vec::new(),
+            oauth: None,
+            calendar_accounts: Vec::new(),
+            available_calendars: Vec::new(),
+        };
+    }
+    let mut state = match host_state.lock() {
         Ok(state) => state,
         Err(_) => {
             return ConnectorHostIpcResponse {
@@ -751,12 +2031,49 @@ fn apply_control_request(
                 message: Some("connector host state unavailable".into()),
                 paused: true,
                 connectors: Vec::new(),
+                calendar_events: Vec::new(),
+                oauth: None,
+                calendar_accounts: Vec::new(),
+                available_calendars: Vec::new(),
             };
         }
     };
     let mut message = None;
+    let mut calendar_events = Vec::new();
+    let oauth = None;
     match request {
         ConnectorHostIpcRequest::Status => {}
+        ConnectorHostIpcRequest::CalendarUpcoming {
+            after_unix,
+            before_unix,
+            limit,
+        } => {
+            if before_unix <= after_unix || limit == 0 || limit > 500 {
+                message = Some("calendar query bounds are invalid".into());
+            } else if let Some(store) = CALENDAR_STORE.get() {
+                match store.upcoming(after_unix, before_unix, limit) {
+                    Ok(events) => {
+                        calendar_events = events
+                            .into_iter()
+                            .map(|event| CalendarEventSnapshot {
+                                account_id: event.account_id,
+                                provider: format!("{:?}", event.provider).to_ascii_lowercase(),
+                                calendar_id: event.calendar_id,
+                                event_id: event.event_id,
+                                title: event.title,
+                                start_time: event.start_time,
+                                end_time: event.end_time,
+                                organizer: event.organizer,
+                                all_day: event.all_day,
+                            })
+                            .collect()
+                    }
+                    Err(error) => message = Some(error.to_string()),
+                }
+            } else {
+                message = Some("calendar store unavailable".into());
+            }
+        }
         ConnectorHostIpcRequest::SetPaused { paused } => state.paused = paused,
         ConnectorHostIpcRequest::PollNow { connector_id } => {
             for (id, runtime) in &mut state.runtimes {
@@ -786,6 +2103,15 @@ fn apply_control_request(
                 message = Some(format!("unknown connector runtime: {connector_id}"));
             }
         }
+        ConnectorHostIpcRequest::CalendarSaveEvent { .. }
+        | ConnectorHostIpcRequest::CalendarDeleteEvent { .. }
+        | ConnectorHostIpcRequest::CalendarConnect { .. }
+        | ConnectorHostIpcRequest::CalendarOAuthStatus { .. }
+        | ConnectorHostIpcRequest::CalendarAccounts
+        | ConnectorHostIpcRequest::CalendarDiscover { .. }
+        | ConnectorHostIpcRequest::CalendarUpdatePreferences { .. }
+        | ConnectorHostIpcRequest::CalendarSyncNow { .. }
+        | ConnectorHostIpcRequest::CalendarDisconnect { .. } => unreachable!(),
     }
     ConnectorHostIpcResponse {
         status: if message.is_some() { "error" } else { "ok" }.into(),
@@ -796,6 +2122,23 @@ fn apply_control_request(
             .values()
             .filter_map(|runtime| runtime.status.clone())
             .collect(),
+        calendar_events,
+        oauth,
+        calendar_accounts: Vec::new(),
+        available_calendars: Vec::new(),
+    }
+}
+
+fn error_control_response(message: &str) -> ConnectorHostIpcResponse {
+    ConnectorHostIpcResponse {
+        status: "error".into(),
+        message: Some(message.into()),
+        paused: true,
+        connectors: Vec::new(),
+        calendar_events: Vec::new(),
+        oauth: None,
+        calendar_accounts: Vec::new(),
+        available_calendars: Vec::new(),
     }
 }
 
@@ -809,6 +2152,68 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_fixture() -> CalendarEventSnapshot {
+        CalendarEventSnapshot {
+            account_id: "work".into(),
+            provider: "google".into(),
+            calendar_id: "primary".into(),
+            event_id: String::new(),
+            title: "Planning".into(),
+            start_time: "2026-11-09T09:00:00-05:00".into(),
+            end_time: "2026-11-09T10:00:00-05:00".into(),
+            organizer: String::new(),
+            all_day: false,
+        }
+    }
+
+    #[test]
+    fn provider_write_payloads_preserve_offsets_and_convert_graph_to_utc() {
+        let event = write_fixture();
+        let google = calendar_write_body(CalendarProvider::Google, &event).unwrap();
+        assert_eq!(google["start"]["dateTime"], event.start_time);
+        assert_eq!(google["summary"], "Planning");
+        assert!(google.get("attendees").is_none()); // PATCH preserves existing invitations.
+        let graph = calendar_write_body(CalendarProvider::Microsoft, &event).unwrap();
+        assert_eq!(graph["start"]["dateTime"], "2026-11-09T14:00:00");
+        assert_eq!(graph["start"]["timeZone"], "UTC");
+        assert_eq!(graph["isAllDay"], false);
+    }
+
+    #[test]
+    fn all_day_writes_use_exclusive_date_boundaries() {
+        let mut event = write_fixture();
+        event.all_day = true;
+        event.start_time = "2026-11-09T00:00:00Z".into();
+        event.end_time = "2026-11-10T00:00:00Z".into();
+        let google = calendar_write_body(CalendarProvider::Google, &event).unwrap();
+        assert_eq!(google["start"]["date"], "2026-11-09");
+        assert_eq!(google["end"]["date"], "2026-11-10");
+        assert!(google["start"].get("dateTime").is_none());
+        let graph = calendar_write_body(CalendarProvider::Microsoft, &event).unwrap();
+        assert_eq!(graph["isAllDay"], true);
+        assert_eq!(graph["end"]["dateTime"], "2026-11-10T00:00:00");
+    }
+
+    #[test]
+    fn provider_write_urls_handle_primary_and_escape_ids() {
+        let mut event = write_fixture();
+        assert_eq!(
+            calendar_event_url(CalendarProvider::Microsoft, &event)
+                .unwrap()
+                .as_str(),
+            "https://graph.microsoft.com/v1.0/me/events"
+        );
+        event.calendar_id = "team/a@example.com".into();
+        event.event_id = "id/with?reserved#characters".into();
+        let url = calendar_event_url(CalendarProvider::Google, &event).unwrap();
+        assert_eq!(url.host_str(), Some("www.googleapis.com"));
+        assert!(
+            url.path()
+                .contains("team%2Fa@example.com/events/id%2Fwith%3Freserved%23characters")
+        );
+        assert_eq!(url.query(), Some("sendUpdates=all"));
+    }
 
     #[test]
     fn calendar_fixture_parser_is_bounded_to_named_fields() {
@@ -851,6 +2256,54 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .quarantined
+        );
+    }
+
+    #[test]
+    fn accepts_only_the_issued_loopback_callback_url() {
+        let request = "GET /?code=authorization-code&state=csrf-token HTTP/1.1\r\nHost: localhost:43821\r\n\r\n";
+        assert_eq!(
+            authorization_code_from_loopback_callback(
+                request,
+                "http://localhost:43821/",
+                "csrf-token"
+            )
+            .unwrap(),
+            "authorization-code"
+        );
+    }
+
+    #[test]
+    fn rejects_callback_for_a_different_loopback_url_or_state() {
+        let wrong_host = "GET /?code=authorization-code&state=csrf-token HTTP/1.1\r\nHost: localhost:9999\r\n\r\n";
+        assert!(
+            authorization_code_from_loopback_callback(
+                wrong_host,
+                "http://localhost:43821/",
+                "csrf-token"
+            )
+            .is_err()
+        );
+
+        let wrong_path = "GET /other?code=authorization-code&state=csrf-token HTTP/1.1\r\nHost: localhost:43821\r\n\r\n";
+        assert!(
+            authorization_code_from_loopback_callback(
+                wrong_path,
+                "http://localhost:43821/",
+                "csrf-token"
+            )
+            .is_err()
+        );
+
+        let wrong_state =
+            "GET /?code=authorization-code&state=other HTTP/1.1\r\nHost: localhost:43821\r\n\r\n";
+        assert!(
+            authorization_code_from_loopback_callback(
+                wrong_state,
+                "http://localhost:43821/",
+                "csrf-token"
+            )
+            .is_err()
         );
     }
 }

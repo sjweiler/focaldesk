@@ -103,7 +103,7 @@ The implementation should extend existing FocalDesk mechanisms instead of creati
 - `core/wayland/portal_capture.rs` already exposes output capture through Smithay's image-copy-capture protocols.
 - `core/portal.rs` already renders portal output frames to textures and DMA-BUFs.
 - `core/backend_render.rs` already clips and compacts per-output damage.
-- `core/input.rs` defines backend-independent `FlowInputEvent` values.
+- `focaldesk-input` defines backend-independent `InputEvent` values.
 - `DesktopState::handle_input` already provides the common input-routing path.
 - `core/wayland/data_device.rs` already observes and installs Wayland clipboard selections.
 - The output store and topology code already track logical location, physical size, scale, and transform.
@@ -270,7 +270,7 @@ public internet.
 ### Phase 5: Remote input
 
 - [ ] Add an input origin such as `Physical` or `Remote(RemoteSessionId)`.
-- [ ] Translate remote events into the existing `FlowInputEvent` path.
+- [ ] Translate remote events into the existing `InputEvent` path.
 - [ ] Convert absolute client coordinates into global logical compositor coordinates.
 - [ ] Account for output location, fractional scale, and transform.
 - [ ] Support pointer motion and buttons.

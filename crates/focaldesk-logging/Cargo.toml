@@ -9,3 +9,11 @@ tracing-appender = { workspace = true }
 tracing-log = { workspace = true }
 tracing-journald = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
+
+opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client"] }
+tracing-opentelemetry = "0.32"
+
+[dev-dependencies]
+opentelemetry_sdk = { version = "0.31", features = ["testing"] }

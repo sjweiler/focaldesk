@@ -1,5 +1,6 @@
 pub mod accessibility;
 pub mod app;
+pub mod backend_event;
 pub mod camera;
 pub mod capture;
 pub mod color;
@@ -7,12 +8,14 @@ pub mod colord;
 pub mod consts;
 pub mod desktop;
 mod desktop_services;
+pub mod display_comfort;
 pub mod icc;
 pub mod icc_lut;
-pub mod input;
+pub mod keyboard_accessibility;
 pub mod layout;
 pub mod linear_compositing;
 pub mod lock;
+pub mod magnifier;
 pub mod output;
 pub mod output_store;
 pub mod remote;
@@ -37,6 +40,7 @@ pub mod ui_builder;
 
 // Re-export the “top-level” state types so `crate::core::X` works everywhere.
 pub use app::App;
+pub use backend_event::BackendEvent;
 pub use output::OutputState;
 pub use render::{FrameCtx, RenderState};
 pub use scene::SceneState;

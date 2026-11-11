@@ -1,0 +1,11 @@
+[Unit]
+Description=FocalDesk AI Console
+PartOf=focaldesk-session.target
+After=focaldesk-server.service
+Wants=focaldesk-server.service
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/focaldesk-ai-console
+UMask=0077
+TimeoutStopSec=10

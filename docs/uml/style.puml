@@ -1,0 +1,19 @@
+' Shared local styling. Smetana avoids an external Graphviz dependency.
+!pragma layout smetana
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam defaultFontName SansSerif
+skinparam defaultFontSize 13
+skinparam ArrowColor #34546D
+skinparam componentStyle rectangle
+skinparam componentBackgroundColor #EDF4FA
+skinparam componentBorderColor #34546D
+skinparam packageBackgroundColor #F8FAFC
+skinparam packageBorderColor #9CAFBF
+skinparam classBackgroundColor #EDF4FA
+skinparam classBorderColor #34546D
+skinparam sequenceParticipantBackgroundColor #EDF4FA
+skinparam sequenceParticipantBorderColor #34546D
+skinparam sequenceLifeLineBorderColor #9CAFBF
+skinparam noteBackgroundColor #FFF8DC
+skinparam noteBorderColor #B7A36A

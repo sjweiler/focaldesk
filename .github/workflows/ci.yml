@@ -4,6 +4,12 @@ on:
   push:
   pull_request:
 
+# Keep the full workspace (including WebKit/GTK) within hosted-runner disk limits.
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+
 permissions:
   contents: read
   pull-requests: read
@@ -63,6 +69,9 @@ jobs:
             libgles2-mesa-dev \
             libgbm-dev \
             libgtk-4-dev \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
             libadwaita-1-dev \
             libpam0g-dev \
             libsecret-tools \
@@ -109,11 +118,38 @@ jobs:
           echo "LIBRARY_PATH=$library_dir" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$library_dir" >> "$GITHUB_ENV"
 
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            apps/focaldesk-ai-console3/package-lock.json
+            apps/focaldesk-automation-studio/frontend/package-lock.json
+            apps/focalmail/frontend/package-lock.json
+
+      - name: Install desktop frontend dependencies
+        run: |
+          npm ci --prefix apps/focaldesk-automation-studio/frontend
+          npm ci --prefix apps/focalmail/frontend
+
+      - name: Build AI Console frontend
+        working-directory: apps/focaldesk-ai-console3
+        run: |
+          npm ci
+          npm run build
+
       - name: Rustfmt
         run: cargo fmt --all -- --check
 
       - name: Cargo check
         run: cargo check --workspace
+
+      - name: Crate boundaries
+        run: |
+          python3 scripts/check-crate-boundaries.py --self-test
+          python3 scripts/check-crate-boundaries.py
+          cargo check -p focaldesk-input --no-default-features
 
       - name: Clippy
         env:

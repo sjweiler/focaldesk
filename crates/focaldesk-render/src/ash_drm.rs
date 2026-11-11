@@ -31,6 +31,7 @@ const ABGR2101010: u32 = u32::from_le_bytes(*b"AB30");
 const GPU_SUBMISSION_TIMEOUT: Duration = Duration::from_secs(5);
 const DAMAGE_HISTORY_LIMIT: usize = 64;
 const DMA_BUF_SYNC_READ: u32 = 1;
+const DMA_BUF_SYNC_WRITE: u32 = 2;
 type DamageRect = [i32; 4];
 type DamageHistory = VecDeque<(u64, Vec<DamageRect>)>;
 
@@ -522,6 +523,15 @@ struct CachedTexture {
     last_used_frame: u64,
 }
 
+struct BorrowedTexture {
+    image: vk::Image,
+    view: vk::ImageView,
+    descriptor_set: vk::DescriptorSet,
+    width: u32,
+    height: u32,
+    format: FramePixelFormat,
+}
+
 #[derive(Clone, Copy)]
 struct DrawTexture {
     image: vk::Image,
@@ -715,8 +725,8 @@ fn capture_rgb_to_srgb8(
             let bt2020 = encoded.map(pq_to_nits);
             let linear_srgb_nits = [
                 1.660_491 * bt2020[0] - 0.587_641 * bt2020[1] - 0.072_850 * bt2020[2],
-                -0.124_550 * bt2020[0] + 1.132_900 * bt2020[1] - 0.008_349 * bt2020[2],
-                -0.018_151 * bt2020[0] - 0.100_579 * bt2020[1] + 1.118_730 * bt2020[2],
+                -0.124_550 * bt2020[0] + 1.132_9 * bt2020[1] - 0.008_349 * bt2020[2],
+                -0.018_151 * bt2020[0] - 0.100_579 * bt2020[1] + 1.118_73 * bt2020[2],
             ];
             let white = reference_white_nits.max(1.0);
             linear_srgb_nits.map(|value| linear_to_srgb((value / white).clamp(0.0, 1.0)))
@@ -769,6 +779,8 @@ pub struct AshDrmRenderer {
     linear_scenes: HashMap<u64, LinearScene>,
     output_resources: HashMap<u64, OutputResources>,
     texture_cache: HashMap<u64, CachedTexture>,
+    borrowed_textures: HashMap<u64, BorrowedTexture>,
+    retired_borrowed_descriptors: Vec<vk::DescriptorSet>,
     frame_no: u64,
     pending: Vec<PendingFrame>,
     completed_captures: VecDeque<AshDrmCapture>,
@@ -795,6 +807,21 @@ impl fmt::Debug for AshDrmRenderer {
 }
 
 impl AshDrmRenderer {
+    /// Publish this submission's completion fence to a DMA-BUF rendered by
+    /// Vulkan.  This is the implicit-sync handoff used by portal/PipeWire
+    /// clients; it lets them consume the buffer without forcing the
+    /// compositor thread to wait for GPU completion.
+    pub fn publish_target_write_fence(
+        &self,
+        target: &DrmRenderTarget,
+        fence: OwnedFd,
+    ) -> Result<()> {
+        let Some(plane) = target.planes.first() else {
+            bail!("DMA-BUF target has no planes");
+        };
+        import_dmabuf_write_fence(plane.as_raw_fd(), fence)
+    }
+
     /// Create a renderer matching the DRM device major/minor numbers.
     pub fn new(drm_major: u32, drm_minor: u32) -> Result<Self> {
         let entry = unsafe { Entry::load() }.context("load Vulkan loader")?;
@@ -1040,6 +1067,8 @@ impl AshDrmRenderer {
             linear_scenes: HashMap::new(),
             output_resources: HashMap::new(),
             texture_cache: HashMap::new(),
+            borrowed_textures: HashMap::new(),
+            retired_borrowed_descriptors: Vec::new(),
             frame_no: 0,
             pending: Vec::new(),
             completed_captures: VecDeque::new(),
@@ -1059,6 +1088,112 @@ impl AshDrmRenderer {
 
     pub fn info(&self) -> &RendererInfo {
         &self.info
+    }
+
+    /// Vulkan instance used by the raw compositor renderer.
+    pub fn instance(&self) -> &ash::Instance {
+        &self.instance
+    }
+
+    /// Physical device used by the raw compositor renderer.
+    pub fn physical_device(&self) -> vk::PhysicalDevice {
+        self.physical_device
+    }
+
+    /// Logical device used by the raw compositor renderer.
+    pub fn device(&self) -> &ash::Device {
+        &self.device
+    }
+
+    /// Graphics queue used by the raw compositor renderer.
+    pub fn queue(&self) -> vk::Queue {
+        self.queue
+    }
+
+    /// Graphics queue-family index used by the raw compositor renderer.
+    pub fn queue_family(&self) -> u32 {
+        self.queue_family
+    }
+
+    /// Registers a same-device image that remains owned by another renderer.
+    ///
+    /// The caller keeps the image and view alive and in
+    /// `SHADER_READ_ONLY_OPTIMAL` while frames referring to `cache_key` may be
+    /// in flight. Queue access must be externally synchronized.
+    pub fn register_borrowed_texture(
+        &mut self,
+        cache_key: u64,
+        image: vk::Image,
+        view: vk::ImageView,
+        width: u32,
+        height: u32,
+        format: FramePixelFormat,
+    ) -> Result<()> {
+        ensure!(image != vk::Image::null(), "borrowed Vulkan image is null");
+        ensure!(
+            view != vk::ImageView::null(),
+            "borrowed Vulkan image view is null"
+        );
+        ensure!(width > 0 && height > 0, "borrowed Vulkan image is empty");
+        if self
+            .borrowed_textures
+            .get(&cache_key)
+            .is_some_and(|texture| {
+                texture.image == image
+                    && texture.view == view
+                    && texture.width == width
+                    && texture.height == height
+                    && texture.format == format
+            })
+        {
+            return Ok(());
+        }
+        let layouts = [self.descriptor_layout];
+        let descriptor_set = unsafe {
+            self.device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(self.descriptor_pool)
+                    .set_layouts(&layouts),
+            )?
+        }[0];
+        let image_info = [vk::DescriptorImageInfo::default()
+            .image_view(view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let sampler_info = [vk::DescriptorImageInfo::default().sampler(self.sampler)];
+        unsafe {
+            self.device.update_descriptor_sets(
+                &[
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(descriptor_set)
+                        .dst_binding(0)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .image_info(&image_info),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(descriptor_set)
+                        .dst_binding(1)
+                        .descriptor_type(vk::DescriptorType::SAMPLER)
+                        .image_info(&sampler_info),
+                ],
+                &[],
+            );
+        }
+        if let Some(previous) = self.borrowed_textures.insert(
+            cache_key,
+            BorrowedTexture {
+                image,
+                view,
+                descriptor_set,
+                width,
+                height,
+                format,
+            },
+        ) {
+            // Descriptor sets can still be referenced by queued compositor
+            // work. Retain replacements until device-idle teardown.
+            self.retired_borrowed_descriptors
+                .push(previous.descriptor_set);
+        }
+        Ok(())
     }
 
     /// Formats the renderer can use as GBM scanout render targets.
@@ -1459,6 +1594,19 @@ impl AshDrmRenderer {
         let output_descriptor = self.output_resources[&stream_id].descriptor_set;
         let output_grid_size = self.output_resources[&stream_id].grid_size;
         for surface in surfaces {
+            if let Some(texture) = self.borrowed_textures.get(&surface.cache_key) {
+                if texture.width == surface.width
+                    && texture.height == surface.height
+                    && texture.format == surface.format
+                {
+                    textures.push(Some(DrawTexture {
+                        image: texture.image,
+                        descriptor_set: texture.descriptor_set,
+                        foreign: false,
+                    }));
+                    continue;
+                }
+            }
             let modifier = surface.dmabuf.as_ref().map(|dmabuf| dmabuf.modifier);
             let compatible = self
                 .texture_cache
@@ -1979,7 +2127,11 @@ impl AshDrmRenderer {
         };
         let signal = [semaphore];
         let commands = [command];
-        let wait_stages = vec![vk::PipelineStageFlags::FRAGMENT_SHADER; wait_semaphores.len()];
+        // The producer fence must also order the FOREIGN ownership acquire and
+        // its layout transition, not just fragment sampling. Without the
+        // maintenance8 ownership-transfer dependency flag, these operations
+        // have no defined pipeline stage and require an ALL_COMMANDS wait.
+        let wait_stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; wait_semaphores.len()];
         if let Err(error) = unsafe {
             self.device.queue_submit(
                 self.queue,
@@ -2872,7 +3024,7 @@ impl AshDrmRenderer {
                 image.image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &[vk::BufferImageCopy::default()
-                    .buffer_row_length(surface.stride / 4)
+                    .buffer_row_length(surface.stride / bytes_per_pixel(surface.format))
                     .image_subresource(
                         vk::ImageSubresourceLayers::default()
                             .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -3540,6 +3692,17 @@ impl Drop for AshDrmRenderer {
                 self.device.destroy_image(cached.resource.image.image, None);
                 self.device.free_memory(cached.resource.image.memory, None);
             }
+            let borrowed = self
+                .borrowed_textures
+                .drain()
+                .map(|(_, texture)| texture.descriptor_set)
+                .chain(self.retired_borrowed_descriptors.drain(..))
+                .collect::<Vec<_>>();
+            if !borrowed.is_empty() {
+                self.device
+                    .free_descriptor_sets(self.descriptor_pool, &borrowed)
+                    .ok();
+            }
             for (_, pipeline) in self.pipelines.drain() {
                 self.device.destroy_pipeline(pipeline.solid, None);
                 self.device.destroy_pipeline(pipeline.texture, None);
@@ -3578,10 +3741,19 @@ fn compile_shader(source: &str, stage: naga::ShaderStage, entry_point: &str) -> 
     )
     .validate(&module)
     .context("validate Vulkan composition shader")?;
+    let mut options = naga::back::spv::Options::default();
+    // Our NDC positions, positive-height viewports, damage render areas and
+    // scissors all use Vulkan's top-left framebuffer convention already.
+    // Naga's default Y flip mirrors scene drawing away from its damage. The
+    // output pass flips again, hiding the error on full frames but exposing
+    // stale mirrored regions as soon as only part of the scene is repainted.
+    options
+        .flags
+        .remove(naga::back::spv::WriterFlags::ADJUST_COORDINATE_SPACE);
     naga::back::spv::write_vec(
         &module,
         &info,
-        &naga::back::spv::Options::default(),
+        &options,
         Some(&naga::back::spv::PipelineOptions {
             shader_stage: stage,
             entry_point: entry_point.into(),
@@ -3609,6 +3781,7 @@ fn texture_vk_format(format: FramePixelFormat) -> vk::Format {
         FramePixelFormat::Rgba8Srgb => vk::Format::R8G8B8A8_UNORM,
         FramePixelFormat::Bgra10Unorm => vk::Format::A2R10G10B10_UNORM_PACK32,
         FramePixelFormat::Rgba10Unorm => vk::Format::A2B10G10R10_UNORM_PACK32,
+        FramePixelFormat::Rgba16FloatLinear => vk::Format::R16G16B16A16_SFLOAT,
     }
 }
 
@@ -3705,6 +3878,21 @@ fn import_dmabuf_read_fence(dmabuf_fd: RawFd, sync_fd: OwnedFd) -> Result<()> {
             Ok(())
         }
         Err(error) => Err(error).context("import Vulkan read fence into DMA-BUF"),
+    }
+}
+
+#[cfg(unix)]
+fn import_dmabuf_write_fence(dmabuf_fd: RawFd, sync_fd: OwnedFd) -> Result<()> {
+    let import = DmaBufImportSyncFile {
+        flags: DMA_BUF_SYNC_WRITE,
+        fd: sync_fd.as_raw_fd(),
+    };
+    match unsafe { dma_buf_import_sync_file(dmabuf_fd, &import) } {
+        Ok(_) => Ok(()),
+        Err(nix::errno::Errno::ENOTTY | nix::errno::Errno::EINVAL | nix::errno::Errno::ENOSYS) => {
+            Ok(())
+        }
+        Err(error) => Err(error).context("import Vulkan write fence into DMA-BUF"),
     }
 }
 
@@ -4005,6 +4193,14 @@ fn texture_upload_byte_len(
     (available >= required).then_some(required)
 }
 
+fn bytes_per_pixel(format: FramePixelFormat) -> u32 {
+    if format == FramePixelFormat::Rgba16FloatLinear {
+        8
+    } else {
+        4
+    }
+}
+
 fn validate_meshes(meshes: &[TexturedMesh]) -> Result<()> {
     for mesh in meshes {
         ensure!(
@@ -4074,6 +4270,33 @@ mod tests {
             let fragment = compile_shader(source, naga::ShaderStage::Fragment, "fs_main").unwrap();
             assert_eq!(vertex.first().copied(), Some(0x0723_0203));
             assert_eq!(fragment.first().copied(), Some(0x0723_0203));
+        }
+    }
+
+    #[test]
+    fn raw_vulkan_vertex_positions_match_top_left_damage_coordinates() {
+        // With a positive-height Vulkan viewport, NDC y=-1 is the top edge.
+        // The raw renderer already supplies positions in that convention.
+        // A compiler-injected Y negation would mirror drawing away from the
+        // unmodified render-area/scissor rectangles during partial repaints.
+        let top = ndc_rect([10, 0, 20, 10], 100, 100);
+        assert_eq!(top[1], -1.0);
+        let source = r#"
+            @vertex fn vs_main() -> @builtin(position) vec4<f32> {
+                return vec4(0.0, -1.0, 0.0, 1.0);
+            }
+        "#;
+        let words = compile_shader(source, naga::ShaderStage::Vertex, "vs_main").unwrap();
+        let mut offset = 5; // Skip the SPIR-V header.
+        while offset < words.len() {
+            let instruction = words[offset];
+            let word_count = (instruction >> 16) as usize;
+            let opcode = instruction & 0xffff;
+            assert!(word_count > 0);
+            // OpFNegate (127) is not present in this shader's source; Naga's
+            // default coordinate adjustment injects it into the epilogue.
+            assert_ne!(opcode, 127, "compiler mirrored the vertex position Y");
+            offset += word_count;
         }
     }
 

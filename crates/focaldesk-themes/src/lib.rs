@@ -1,6 +1,5 @@
 pub mod builtins;
 pub mod document;
-pub mod export;
 pub mod gtk;
 pub mod manager;
 pub mod package;
@@ -11,15 +10,15 @@ pub mod theme;
 pub const SYSTEM_DEFAULT_THEME_PATH: &str = "/usr/share/focaldesk/default.toml";
 
 pub use theme::{
-    BackgroundTheme, ChromeTheme, DialogTheme, FlowTheme, FlowThemeId, IconTheme, TextTheme,
-    WallpaperTheme,
+    BackgroundTheme, BackingTheme, ChromeTheme, DialogTheme, FlowTheme, FlowThemeId, IconTheme,
+    TextTheme, WallpaperTheme,
 };
 
 pub use document::{
-    ThemeDocument, ThemeWallpaper, ThemeWallpaperFit, MAX_GRADIENT_STOPS, THEME_DOCUMENT_VERSION,
+    ThemeBacking, ThemeDocument, ThemeWallpaper, ThemeWallpaperFit, MAX_GRADIENT_STOPS,
+    THEME_DOCUMENT_VERSION,
 };
 
-pub use export::{builtin_theme_css, write_builtin_theme_css};
 pub use gtk::{gtk_app_css, gtk_app_prefers_dark, GtkAppThemeOptions};
 pub use manager::{ActiveTheme, ThemeManager};
 pub use package::{

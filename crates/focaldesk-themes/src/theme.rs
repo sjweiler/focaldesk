@@ -28,6 +28,10 @@ pub struct FlowTheme {
 
     pub background: BackgroundTheme,
     pub wallpaper: WallpaperTheme,
+    /// Opacity for the smoked-glass backing behind the external shell surfaces.
+    /// The color remains shared so themes only need to express the amount of
+    /// separation their wallpaper needs.
+    pub backing: BackingTheme,
     pub chrome: ChromeTheme,
     pub dialog: DialogTheme,
     pub text: TextTheme,
@@ -70,6 +74,23 @@ pub struct WallpaperTheme {
     pub blur: f32,
     #[serde(default = "default_wallpaper_saturation")]
     pub saturation: f32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct BackingTheme {
+    /// Backing opacity for the right-hand system rail.
+    pub rail_opacity: f32,
+    /// Backing opacity for the bottom task shelf.
+    pub dock_opacity: f32,
+}
+
+impl Default for BackingTheme {
+    fn default() -> Self {
+        Self {
+            rail_opacity: 0.68,
+            dock_opacity: 0.78,
+        }
+    }
 }
 
 fn default_wallpaper_saturation() -> f32 {
@@ -120,17 +141,17 @@ pub struct IconTheme {
 
 impl Default for FlowTheme {
     fn default() -> Self {
-        crate::builtins::eagle_theme()
+        crate::builtins::default_theme()
     }
 }
 
 pub fn theme_by_name(name: &str) -> FlowTheme {
-    match name {
-        "Eagle" => builtin_theme(BuiltInThemeId::Eagle),
-        "Moonbase" => builtin_theme(BuiltInThemeId::Moonbase),
-        "Classic" => builtin_theme(BuiltInThemeId::Classic),
-        _ => builtin_theme(BuiltInThemeId::Eagle),
+    if let Ok(document) = crate::ThemeDocument::load(std::path::Path::new(name)) {
+        if let Ok(theme) = crate::manager::theme_from_document(&document) {
+            return theme;
+        }
     }
+    builtin_theme(BuiltInThemeId::Eagle)
 }
 
 impl Default for FlowThemeId {

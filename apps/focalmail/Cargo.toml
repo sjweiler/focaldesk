@@ -1,0 +1,35 @@
+[package]
+name = "focalmail"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["desktop", "custom-protocol"]
+custom-protocol = ["tauri?/custom-protocol"]
+desktop = ["dep:tauri", "dep:tauri-build"]
+
+[build-dependencies]
+tauri-build = { version = "2", optional = true }
+
+[dependencies]
+tauri = { version = "2", optional = true }
+anyhow = "1"
+base64 = "0.22"
+chrono = "0.4"
+dirs = "6"
+keyring = { version = "3", features = ["async-secret-service", "crypto-rust", "async-io"] }
+mailparse = "0.16"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+url = "2"
+webbrowser = "1"
+scraper = { version = "0.27", default-features = false }
+
+imap = "2.4"
+native-tls = "0.2"
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "native-tls"] }
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }

@@ -17,7 +17,18 @@ impl PointerConstraintsHandler for DesktopState {
         if current_focus.wl_surface().as_deref() == Some(surface) {
             with_pointer_constraint(surface, pointer, |constraint| {
                 if let Some(constraint) = constraint {
-                    constraint.activate();
+                    // A locked pointer pins the compositor cursor at its last
+                    // position.  Granting that request as soon as a client
+                    // creates the object can make an ordinary desktop cursor
+                    // appear to be pulled back to the centre of the screen.
+                    // FocalDesk therefore supports bounded confinement but
+                    // does not grant client cursor locks by default.
+                    if matches!(
+                        &*constraint,
+                        smithay::wayland::pointer_constraints::PointerConstraint::Confined(_)
+                    ) {
+                        constraint.activate();
+                    }
                 }
             });
         }

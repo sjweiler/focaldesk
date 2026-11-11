@@ -244,12 +244,12 @@ fn supported_wallpaper_extension(path: &Path) -> anyhow::Result<String> {
         .map(str::to_ascii_lowercase)
         .ok_or_else(|| anyhow::anyhow!("wallpaper must have a supported image extension"))?;
     match extension.as_str() {
-        "png" | "jpg" | "jpeg" | "webp" => Ok(if extension == "jpeg" {
+        "png" | "jpg" | "jpeg" | "webp" | "exr" => Ok(if extension == "jpeg" {
             "jpg".to_string()
         } else {
             extension
         }),
-        _ => bail!("wallpaper must be PNG, JPEG, or WebP"),
+        _ => bail!("wallpaper must be PNG, JPEG, WebP, or OpenEXR"),
     }
 }
 
@@ -257,6 +257,7 @@ fn wallpaper_media_type(extension: &str) -> &'static str {
     match extension {
         "png" => "image/png",
         "webp" => "image/webp",
+        "exr" => "image/x-exr",
         _ => "image/jpeg",
     }
 }

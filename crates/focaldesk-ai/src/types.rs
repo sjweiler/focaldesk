@@ -17,6 +17,9 @@ pub struct ChatRequest {
     /// provider is called. No-op if no memory store is configured.
     #[serde(default)]
     pub use_memory: bool,
+    /// None uses shared memory; Some restricts retrieval to these indexed source URIs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_sources: Option<Vec<String>>,
 }
 
 impl ChatRequest {
@@ -28,6 +31,7 @@ impl ChatRequest {
             temperature: None,
             max_tokens: None,
             use_memory: false,
+            memory_sources: None,
         }
     }
 }
@@ -36,6 +40,9 @@ impl ChatRequest {
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
+    /// Validated image data URLs. Text-only callers remain wire compatible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
 }
 
 impl ChatMessage {
@@ -43,6 +50,7 @@ impl ChatMessage {
         Self {
             role: ChatRole::System,
             content: content.into(),
+            images: Vec::new(),
         }
     }
 
@@ -50,6 +58,7 @@ impl ChatMessage {
         Self {
             role: ChatRole::User,
             content: content.into(),
+            images: Vec::new(),
         }
     }
 
@@ -57,6 +66,7 @@ impl ChatMessage {
         Self {
             role: ChatRole::Assistant,
             content: content.into(),
+            images: Vec::new(),
         }
     }
 }
@@ -111,6 +121,19 @@ pub struct DocumentIngestResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectoryIngestResult {
+    pub source: String,
+    pub indexed: usize,
+    pub unchanged: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub chunks: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+}
+
+/// Summary of a bounded static-site ingestion run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebsiteIngestResult {
     pub source: String,
     pub indexed: usize,
     pub unchanged: usize,
@@ -185,6 +208,16 @@ pub struct AiDaemonStatus {
     pub provider_count: usize,
     #[serde(default)]
     pub provider_telemetry: Vec<ProviderTelemetry>,
+    /// Most recent completed chat retained in memory for session-local surfaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_chat: Option<RecentChatActivity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentChatActivity {
+    pub prompt: String,
+    pub response: String,
+    pub completed_at_unix: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

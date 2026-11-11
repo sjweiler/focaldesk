@@ -51,9 +51,13 @@ pub fn script_path(script: &str) -> PathBuf {
 /// rather than a startup failure — the daemon should still come up and
 /// serve `Status`/`ListAutomations` over IPC.
 pub fn load_config() -> AutomationConfig {
-    let path = config_path();
+    load_config_at(&automation_root())
+}
 
-    match std::fs::read_to_string(&path) {
+fn load_config_at(root: &Path) -> AutomationConfig {
+    let path = root.join("automations.toml");
+
+    let mut config = match std::fs::read_to_string(&path) {
         Ok(text) => toml::from_str(&text).unwrap_or_else(|err| {
             tracing::warn!(
                 target: "focaldesk.automation",
@@ -64,12 +68,56 @@ pub fn load_config() -> AutomationConfig {
             AutomationConfig::default()
         }),
         Err(_) => AutomationConfig::default(),
+    };
+    // Studio manifests are committed atomically and never replace user config.
+    let published = root.join("studio/published");
+    if let Ok(entries) = std::fs::read_dir(published) {
+        let mut paths: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        for path in paths {
+            if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+                continue;
+            }
+            match std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| toml::from_str::<AutomationEntry>(&text).ok())
+            {
+                Some(entry) if !config.automations.iter().any(|a| a.name == entry.name) => {
+                    config.automations.push(entry)
+                }
+                _ => {
+                    tracing::warn!(target: "focaldesk.automation", path = %path.display(), "ignored invalid or duplicate Studio manifest")
+                }
+            }
+        }
     }
+    config
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loads_studio_manifests_alongside_legacy_config() {
+        let root = std::env::temp_dir().join(format!("studio-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("studio/published")).unwrap();
+        std::fs::write(
+            root.join("automations.toml"),
+            "[[automation]]\nname='legacy'\nscript='old.lua'\nschedule='every 1h'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("studio/published/new.toml"),
+            "name='studio:new'\nscript='/tmp/new.lua'\nschedule='daily 09:00'\nenabled=true\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("studio/published/broken.toml"), "invalid").unwrap();
+        assert_eq!(load_config_at(&root).automations.len(), 2);
+        std::fs::remove_file(root.join("automations.toml")).unwrap();
+        assert_eq!(load_config_at(&root).automations.len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn script_path_resolves_relative_against_scripts_dir() {

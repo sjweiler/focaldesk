@@ -37,6 +37,8 @@ tracked in [Known Issues](docs/known-issues.md).
 - PipeWire and portal integration for experimental screen capture.
 - Experimental, view-only RDP service with TLS, short-lived credentials, and a
   loopback-only listener ([details](docs/remote-desktop.md)).
+- [Automation Studio](apps/focaldesk-automation-studio/README.md): a Svelte Flow
+  visual editor for scheduled desktop workflows, with draft storage and Lua publishing.
 - Separate user services for launching, settings, notifications, power,
   dialogs, controls, speech, voice input, and permissioned automation.
 - Encrypted credential broker with ACL-protected native IPC and Secret Service
@@ -64,7 +66,7 @@ release.
 | XWayland application support | Working, alpha |
 | PipeWire/portal screen capture | Experimental |
 | Remote desktop | Experimental Phase 3: one output, one view-only RDP client, loopback/SSH-tunnel access only |
-| HDR and color management | Experimental and hardware-dependent; HDR10 verified through both GLES and raw Ash Vulkan on Fedora 44 with NVIDIA 595. Raw Vulkan has also been visually validated with HDR images and video, visually correct SDR-in-HDR composition, a TCL HDR 1400 display stable at 165 Hz, and an ASUS VG32VQR DisplayHDR 400 display stable at up to 120 Hz. An automated ArgyllCMS measurement workflow is implemented, but the physical meter run is still pending ([validation status](docs/hdr.md#validation-status)) |
+| HDR and color management | Experimental and hardware-dependent. Calibrite Display Plus HL measurements verify the raw-Ash Vulkan HDR10/PQ output path and metadata, SDR-reference-white/HDR-pattern switching, D65-tolerant neutral whites, and HDR luminance headroom. A strict pass on one display measured 1,354 nits for a 10% highlight and 621 nits full-frame. A second same-model monitor confirmed the HDR pipeline and color behavior, while its luminance varied with OSD brightness and panel response. Vulkan was the only tested FocalDesk rendering path with correct measured color through the complete HDR output pipeline; this validates the calibration-pattern/output path, not every content tone-mapping case. |
 | Settings, theme editor, file manager, launcher, and AI console | Usable prototypes; theme editor gradients render compositor-side with up to eight stops |
 | Local AI and automation services | Experimental and permission-gated |
 | Precise Wayland subsurface damage tracking | Implemented, with safe fallbacks |
@@ -93,9 +95,11 @@ and native applications running together. The repository contains:
 
 ### Launcher
 
-The native launcher provides application discovery and starts applications
-through a dedicated launcher service rather than embedding process management
-in the compositor.
+The native launcher provides ranked, keyboard-first search across applications,
+Settings pages, favorite and recent files, and currently open windows. It also
+evaluates bounded arithmetic expressions locally. Window focus and Settings
+navigation use typed compositor actions; search never executes arbitrary shell
+input.
 
 ![Launcher](docs/screenshots/launcher.png)
 
@@ -108,8 +112,35 @@ service controls. Some panels are still incomplete or hardware-dependent.
 
 ### File Manager
 
-The first-party file manager prototype provides common browsing, navigation,
-search, sorting, and list/grid workflows.
+The first-party file manager provides common browsing, navigation, search,
+sorting, and list/grid workflows. Grid view generates bounded asynchronous
+JPEG, PNG, and first-page PDF thumbnails, while the selection pane previews
+supported images, PDFs, text, and file metadata. A live Devices sidebar mounts
+and unlocks removable volumes and provides capability-aware safe unmount or
+eject actions through GIO.
+Rename, move, copy, new-folder, drag-copy, and trash operations have bounded
+per-tab undo history through `Ctrl+Z` and the operation toast.
+Local copy and move jobs run off the UI thread with byte progress, throughput
+and ETA reporting, mid-file cancellation, staged commits, batch conflict
+choices, metadata/link preservation, and exact replacement undo.
+Trash also supports conflict-safe restore to the recorded original location and
+confirmed permanent deletion of selected items.
+Files can also mount SMB, SFTP, FTP, and WebDAV servers through native GIO
+authentication, with URI-only private bookmarks and safe disconnect controls.
+Search can optionally traverse local subfolders in the background, with bounded
+partial results and relative paths.
+ZIP, TAR, gzip TAR, and xz TAR archives can be extracted asynchronously with
+safe-path validation, bounded output, keep-both conflicts, cancellation, and
+undo.
+Multi-selection rename provides a live rule preview, extension preservation,
+collision checks, transactional rollback, and undo.
+Local folders can be pinned to the Places sidebar with `Ctrl+D` and shared with
+GTK file pickers; bookmarks can be renamed, reordered, or removed, while
+temporarily missing targets remain manageable.
+Properties can edit local Unix read, write, and execute permissions, including
+mixed multi-selection and a regular-file executable shortcut. Confirmed
+recursive changes are bounded, symlink- and mount-safe, transactional, and
+exactly undoable with `Ctrl+Z`.
 
 ![File Manager](docs/screenshots/files.png)
 
@@ -150,6 +181,8 @@ state.
 The diagram is conceptual and includes elements marked as planned or future.
 See the [architecture guide](docs/architecture.md) for the rendering and IPC
 diagrams, current boundaries, and implementation notes.
+The [UML guide](docs/uml/README.md) adds generated workspace dependency diagrams
+and reviewed rendering, IPC, and type diagrams, with editable sources and SVGs.
 
 ## Technical Challenges
 
@@ -186,10 +219,14 @@ diagrams, current boundaries, and implementation notes.
 - `apps/focaldesk-desktop`: compositor executable
 - `apps/focaldesk-cli`: command-line interface
 - `apps/focaldesk-ai-console`: interface app for ai
-- `apps/focaldesk-files`: file app prototype
+- `apps/focaldesk-calendar`: unified Google Calendar and Microsoft 365 weekly
+  calendar with event editing and AI meeting preparation
+- `apps/focaldesk-files`: file app with previews, devices, network locations,
+  undo, and bounded recursive filename search
 - `apps/focaldesk-settings`: settings app prototype
 - `apps/focaldesk-portal`: portal-related app code
 - `services/focaldesk-remoted`: experimental view-only RDP service
+- `services/focaldesk-recorder`: explicit, local MP4 screen recorder
 - `services/`: other background daemons and IPC services
 - `crates/`: shared FocalDesk libraries
 - `assets/`: bundled visual assets
@@ -250,12 +287,21 @@ The default `focaldesk-desktop` features target a direct DRM/KMS session. Do not
 run that mode casually from an important graphical session; use the installed
 Wayland session described below.
 
-To make FocalDesk show up in GDM, install the compositor and Wayland session:
+To install a complete FocalDesk session on Fedora, including its shell and
+supporting services, run:
 
 ```sh
 just install-desktop
 just install-desktop-session
+just install-services-fedora
+just install-launcher
 ```
+
+Select FocalDesk in your existing display manager (including Plasma Login
+Manager or GDM). Installing only the compositor and session entry leaves
+launching, controls, notifications, and the GTK shell unavailable. FocalDM is
+not required. Other distributions can use `just install-services` for the
+per-user service installation.
 
 That recipe builds and installs the compositor to
 `/usr/local/bin/focaldesk-desktop` (the Wayland session `Exec=`), and installs
@@ -506,7 +552,7 @@ and an emergency disconnect are built in. See
 [Event Fabric and Consent Center](docs/event-fabric.md).
 
 The **Connector SDK and Trust Store** adds validated versioned producer
-manifests, five disabled-by-default local connector identities, namespaced
+manifests, seven disabled-by-default connector identities, namespaced
 opaque signing-key handles, signed event requests with freshness and replay
 protection, persistent source consent, health reporting, explicit network
 domain authority, and reversible updates. See

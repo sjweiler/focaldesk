@@ -6,7 +6,10 @@ pub mod connector;
 pub mod context;
 pub mod event;
 pub mod forge;
+pub mod guard;
+mod ingestion;
 pub mod ipc;
+pub use ingestion::{IngestionJob, IngestionSource};
 mod managed_provider;
 pub mod mission;
 pub mod package;
@@ -17,6 +20,7 @@ pub mod provider;
 pub mod providers;
 pub mod routine;
 mod run_store;
+mod runtime_context;
 pub mod scenario;
 pub mod service;
 pub mod types;
@@ -58,7 +62,7 @@ pub use forge::{
 pub use ipc::{
     AI_LEGACY_PROTOCOL_VERSION, AI_MAX_REQUEST_BYTES, AI_MAX_RESPONSE_BYTES, AI_PROTOCOL_VERSION,
     AI_SOCKET_ENV, AI_SOCKET_NAME, AiIpcRequest, AiIpcResponse, ai_socket_path, cancel_ai_stream,
-    send_ai_request, serve_ai_ipc, stream_ai_chat,
+    send_ai_request, serve_ai_ipc, stream_ai_chat, stream_ai_chat_with_id,
 };
 pub use mission::{
     MissionBudgetSummary, MissionConnectorSummary, MissionControlSnapshot, MissionRuntimeSummary,
@@ -94,7 +98,8 @@ pub use service::{AgentControlStatus, AiService};
 pub use types::{
     AiDaemonStatus, AiStreamEvent, ChatMessage, ChatRequest, ChatResponse, ChatRole, Citation,
     DirectoryIngestResult, DocumentIngestResult, ProviderInfo, ProviderModelInfo,
-    ProviderTelemetry, RetrievalEvalCase, RetrievalEvalReport, TokenUsage,
+    ProviderTelemetry, RecentChatActivity, RetrievalEvalCase, RetrievalEvalReport, TokenUsage,
+    WebsiteIngestResult,
 };
 pub use workflow::{
     WORKFLOW_MANIFEST_VERSION, WorkflowArtifact, WorkflowDefinition, WorkflowNode,

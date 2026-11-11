@@ -356,6 +356,7 @@ impl MemoryStore {
     /// Stores `text` with its precomputed `embedding` and returns its id.
     /// The blocking sqlite work runs on a blocking thread so callers on the
     /// async runtime don't stall behind disk I/O.
+    #[tracing::instrument(name = "memory.index", target = "focaldesk.telemetry", skip_all)]
     pub async fn remember(
         &self,
         text: String,
@@ -417,6 +418,7 @@ impl MemoryStore {
 
     /// Finds the `top_k` memories whose stored embedding is nearest to
     /// `query_embedding` (nearest first).
+    #[tracing::instrument(name = "memory.search", target = "focaldesk.telemetry", skip_all)]
     pub async fn recall(&self, query_embedding: Vec<f32>, top_k: usize) -> Result<Vec<SearchHit>> {
         if query_embedding.len() != self.dimension {
             bail!(
@@ -429,7 +431,9 @@ impl MemoryStore {
         let inner = self.inner.clone();
         let policy = self.policy;
         let backend = self.vector_backend.clone();
+        let parent = tracing::Span::current();
         tokio::task::spawn_blocking(move || {
+            let _parent = parent.enter();
             let mut conn = inner.lock().expect("memory store connection poisoned");
             Self::prune_backend_locked(&mut conn, policy, now_unix(), &backend)?;
 
@@ -437,9 +441,20 @@ impl MemoryStore {
                 VectorBackend::SqliteVec => Self::recall_sqlite(&conn, query_embedding, top_k),
                 VectorBackend::FocalVector { client, collection } => {
                     Self::sync_pending_embeddings(&mut conn, &backend)?;
-                    let hits = client
-                        .query(collection.clone(), query_embedding, top_k, None, None)
-                        .context("Focal Vector memory query failed")?;
+                    let query_span = tracing::info_span!(target: "focaldesk.telemetry", "focal_vector.query", dimensions = query_embedding.len(), top_k);
+                    let mut operation = focaldesk_logging::metrics::Operation::start(focaldesk_logging::metrics::Stage::VectorSearch);
+                    let hits: anyhow::Result<_> = query_span.in_scope(|| {
+                        client
+                            .query(collection.clone(), query_embedding, top_k, None, None)
+                            .context("Focal Vector memory query failed")
+                    });
+                    operation.finish(match &hits {
+                        Ok(_) => focaldesk_logging::metrics::Outcome::Ok,
+                        Err(error) if error.chain().any(|e| e.downcast_ref::<focal_vector_client::Error>().is_some_and(|error| matches!(error, focal_vector_client::Error::Io(io) if matches!(io.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)))) => focaldesk_logging::metrics::Outcome::Timeout,
+                        Err(_) => focaldesk_logging::metrics::Outcome::Error,
+                    });
+                    drop(operation);
+                    let hits = hits?;
                     let mut recalled = Vec::with_capacity(hits.len());
                     for hit in hits {
                         let Ok(id) = hit.id.parse::<MemoryId>() else {
@@ -475,17 +490,16 @@ impl MemoryStore {
             return Ok(Vec::new());
         }
         let candidate_count = top_k.saturating_mul(4).max(top_k);
+        let query_terms = terms(&query);
         let dense = self.recall(query_embedding, candidate_count).await?;
         let inner = self.inner.clone();
-        let query_for_lexical = query.clone();
+        let query_terms_for_lexical = query_terms.clone();
         let lexical = tokio::task::spawn_blocking(move || {
             let conn = inner.lock().expect("memory store connection poisoned");
-            Self::recall_lexical(&conn, &query_for_lexical, candidate_count)
+            Self::recall_lexical(&conn, &query_terms_for_lexical, candidate_count)
         })
         .await
         .context("memory lexical search task panicked")??;
-
-        let query_terms = terms(&query);
         let sqlite_distances_are_l2 = matches!(self.vector_backend, VectorBackend::SqliteVec);
         let mut fused: HashMap<MemoryId, (MemoryRecord, f32, Option<f32>)> = HashMap::new();
         for (rank, hit) in dense.into_iter().enumerate() {
@@ -519,7 +533,12 @@ impl MemoryStore {
                         / query_terms.len() as f32;
                     score += overlap * 0.02;
                 }
-                (record, score, semantic_distance.unwrap_or(f32::INFINITY))
+                // `SearchHit` crosses the AI IPC boundary as JSON. JSON has
+                // no representation for infinity (serde_json writes it as
+                // `null`), which made lexical-only matches impossible for
+                // clients to deserialize. A finite maximum value preserves
+                // the "no semantic score" ordering without breaking IPC.
+                (record, score, semantic_distance.unwrap_or(f32::MAX))
             })
             .collect::<Vec<_>>();
         hits.sort_by(|left, right| right.1.total_cmp(&left.1));
@@ -819,9 +838,13 @@ impl MemoryStore {
             .map_err(anyhow::Error::from)
     }
 
-    fn recall_lexical(conn: &Connection, query: &str, top_k: usize) -> Result<Vec<SearchHit>> {
-        let fts_query = terms(query)
-            .into_iter()
+    fn recall_lexical(
+        conn: &Connection,
+        query_terms: &HashSet<String>,
+        top_k: usize,
+    ) -> Result<Vec<SearchHit>> {
+        let fts_query = query_terms
+            .iter()
             .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" OR ");
@@ -1127,8 +1150,10 @@ fn decode_embedding(bytes: &[u8]) -> Result<Vec<f32>> {
         bail!("stored embedding has invalid byte length {}", bytes.len());
     }
     Ok(bytes
-        .chunks_exact(std::mem::size_of::<f32>())
-        .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("four-byte chunk")))
+        .as_chunks::<{ std::mem::size_of::<f32>() }>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_ne_bytes(*chunk))
         .collect())
 }
 
@@ -1527,6 +1552,7 @@ mod tests {
                 hits[0].record.text,
                 "diagnostic code ZXQ441 identifies the failure"
             );
+            assert!(hits.iter().all(|hit| hit.distance.is_finite()));
         });
         drop(store);
         let _ = fs::remove_file(path);

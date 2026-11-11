@@ -110,10 +110,33 @@ truth for what is usable today.
 
 - [x] Expand the completed workspace-slot controls with animated window-layout
   overview thumbnails.
-- Add full-desktop workspace transition animations.
+- [x] Add full-desktop workspace transition animations.
 - [x] Expand the completed keybinding editor with direct shortcut capture and
   conflict feedback.
-- Add configurable pointer gestures.
+- [x] Add configurable pointer gestures.
+- [x] Add standards-compatible actionable desktop notifications.
+- [x] Add unified Launcher search for apps, Settings, files, windows, and
+  calculator results.
+- [x] Add bounded asynchronous thumbnails and selection previews to Files.
+- [x] Add hotplug-aware removable-volume mounting, unlocking, unmounting, and
+  ejecting to Files through GIO.
+- [x] Add bounded, conflict-safe per-tab undo for common Files operations.
+- [x] Add GIO-backed SMB, SFTP, FTP, and WebDAV connections with private,
+  credential-free bookmarks to Files.
+- [x] Add bounded asynchronous recursive filename search to Files.
+- [x] Complete Files Trash recovery with conflict-safe restore and confirmed
+  selected-item permanent deletion.
+- [x] Add bounded, cancellable, undoable archive extraction with safe-path and
+  archive-bomb defenses to Files.
+- [x] Add preview-first transactional bulk rename with collision validation and
+  undo to Files.
+- [x] Add transactional Unix permission editing to Files with mixed selection,
+  bounded symlink-safe recursion, and exact undo.
+- [x] Add interoperable local Places bookmarks to Files with persistence,
+  rename, reorder, missing-target handling, and GTK file-picker sharing.
+- [x] Add a bounded background local file-transfer engine with byte progress,
+  cancellation, conflict policy, staged commits, metadata preservation, and
+  replacement-aware undo.
 - Mature the launcher, Settings application, file manager, notifications, power
   handling, lock screen, and accessibility behavior.
 - Improve first-run setup, recovery, and uninstall workflows.

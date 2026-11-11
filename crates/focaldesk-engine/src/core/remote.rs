@@ -12,7 +12,8 @@ use std::thread;
 use std::time::Duration;
 
 use focaldesk_remote_protocol::{
-    send_fd, write_message, DamageRect, Event, OutputTransform, PixelFormat, Request,
+    send_fd, write_message, CapturePurpose, DamageRect, Event, OutputTransform, PixelFormat,
+    Request,
 };
 use focaldesk_types::OutputId;
 use smithay::backend::renderer::gles::GlesRenderer;
@@ -27,6 +28,7 @@ const OUTBOUND_QUEUE_DEPTH: usize = 2;
 enum RemoteCommand {
     Start {
         output_id: OutputId,
+        purpose: CapturePurpose,
         outbound: SyncSender<RemoteOutbound>,
     },
     Disconnected {
@@ -45,6 +47,7 @@ struct RemoteOutbound {
 struct RemoteSession {
     consumer_id: CaptureConsumerId,
     output_id: OutputId,
+    purpose: CapturePurpose,
     next_frame_serial: u64,
     outbound: SyncSender<RemoteOutbound>,
 }
@@ -79,6 +82,7 @@ impl LocalRemoteCapture {
             match command {
                 RemoteCommand::Start {
                     output_id,
+                    purpose,
                     outbound,
                 } => {
                     let Some(output) = state.outputs.get(&output_id) else {
@@ -113,6 +117,7 @@ impl LocalRemoteCapture {
                         RemoteSession {
                             consumer_id,
                             output_id,
+                            purpose,
                             next_frame_serial: 1,
                             outbound: outbound.clone(),
                         },
@@ -146,6 +151,12 @@ impl LocalRemoteCapture {
                 }
             }
         }
+    }
+
+    pub fn recording_output_active(&self, output_id: OutputId) -> bool {
+        self.sessions.values().any(|session| {
+            session.output_id == output_id && session.purpose == CapturePurpose::Recording
+        })
     }
 
     fn export_frames(&mut self, state: &mut DesktopState, renderer: &mut GlesRenderer) {
@@ -318,6 +329,18 @@ pub fn export_rgba_frame(
     state.local_remote_capture = Some(remote);
 }
 
+/// Whether the raw-renderer compatibility readback is still needed for a
+/// remote-desktop consumer on this output.  Portal clients have their own
+/// DMA-BUF path and must not force a CPU readback merely by existing.
+pub fn capture_active_for_output(state: &DesktopState, output_id: OutputId) -> bool {
+    state.local_remote_capture.as_ref().is_some_and(|remote| {
+        remote
+            .sessions
+            .values()
+            .any(|session| session.output_id == output_id)
+    })
+}
+
 fn socket_path() -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os(SOCKET_ENV).filter(|path| !path.is_empty()) {
         return Ok(path.into());
@@ -366,7 +389,7 @@ fn handle_client(stream: UnixStream, commands: mpsc::Sender<RemoteCommand>) {
         Ok(request) => request,
         Err(_) => return,
     };
-    let Request::StartCapture { output_id } = request else {
+    let Request::StartCapture { output_id, purpose } = request else {
         let _ = write_message(
             &stream,
             &Event::Error {
@@ -379,6 +402,7 @@ fn handle_client(stream: UnixStream, commands: mpsc::Sender<RemoteCommand>) {
     if commands
         .send(RemoteCommand::Start {
             output_id: OutputId(output_id),
+            purpose,
             outbound,
         })
         .is_err()
@@ -497,12 +521,19 @@ mod tests {
         let (commands_tx, commands_rx) = mpsc::channel();
         let worker = thread::spawn(move || handle_client(server, commands_tx));
 
-        focaldesk_remote_protocol::write_message(&client, &Request::StartCapture { output_id: 9 })
-            .unwrap();
+        focaldesk_remote_protocol::write_message(
+            &client,
+            &Request::StartCapture {
+                output_id: 9,
+                purpose: CapturePurpose::RemoteDesktop,
+            },
+        )
+        .unwrap();
         let (output_id, outbound) = match commands_rx.recv().unwrap() {
             RemoteCommand::Start {
                 output_id,
                 outbound,
+                ..
             } => (output_id, outbound),
             _ => panic!("expected start command"),
         };

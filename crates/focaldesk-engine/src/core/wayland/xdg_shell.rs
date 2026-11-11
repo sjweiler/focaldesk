@@ -93,11 +93,17 @@ impl DesktopState {
         let minimized = window.minimized;
         let rect = window.tile_rect.or(window.float_rect);
         let mapped_window = window.mapped.then(|| window.window.clone());
+        let fullscreen_rect = fullscreen
+            .then(|| {
+                self.work_recess_for_output(output_id).or_else(|| {
+                    self.outputs
+                        .get(&output_id)
+                        .and_then(|output| self.space.output_geometry(&output.handle))
+                })
+            })
+            .flatten();
         let size = if fullscreen {
-            self.outputs
-                .get(&output_id)
-                .and_then(|output| self.space.output_geometry(&output.handle))
-                .map(|rect| rect.size)
+            fullscreen_rect.map(|rect| rect.size)
         } else if maximized {
             self.work_recess_for_output(output_id).map(|rect| rect.size)
         } else {
@@ -123,7 +129,7 @@ impl DesktopState {
         self.apply_restored_xdg_split_state(window_id, surface);
         surface.send_pending_configure();
         if !minimized {
-            if let (Some(window), Some(rect)) = (mapped_window, rect) {
+            if let (Some(window), Some(rect)) = (mapped_window, fullscreen_rect.or(rect)) {
                 self.map_window_bbox_location(window, rect.loc, false);
             }
         }
@@ -137,10 +143,19 @@ impl XdgShellHandler for DesktopState {
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let window_id = self.add_xdg_toplevel(surface.clone());
-        let (_, app_id) = toplevel_metadata(&surface);
+        let (title, app_id) = toplevel_metadata(&surface);
         let restored = app_id.as_deref().is_some_and(|app_id| {
             self.try_restore_window(window_id, SavedProtocol::Wayland, app_id)
         });
+        let rule = (!restored && surface.parent().is_none())
+            .then(|| {
+                self.apply_window_rule(
+                    window_id,
+                    app_id.as_deref(),
+                    title.as_deref().unwrap_or_default(),
+                )
+            })
+            .flatten();
         let window = self.windows.iter().find(|window| window.id == window_id);
         let output_id = window
             .and_then(|window| window.output)
@@ -148,7 +163,8 @@ impl XdgShellHandler for DesktopState {
         let maximize_on_launch = if restored {
             window.is_some_and(|window| window.maximized)
         } else {
-            self.workspaces.maximize_on_launch
+            rule.and_then(|rule| rule.maximize)
+                .unwrap_or(self.workspaces.maximize_on_launch)
         };
         let fullscreen_on_launch = restored && window.is_some_and(|window| window.fullscreen);
         let minimized_on_launch = restored && window.is_some_and(|window| window.minimized);
@@ -282,15 +298,20 @@ impl XdgShellHandler for DesktopState {
             debug!(target: "focaldesk", ?surface_id, "xdg popup grab ignored: no root");
             return;
         };
-        let Some(window) = self.window_for_wl_surface(&root) else {
-            debug!(
-                target: "focaldesk",
-                ?surface_id,
-                "xdg popup grab ignored: root window not mapped"
-            );
+        let root_focus = if let Some(window) = self.window_for_wl_surface(&root) {
+            KeyboardFocusTarget::Window(window)
+        } else if self
+            .space
+            .layer_for_surface(&root, smithay::desktop::WindowSurfaceType::TOPLEVEL)
+            .is_some()
+        {
+            // Popovers hosted by a rail or another layer surface have no app
+            // window. Keep their real layer root as the focus restored on ungrab.
+            KeyboardFocusTarget::Layer(root)
+        } else {
+            debug!(target: "focaldesk", ?surface_id, "xdg popup grab ignored: root is not mapped");
             return;
         };
-        let root_focus = KeyboardFocusTarget::Window(window.clone());
         let Ok(mut grab) = self.popups.grab_popup(root_focus, kind, &seat, serial) else {
             debug!(target: "focaldesk", ?surface_id, "xdg popup grab ignored: grab_popup failed");
             return;

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Root-owned, deliberately narrow DDC/CI brightness helper. The connector is
+# resolved from ddcutil's current DRM mapping, so it never assumes a fixed I²C
+# bus or GPU card number.
+command=${1:-}
+connector=${2:-}
+
+if [[ "$command" == "detect" && $# == 1 ]]; then
+  exec /usr/bin/ddcutil detect
+fi
+if [[ "$command" != "get" && "$command" != "set" ]]; then
+  echo "usage: $0 detect | get CONNECTOR | set CONNECTOR 0..100" >&2
+  exit 64
+fi
+if [[ ! "$connector" =~ ^[A-Za-z0-9.-]+$ ]]; then
+  echo "connector must be a FocalDesk DRM connector name" >&2
+  exit 64
+fi
+if [[ "$command" == "get" && $# != 2 ]]; then
+  echo "usage: $0 get CONNECTOR" >&2
+  exit 64
+fi
+if [[ "$command" == "set" ]]; then
+  value=${3:-}
+  if [[ $# != 3 || ! "$value" =~ ^([0-9]|[1-9][0-9]|100)$ ]]; then
+    echo "brightness must be an integer from 0 through 100" >&2
+    exit 64
+  fi
+fi
+
+# ddcutil's DRM connector is cardN-CONNECTOR; FocalDesk uses CONNECTOR.
+bus=$(/usr/bin/ddcutil detect | /usr/bin/awk -v want="$connector" '
+  $1 == "I2C" && $2 == "bus:" { bus = $3; sub("^/dev/i2c-", "", bus) }
+  $1 == "DRM_connector:" {
+    name = $2
+    sub("^card[0-9]+-", "", name)
+    if (name == want) { print bus; exit }
+  }
+')
+if [[ ! "$bus" =~ ^[0-9]+$ ]]; then
+  echo "no DDC/CI display found for connector $connector" >&2
+  exit 69
+fi
+if [[ "$command" == "get" ]]; then
+  exec /usr/bin/ddcutil --bus "$bus" getvcp 10
+fi
+exec /usr/bin/ddcutil --bus "$bus" setvcp 10 "$value"

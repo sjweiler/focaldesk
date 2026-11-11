@@ -16,11 +16,102 @@ The host provides bounded adapters for the built-in connector identities:
 - `notifications` publishes each currently visible unread notification once;
 - `local-calendar` reads only an explicitly configured absolute ICS file of at
   most 1 MiB and extracts UID, summary, start, end, and organizer;
+- `google-calendar` performs read-only incremental Google Calendar sync for
+  explicitly configured accounts after calendar-source and network consent;
+- `microsoft-calendar` performs read-only Microsoft Graph calendar-view delta
+  sync under the same consent controls;
 - `workflow-events` remains inside the AI supervisor, where workflow lifecycle
   events originate.
 
 The optional calendar path is set with `FOCALDESK_LOCAL_CALENDAR_ICS` in a
 user-service drop-in. No calendar location is guessed or scanned.
+
+Cloud accounts are declared in
+`$XDG_STATE_HOME/focaldesk/calendar-accounts.json` (normally
+`~/.local/state/focaldesk/calendar-accounts.json`). Settings writes it only
+through the typed connector-host IPC. The file contains no tokens:
+
+```json
+{
+  "version": 1,
+  "accounts": [
+    {
+      "id": "school-google",
+      "provider": "google",
+      "enabled": false,
+      "client_id": "YOUR_DESKTOP_OAUTH_CLIENT_ID",
+      "calendar_id": "primary",
+      "calendar_ids": ["primary"],
+      "reminder_minutes": 10
+    },
+    {
+      "id": "work-m365",
+      "provider": "microsoft",
+      "enabled": false,
+      "client_id": "YOUR_PUBLIC_CLIENT_ID",
+      "calendar_id": "primary",
+      "calendar_ids": ["primary"],
+      "reminder_minutes": 10,
+      "tenant": "common"
+    }
+  ]
+}
+```
+
+OAuth refresh tokens live only at the opaque secret handles
+`calendar/<account-id>/refresh-token`; an optional Google client secret uses
+`calendar/<account-id>/client-secret`. Provider connectors, account entries,
+network access, and the Event Fabric calendar source must all be enabled
+before synchronization starts. Cached normalized events and reminder-delivery
+state are kept in `$XDG_STATE_HOME/focaldesk/calendar.db`. Event descriptions,
+locations, attendee lists, conference URLs, and message bodies are neither
+stored nor published.
+
+The Settings **Calendar** page starts authorization through typed connector
+IPC. Google and Microsoft use the system browser, a random loopback port,
+PKCE-S256, and a validated state value. The callback host and path must match
+the issued `http://localhost:<random-port>/` redirect URL before an
+authorization code is accepted. Register `http://localhost/` as a **Mobile
+and desktop applications** redirect URI in Microsoft Entra; Entra permits the
+ephemeral port for this localhost redirect.
+Authorization expires after ten minutes. Settings
+receives status and public verification data only; refresh tokens and optional
+Google client secrets never return over the connector IPC.
+
+The same page lists each account's provider, connection state, cached-event
+count, last connector run, and current connector error. **Calendars** securely
+discovers the provider's calendar list, lets the user select up to 32 calendars,
+and configures reminders as off, 5, 10, 15, 30, or 60 minutes before an event.
+**Sync now** queues an immediate provider poll, and the page previews up to 20
+cached events from the next seven days. **Disconnect** removes
+the refresh token and any saved client secret through the broker. The separate
+**Delete local data** option also removes that account's cached events and sync
+cursor; leaving it unchecked retains the local cache while preventing further
+cloud synchronization.
+
+Google authorization must use the
+`https://www.googleapis.com/auth/calendar.readonly` and
+`https://www.googleapis.com/auth/calendar.events` scopes. Microsoft
+authorization uses delegated `Calendars.ReadWrite` and `offline_access`. Accounts
+previously connected with read-only permissions must reconnect before editing.
+Both
+providers use incremental cursors, refresh the bounded 30-days-past to
+365-days-future window weekly, and poll at most once every five minutes.
+Upcoming normalized events can be inspected without exposing tokens:
+
+```sh
+focaldesk-cli calendar upcoming 7
+```
+
+The `apps/focaldesk-calendar` desktop application uses the same account list and
+event cache through connector-host IPC. `calendar_save_event` creates an event
+when its event ID is empty and otherwise patches its title, start, end, and
+all-day flag. `calendar_delete_event` removes the selected provider event.
+Writes require an enabled account, a selected calendar, and an enabled provider
+connector with network consent. Access tokens remain inside the connector host.
+Provider errors are surfaced to the application, and successful writes update
+the shared cache. Existing attendees and other fields are retained by PATCH;
+provider notifications can be sent to existing attendees when events change.
 
 Each adapter runs only when both its connector and at least one declared Event
 Fabric source are enabled. Events are checked again by the AI service against

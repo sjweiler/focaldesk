@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=FocalDesk AI Console
+Comment=Chat, agents, knowledge and integrations for FocalDesk
+Exec=/usr/bin/systemctl --user start focaldesk-ai-console-app.service
+TryExec=/usr/bin/focaldesk-ai-console
+Icon=focaldesk-ai-console
+Terminal=false
+Categories=Utility;Development;
+StartupWMClass=dev.focaldesk.ai-console

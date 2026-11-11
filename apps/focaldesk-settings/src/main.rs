@@ -1,25 +1,27 @@
 use adw::prelude::*;
 use focaldesk_ai::{list_ai_permission_records, revoke_ai_permission, AiPermissionRecord};
 use focaldesk_bluetooth::{load_snapshot as load_bluetooth_snapshot, BluetoothSnapshot};
-use focaldesk_config::{load_config, save_config, DockVisibility, FocalDeskConfig};
+use focaldesk_config::{load_config, save_config, DockVisibility, FocalDeskConfig, RailBackdrop};
 use focaldesk_gtk::{StateKind, StatusBanner};
 use focaldesk_ipc::{
-    send_desktop_config, send_desktop_request, send_desktop_set, send_power_request,
-    send_settings_request, watch_desktop_keys, DesktopAction, DisplayRuntimeOutputStatus,
-    IpcRequest, IpcResponse, PowerIpcRequest, PowerIpcResponse, ThemeEditorCommand,
-    THEME_EDITOR_PROTOCOL_VERSION,
+    send_connector_host_request, send_desktop_config, send_desktop_request, send_desktop_set,
+    send_power_request, send_settings_request, watch_desktop_keys, ConnectorHostIpcRequest,
+    DesktopAction, DisplayRuntimeOutputStatus, InputDeviceSnapshot, IpcRequest, IpcResponse,
+    PowerIpcRequest, PowerIpcResponse, ThemeEditorCommand, THEME_EDITOR_PROTOCOL_VERSION,
 };
 use focaldesk_ipc::{send_notification_request, NotificationIpcRequest};
-use focaldesk_launcher_state::clear_recent_apps;
+use focaldesk_launcher_state::clear_recent_activity;
 use focaldesk_logging::{init_default_logging, session_id};
 use focaldesk_permissions::{
     PermissionDecision, PermissionResource, PermissionScope, PermissionTarget,
 };
 use focaldesk_settings_core::{
     load_exclusive_hdr_state, load_settings, save_exclusive_hdr_state, save_settings,
-    BrowserLaunchBackend, DebugLogLevel, DisplayColorProfile, DisplayTransform, ExclusiveHdrPhase,
-    ExclusiveHdrState, HdrAppearance, HdrCalibrationPattern, HdrToneMapper, LidCloseAction,
-    LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction, Settings,
+    BrowserLaunchBackend, ColorFilter, DebugLogLevel, DisplayColorProfile, DisplayTransform,
+    ExclusiveHdrPhase, ExclusiveHdrState, HdrAppearance, HdrCalibrationPattern, HdrToneMapper,
+    InputAccelerationProfile, InputScrollMethod, LidCloseAction, LowBatteryAction,
+    NightLightSchedule, OutputConfig, PerformanceMode, PowerButtonAction, Settings, StartupApp,
+    WindowRule, WorkspaceTransitionStyle,
 };
 use focaldesk_sounds::{generate_ui_sound, SoundBuffer, UiSound, UiSoundPlayer, SAMPLE_RATE};
 use focaldesk_themes::{
@@ -33,13 +35,13 @@ use gtk::cairo;
 use gtk::glib;
 use serde_json::json;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 
 mod audio;
@@ -61,7 +63,6 @@ const SCALE_OPTIONS: &[(&str, f64)] = &[
     ("266 %", 2.6666667),
 ];
 
-const THEME_OPTIONS: &[&str] = &["Default", "Eagle", "Moonbase", "Classic"];
 const TASK_SHELF_VISIBILITY_OPTIONS: &[&str] = &["Intelligent dodge", "Always visible", "Autohide"];
 const ORIENTATION_OPTIONS: &[&str] = &[
     "Landscape",
@@ -109,6 +110,12 @@ const EDITABLE_KEYBINDINGS: &[(&str, &str, &str)] = &[
     ("close_focused", "Close focused window", "Super+Q"),
     ("lock_screen", "Lock screen", "Super+L"),
     ("toggle_clipboard_history", "Clipboard history", "Super+V"),
+    ("magnifier_zoom_in", "Increase magnification", "Super+equal"),
+    (
+        "magnifier_zoom_out",
+        "Decrease magnification",
+        "Super+minus",
+    ),
     ("focus_previous", "Focus previous window", "Super+F7"),
     ("focus_next", "Focus next window", "Super+F8"),
     ("split_left", "Place window in left half", "Super+Left"),
@@ -336,6 +343,7 @@ struct ConfigEvent {
 }
 
 type DynamicRows = Rc<RefCell<Vec<gtk::Widget>>>;
+type WindowRuleToggle = fn(&mut WindowRule, Option<bool>);
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct DisplayModeConfig {
@@ -371,6 +379,8 @@ struct DisplayConfig {
 
     primary: bool,
     transform: String,
+    #[serde(default)]
+    role: focaldesk_settings_core::OutputRole,
 
     #[serde(default)]
     hdr_supported: bool,
@@ -485,6 +495,7 @@ fn output_config_from_display(display: &DisplayConfig) -> OutputConfig {
             "Rotate270" => DisplayTransform::Rotate270,
             _ => DisplayTransform::Normal,
         },
+        role: display.role,
         primary: display.primary,
         color_profile: display.color_profile,
         icc_profile_path: display.icc_profile_path.clone(),
@@ -2238,6 +2249,68 @@ fn connected_display_row(
         });
     }
 
+    let role_row = adw::ActionRow::new();
+    role_row.set_title("Display role");
+    role_row.set_subtitle("Reserve a display for the companion and touchscreen controls");
+    let role_dropdown = gtk::DropDown::from_strings(&["Desktop", "Control Panel"]);
+    role_dropdown.set_selected(u32::from(
+        display.role == focaldesk_settings_core::OutputRole::ControlPanel,
+    ));
+    role_dropdown.set_sensitive(
+        display.enabled
+            && displays
+                .borrow()
+                .iter()
+                .filter(|output| output.enabled)
+                .count()
+                > 1,
+    );
+    role_row.add_suffix(&role_dropdown);
+    row.add_row(&role_row);
+    {
+        let displays = displays.clone();
+        let area = area.clone();
+        let row = row.clone();
+        role_dropdown.connect_selected_notify(move |dropdown| {
+            let panel = dropdown.selected() == 1;
+            {
+                let mut current = displays.borrow_mut();
+                if panel {
+                    for output in current.iter_mut() {
+                        output.role = focaldesk_settings_core::OutputRole::Normal;
+                    }
+                }
+                if let Some(output) = current.get_mut(index) {
+                    output.role = if panel {
+                        focaldesk_settings_core::OutputRole::ControlPanel
+                    } else {
+                        focaldesk_settings_core::OutputRole::Normal
+                    };
+                    if panel {
+                        output.primary = false;
+                    }
+                }
+                if !current.iter().any(|output| {
+                    output.enabled
+                        && output.primary
+                        && output.role == focaldesk_settings_core::OutputRole::Normal
+                }) {
+                    if let Some(output) = current.iter_mut().find(|output| {
+                        output.enabled && output.role == focaldesk_settings_core::OutputRole::Normal
+                    }) {
+                        output.primary = true;
+                    }
+                }
+            }
+            save_display_change(&displays, &area, &row, index);
+            std::thread::spawn(|| {
+                let _ = Command::new("systemctl")
+                    .args(["--user", "restart", "focaldesk-companion-dashboard.service"])
+                    .status();
+            });
+        });
+    }
+
     let primary_row = adw::ActionRow::new();
     primary_row.set_title("Primary Display");
     let primary = gtk::Switch::new();
@@ -2589,8 +2662,17 @@ fn persist_config_key(config: &FocalDeskConfig, key: &str, value: serde_json::Va
     }
 }
 
+// Display changes have their own persistence path. A preferences page may
+// retain an older Settings snapshot while the companion changes output roles.
+fn settings_for_preferences_save(settings: &Settings, latest: Settings) -> Settings {
+    let mut merged = settings.clone();
+    merged.displays = latest.displays;
+    merged
+}
+
 fn persist_settings(settings: &Settings) {
-    if let Err(err) = save_settings(settings) {
+    let merged = settings_for_preferences_save(settings, load_settings());
+    if let Err(err) = save_settings(&merged) {
         error!(
             target: "focaldesk",
             session_id = session_id(),
@@ -2870,8 +2952,37 @@ fn dock_visibility_from_index(index: u32) -> DockVisibility {
     }
 }
 
+fn theme_backing_opacities(theme_name: &str) -> (f64, f64) {
+    let backing = theme_by_name(theme_name).backing;
+    (
+        f64::from(backing.rail_opacity.clamp(0.0, 1.0)),
+        f64::from(backing.dock_opacity.clamp(0.0, 1.0)),
+    )
+}
+
+fn effective_panel_darkness(config: &FocalDeskConfig) -> f64 {
+    config.appearance.panel_darkness.unwrap_or_else(|| {
+        // The rail value is the direct counterpart to the historical Panel
+        // setting; reset still restores each surface's individual default.
+        theme_backing_opacities(&config.appearance.theme).0
+    })
+}
+
 fn main() {
     init_default_logging();
+    // The managed connector host verifies local clients through
+    // /proc/<pid>/exe after validating SO_PEERCRED. Settings contains no
+    // secret material, so keep that identity available to the host.
+    // SAFETY: PR_SET_DUMPABLE accepts an integer flag and no pointer.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) } != 0 {
+        error!(error = %std::io::Error::last_os_error(), "could not enable Settings IPC identity verification");
+    }
+    // On systems with Yama ptrace restrictions, the connector is a sibling
+    // process rather than a Settings child. Permit its read-only /proc identity
+    // check; the connector still verifies the Unix-socket UID and executable.
+    if unsafe { libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0) } != 0 {
+        error!(error = %std::io::Error::last_os_error(), "could not enable Settings IPC peer verification");
+    }
     let initial_panel = requested_panel(std::env::args().skip(1));
     let app = adw::Application::new(
         Some("com.focaldesk.Settings"),
@@ -2971,8 +3082,10 @@ fn build_ui(app: &adw::Application, initial_panel: Option<&str>) {
 
     let panel_names = [
         "Appearance",
+        "Accessibility",
         "Theme Editor",
         "Network",
+        "Calendar",
         "Bluetooth",
         "Printers",
         "Displays",
@@ -2980,6 +3093,7 @@ fn build_ui(app: &adw::Application, initial_panel: Option<&str>) {
         "Applications",
         "Chrome",
         "Workspaces",
+        "Mouse & Touchpad",
         "Keyboard",
         "Privacy",
         "Power",
@@ -3014,8 +3128,13 @@ fn build_ui(app: &adw::Application, initial_panel: Option<&str>) {
         "Appearance".to_string(),
         appearance_page(config.clone(), settings.clone()),
     );
+    pages.insert(
+        "Accessibility".to_string(),
+        accessibility_page(settings.clone()),
+    );
     pages.insert("Theme Editor".to_string(), theme_editor_page());
     pages.insert("Network".to_string(), network_page());
+    pages.insert("Calendar".to_string(), calendar_page());
     pages.insert("Bluetooth".to_string(), bluetooth_page());
     pages.insert("Printers".to_string(), printers_page());
     pages.insert(
@@ -3029,6 +3148,10 @@ fn build_ui(app: &adw::Application, initial_panel: Option<&str>) {
     );
     pages.insert("Chrome".to_string(), chrome_page(settings.clone()));
     pages.insert("Workspaces".to_string(), workspaces_page(settings.clone()));
+    pages.insert(
+        "Mouse & Touchpad".to_string(),
+        mouse_touchpad_page(settings.clone()),
+    );
     pages.insert("Keyboard".to_string(), keyboard_page(settings.clone()));
     pages.insert("Privacy".to_string(), privacy_page(settings.clone()));
     pages.insert("Power".to_string(), power_page(settings.clone()));
@@ -4122,6 +4245,35 @@ fn installed_themes_root() -> PathBuf {
         .join("themes")
 }
 
+/// Returns durable appearance choices. The system document is the sole
+/// built-in; every additional entry is a validated package installed by Theme
+/// Editor and points at its private installed document.
+fn appearance_theme_options() -> Vec<(String, String)> {
+    let mut options = vec![("Default".to_string(), "Default".to_string())];
+    let Ok(entries) = std::fs::read_dir(installed_themes_root()) else {
+        return options;
+    };
+
+    let mut installed = entries
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|kind| kind.is_dir() && !kind.is_symlink())?;
+            let path = entry.path().join("theme.toml");
+            let document = ThemeDocument::load(&path).ok()?;
+            Some((
+                format!("{} (installed)", document.name),
+                path.to_string_lossy().into_owned(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    installed.sort_by_key(|left| left.0.to_lowercase());
+    options.extend(installed);
+    options
+}
+
 fn extract_wallpaper_accent(path: &std::path::Path) -> Result<ThemeColor, String> {
     use image::GenericImageView;
     let image = image::open(path)
@@ -5138,7 +5290,7 @@ fn theme_editor_page() -> adw::NavigationPage {
             dialog.set_title("Choose Theme Wallpaper");
             let filter = gtk::FileFilter::new();
             filter.set_name(Some("Wallpaper images"));
-            for pattern in ["*.png", "*.jpg", "*.jpeg", "*.webp"] {
+            for pattern in ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.exr"] {
                 filter.add_pattern(pattern);
             }
             dialog.set_default_filter(Some(&filter));
@@ -6538,6 +6690,91 @@ fn appearance_page(
 
     visual_group.add(&glass_row);
 
+    let rail_backdrop_options = ["Solid", "Smoked glass"];
+    let rail_backdrop_row = add_dropdown_row(
+        &visual_group,
+        "Rail background",
+        Some("Choose the compositor backing behind the system rail"),
+        &rail_backdrop_options,
+        match config.borrow().appearance.rail_backdrop {
+            RailBackdrop::Solid => 0,
+            RailBackdrop::SmokedGlass => 1,
+        },
+    );
+    {
+        let config = config.clone();
+        rail_backdrop_row.connect_selected_notify(move |dropdown| {
+            let backdrop = match dropdown.selected() {
+                1 => RailBackdrop::SmokedGlass,
+                _ => RailBackdrop::Solid,
+            };
+            if config.borrow().appearance.rail_backdrop == backdrop {
+                return;
+            }
+            config.borrow_mut().appearance.rail_backdrop = backdrop;
+            persist_config_key(
+                &config.borrow(),
+                "appearance.rail_backdrop",
+                serde_json::to_value(backdrop).expect("rail backdrop serializes"),
+            );
+        });
+    }
+
+    let panel_darkness_row = adw::ActionRow::new();
+    panel_darkness_row.set_title("Panel darkness");
+    let (theme_rail_opacity, theme_dock_opacity) =
+        theme_backing_opacities(&config.borrow().appearance.theme);
+    panel_darkness_row.set_subtitle(&format!(
+        "Theme default: rail {:.0}% · dock {:.0}%. Adjusting applies one smoked-glass backing value to both.",
+        theme_rail_opacity * 100.0,
+        theme_dock_opacity * 100.0,
+    ));
+    let panel_darkness = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.01);
+    panel_darkness.set_hexpand(true);
+    panel_darkness.set_draw_value(true);
+    panel_darkness.set_value(effective_panel_darkness(&config.borrow()));
+    panel_darkness.set_tooltip_text(Some(
+        "Controls only the rail and dock backing; icon and text opacity stay unchanged",
+    ));
+    panel_darkness_row.add_suffix(&panel_darkness);
+    visual_group.add(&panel_darkness_row);
+    let panel_darkness_syncing = Rc::new(Cell::new(false));
+    {
+        let config = config.clone();
+        let panel_darkness_syncing = panel_darkness_syncing.clone();
+        panel_darkness.connect_value_changed(move |scale| {
+            if panel_darkness_syncing.get() {
+                return;
+            }
+            let value = scale.value().clamp(0.0, 1.0);
+            if config.borrow().appearance.panel_darkness == Some(value) {
+                return;
+            }
+            config.borrow_mut().appearance.panel_darkness = Some(value);
+            persist_config_key(&config.borrow(), "appearance.panel_darkness", json!(value));
+        });
+    }
+    let theme_default_button = gtk::Button::with_label("Use theme default");
+    theme_default_button.set_valign(gtk::Align::Center);
+    panel_darkness_row.add_suffix(&theme_default_button);
+    {
+        let config = config.clone();
+        let panel_darkness = panel_darkness.clone();
+        let panel_darkness_syncing = panel_darkness_syncing.clone();
+        theme_default_button.connect_clicked(move |_| {
+            config.borrow_mut().appearance.panel_darkness = None;
+            let value = effective_panel_darkness(&config.borrow());
+            persist_config_key(
+                &config.borrow(),
+                "appearance.panel_darkness",
+                serde_json::Value::Null,
+            );
+            panel_darkness_syncing.set(true);
+            set_scale_if_changed(&panel_darkness, value);
+            panel_darkness_syncing.set(false);
+        });
+    }
+
     // Output focus glow
     let focus_row = adw::ActionRow::new();
     focus_row.set_title("Output focus glow");
@@ -6600,20 +6837,34 @@ fn appearance_page(
 
     let theme_row = adw::ActionRow::new();
     theme_row.set_title("Theme");
+    theme_row.set_subtitle("Import optional .fdtheme packages through Theme Editor");
+
+    let theme_options = appearance_theme_options();
+    let theme_labels = theme_options
+        .iter()
+        .map(|(label, _)| label.as_str())
+        .collect::<Vec<_>>();
+    let theme_values = Rc::new(
+        theme_options
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>(),
+    );
 
     let theme_dropdown = dropdown_from_strings(
-        THEME_OPTIONS,
-        THEME_OPTIONS
+        &theme_labels,
+        theme_values
             .iter()
-            .position(|theme| *theme == config.borrow().appearance.theme.as_str())
+            .position(|theme| theme == &config.borrow().appearance.theme)
             .unwrap_or(0) as u32,
     );
 
     {
         let config = config.clone();
+        let theme_values = theme_values.clone();
         theme_dropdown.connect_selected_notify(move |dropdown| {
-            if let Some(theme) = THEME_OPTIONS.get(dropdown.selected() as usize) {
-                let theme = (*theme).to_string();
+            if let Some(theme) = theme_values.get(dropdown.selected() as usize) {
+                let theme = theme.clone();
                 config.borrow_mut().appearance.theme = theme.clone();
                 persist_config_key(&config.borrow(), "appearance.theme", json!(theme));
             }
@@ -6699,9 +6950,13 @@ fn appearance_page(
         let settings = settings.clone();
         let shader_switch = shader_switch.clone();
         let glass_switch = glass_switch.clone();
+        let rail_backdrop_row = rail_backdrop_row.clone();
+        let panel_darkness = panel_darkness.clone();
+        let panel_darkness_syncing = panel_darkness_syncing.clone();
         let focus_switch = focus_switch.clone();
         let shelf_visibility = shelf_visibility.clone();
         let theme_dropdown = theme_dropdown.clone();
+        let theme_values = theme_values.clone();
         let contrast_switch = contrast_switch.clone();
         let motion_switch = motion_switch.clone();
         let glow_scale = glow_scale.clone();
@@ -6715,11 +6970,13 @@ fn appearance_page(
             persist_config(&config.borrow());
             persist_settings(&settings.borrow());
 
-            let (shader, glass, focus, visibility, theme, glow, font) = {
+            let (shader, glass, rail_backdrop, darkness, focus, visibility, theme, glow, font) = {
                 let config = config.borrow();
                 (
                     config.appearance.shader_chrome,
                     config.appearance.work_area_glass,
+                    config.appearance.rail_backdrop,
+                    effective_panel_darkness(&config),
                     config.appearance.output_focus_glow,
                     config.dock.visibility,
                     config.appearance.theme.clone(),
@@ -6729,9 +6986,16 @@ fn appearance_page(
             };
             set_switch_if_changed(&shader_switch, shader);
             set_switch_if_changed(&glass_switch, glass);
+            rail_backdrop_row.set_selected(match rail_backdrop {
+                RailBackdrop::Solid => 0,
+                RailBackdrop::SmokedGlass => 1,
+            });
+            panel_darkness_syncing.set(true);
+            set_scale_if_changed(&panel_darkness, darkness);
+            panel_darkness_syncing.set(false);
             set_switch_if_changed(&focus_switch, focus);
             shelf_visibility.set_selected(dock_visibility_index(visibility));
-            if let Some(index) = THEME_OPTIONS.iter().position(|option| *option == theme) {
+            if let Some(index) = theme_values.iter().position(|option| option == &theme) {
                 theme_dropdown.set_selected(index as u32);
             }
             set_scale_if_changed(&glow_scale, glow);
@@ -6763,6 +7027,8 @@ fn appearance_page(
         let rx = start_config_watch(&[
             "appearance.shader_chrome",
             "appearance.work_area_glass",
+            "appearance.rail_backdrop",
+            "appearance.panel_darkness",
             "appearance.output_focus_glow",
             "appearance.theme",
             "appearance.glow_strength",
@@ -6772,8 +7038,12 @@ fn appearance_page(
         let config = config.clone();
         let shader_switch = shader_switch.clone();
         let glass_switch = glass_switch.clone();
+        let rail_backdrop_row = rail_backdrop_row.clone();
+        let panel_darkness = panel_darkness.clone();
+        let panel_darkness_syncing = panel_darkness_syncing.clone();
         let focus_switch = focus_switch.clone();
         let theme_dropdown = theme_dropdown.clone();
+        let theme_values = theme_values.clone();
         let glow_scale = glow_scale.clone();
         let font_scale = font_scale.clone();
         let shelf_visibility = shelf_visibility.clone();
@@ -6793,6 +7063,31 @@ fn appearance_page(
                             set_switch_if_changed(&glass_switch, active);
                         }
                     }
+                    "appearance.rail_backdrop" => {
+                        if let Ok(backdrop) =
+                            serde_json::from_value::<RailBackdrop>(event.value.clone())
+                        {
+                            config.borrow_mut().appearance.rail_backdrop = backdrop;
+                            let selected = match backdrop {
+                                RailBackdrop::Solid => 0,
+                                RailBackdrop::SmokedGlass => 1,
+                            };
+                            if rail_backdrop_row.selected() != selected {
+                                rail_backdrop_row.set_selected(selected);
+                            }
+                        }
+                    }
+                    "appearance.panel_darkness" => {
+                        let darkness = event
+                            .value
+                            .as_f64()
+                            .filter(|value| (0.0..=1.0).contains(value));
+                        config.borrow_mut().appearance.panel_darkness = darkness;
+                        let effective = effective_panel_darkness(&config.borrow());
+                        panel_darkness_syncing.set(true);
+                        set_scale_if_changed(&panel_darkness, effective);
+                        panel_darkness_syncing.set(false);
+                    }
                     "appearance.output_focus_glow" => {
                         if let Some(active) = event.value.as_bool() {
                             config.borrow_mut().appearance.output_focus_glow = active;
@@ -6803,9 +7098,15 @@ fn appearance_page(
                         if let Some(theme) = event.value.as_str() {
                             config.borrow_mut().appearance.theme = theme.to_string();
                             if let Some(index) =
-                                THEME_OPTIONS.iter().position(|option| *option == theme)
+                                theme_values.iter().position(|option| option == theme)
                             {
                                 theme_dropdown.set_selected(index as u32);
+                            }
+                            if config.borrow().appearance.panel_darkness.is_none() {
+                                let effective = effective_panel_darkness(&config.borrow());
+                                panel_darkness_syncing.set(true);
+                                set_scale_if_changed(&panel_darkness, effective);
+                                panel_darkness_syncing.set(false);
                             }
                         }
                     }
@@ -7256,6 +7557,597 @@ fn network_page() -> adw::NavigationPage {
     }
 
     adw::NavigationPage::new(&page, "Network")
+}
+
+fn calendar_page() -> adw::NavigationPage {
+    let page = adw::PreferencesPage::new();
+    page.set_title("Calendar");
+    let intro = adw::PreferencesGroup::new();
+    intro.set_title("Connected Calendars");
+    intro.set_description(Some("Read-only access. OAuth tokens are stored by the FocalDesk secrets broker, never in Settings."));
+    page.add(&intro);
+    let upcoming = adw::PreferencesGroup::new();
+    upcoming.set_title("Next 7 days");
+    let upcoming_rows: DynamicRows = Rc::new(RefCell::new(Vec::new()));
+    let upcoming_status = StatusBanner::new("Loading upcoming events…");
+    upcoming.add(&upcoming_status.widget());
+    let upcoming_refresh = gtk::Button::with_label("Refresh");
+    upcoming_refresh.add_css_class("pill");
+    let upcoming_refresh_row = adw::ActionRow::new();
+    upcoming_refresh_row.set_title("Upcoming events");
+    upcoming_refresh_row.add_suffix(&upcoming_refresh);
+    upcoming.add(&upcoming_refresh_row);
+    page.add(&upcoming);
+    refresh_upcoming_events(&upcoming, &upcoming_rows, &upcoming_status);
+    {
+        let group = upcoming.clone();
+        let rows = upcoming_rows.clone();
+        let status = upcoming_status.clone();
+        upcoming_refresh.connect_clicked(move |_| refresh_upcoming_events(&group, &rows, &status));
+    }
+    let accounts = adw::PreferencesGroup::new();
+    accounts.set_title("Accounts");
+    let account_rows: DynamicRows = Rc::new(RefCell::new(Vec::new()));
+    let account_status = StatusBanner::new("Loading connected accounts…");
+    accounts.add(&account_status.widget());
+    let refresh = gtk::Button::with_label("Refresh accounts");
+    refresh.add_css_class("pill");
+    let refresh_row = adw::ActionRow::new();
+    refresh_row.set_title("Account status");
+    refresh_row.add_suffix(&refresh);
+    accounts.add(&refresh_row);
+    page.add(&accounts);
+    refresh_calendar_accounts(&accounts, &account_rows, &account_status);
+    {
+        let accounts = accounts.clone();
+        let rows = account_rows.clone();
+        let status = account_status.clone();
+        refresh.connect_clicked(move |_| refresh_calendar_accounts(&accounts, &rows, &status));
+    }
+    page.add(&calendar_provider_group("Google Calendar", "google", false));
+    page.add(&calendar_provider_group("Microsoft 365", "microsoft", true));
+    adw::NavigationPage::new(&page, "Calendar")
+}
+
+fn refresh_upcoming_events(
+    group: &adw::PreferencesGroup,
+    rows: &DynamicRows,
+    status: &StatusBanner,
+) {
+    clear_dynamic_rows(group, rows);
+    status.set_text("Loading upcoming events…");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let request = ConnectorHostIpcRequest::CalendarUpcoming {
+        after_unix: now,
+        before_unix: now + 7 * 86_400,
+        limit: 20,
+    };
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(send_connector_host_request(&request));
+    });
+    let group = group.clone();
+    let rows = rows.clone();
+    let status = status.clone();
+    glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+        Ok(Ok(response)) if response.status == "ok" => {
+            if response.calendar_events.is_empty() {
+                status.set_text("No events cached for the next 7 days");
+            } else {
+                status.set_text(&format!(
+                    "{} upcoming event(s)",
+                    response.calendar_events.len()
+                ));
+            }
+            for event in response.calendar_events {
+                let row = adw::ActionRow::new();
+                row.set_title(&event.title);
+                row.set_subtitle(&format!(
+                    "{} · {} · {}",
+                    event.start_time.replace('T', " ").trim_end_matches('Z'),
+                    event.provider,
+                    event.account_id
+                ));
+                group.add(&row);
+                rows.borrow_mut().push(row.upcast());
+            }
+            glib::ControlFlow::Break
+        }
+        Ok(Ok(response)) => {
+            status.set_text(
+                response
+                    .message
+                    .as_deref()
+                    .unwrap_or("Could not load events"),
+            );
+            glib::ControlFlow::Break
+        }
+        Ok(Err(error)) => {
+            status.set_text(&error);
+            glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(_) => glib::ControlFlow::Break,
+    });
+}
+
+fn refresh_calendar_accounts(
+    group: &adw::PreferencesGroup,
+    rows: &DynamicRows,
+    status: &StatusBanner,
+) {
+    clear_dynamic_rows(group, rows);
+    status.set_text("Loading connected accounts…");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(send_connector_host_request(
+            &ConnectorHostIpcRequest::CalendarAccounts,
+        ));
+    });
+    let group = group.clone();
+    let rows = rows.clone();
+    let status = status.clone();
+    glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+        Ok(Ok(response)) if response.status == "ok" => {
+            if response.calendar_accounts.is_empty() {
+                status.set_text("No calendar accounts connected");
+            } else {
+                status.set_text(&format!(
+                    "{} calendar account(s)",
+                    response.calendar_accounts.len()
+                ));
+            }
+            for account in response.calendar_accounts {
+                let row = adw::ActionRow::new();
+                row.set_title(&account.account_id);
+                let connection = if account.connected {
+                    "connected"
+                } else {
+                    "disconnected"
+                };
+                let mut subtitle = format!(
+                    "{} · {} · {} cached event(s) · {}",
+                    account.provider, connection, account.cached_events, account.sync_state
+                );
+                if let Some(error) = &account.last_error {
+                    subtitle.push_str(&format!(" · {error}"));
+                }
+                row.set_subtitle(&subtitle);
+                let purge = gtk::CheckButton::with_label("Delete local data");
+                row.add_suffix(&purge);
+                let disconnect = gtk::Button::with_label("Disconnect");
+                disconnect.add_css_class("destructive-action");
+                disconnect.add_css_class("pill");
+                row.add_suffix(&disconnect);
+                let manage = gtk::Button::with_label("Calendars");
+                manage.add_css_class("pill");
+                row.add_suffix(&manage);
+                let sync = gtk::Button::with_label("Sync now");
+                sync.add_css_class("pill");
+                row.add_suffix(&sync);
+                let manage_account = account.account_id.clone();
+                let manage_group = group.clone();
+                let manage_rows = rows.clone();
+                let manage_status = status.clone();
+                let reminder_minutes = account.reminder_minutes;
+                manage.connect_clicked(move |button| {
+                    button.set_sensitive(false);
+                    discover_calendar_preferences(
+                        &manage_account,
+                        reminder_minutes,
+                        &manage_group,
+                        &manage_rows,
+                        &manage_status,
+                    );
+                });
+                let sync_account = account.account_id.clone();
+                let sync_status = status.clone();
+                sync.connect_clicked(move |button| {
+                    button.set_sensitive(false);
+                    sync_status.set_text("Calendar sync requested…");
+                    let request = ConnectorHostIpcRequest::CalendarSyncNow {
+                        account_id: sync_account.clone(),
+                    };
+                    let (tx, rx) = mpsc::channel();
+                    thread::spawn(move || {
+                        let _ = tx.send(send_connector_host_request(&request));
+                    });
+                    let button = button.clone();
+                    let status = sync_status.clone();
+                    glib::timeout_add_local(Duration::from_millis(50), move || {
+                        match rx.try_recv() {
+                            Ok(Ok(response)) if response.status == "ok" => {
+                                status.set_text("Sync queued");
+                                button.set_sensitive(true);
+                                glib::ControlFlow::Break
+                            }
+                            Ok(Ok(response)) => {
+                                status
+                                    .set_text(response.message.as_deref().unwrap_or("Sync failed"));
+                                button.set_sensitive(true);
+                                glib::ControlFlow::Break
+                            }
+                            Ok(Err(error)) => {
+                                status.set_text(&error);
+                                button.set_sensitive(true);
+                                glib::ControlFlow::Break
+                            }
+                            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                            Err(_) => glib::ControlFlow::Break,
+                        }
+                    });
+                });
+                let account_id = account.account_id.clone();
+                let group_next = group.clone();
+                let rows_next = rows.clone();
+                let status_next = status.clone();
+                disconnect.connect_clicked(move |button| {
+                    button.set_sensitive(false);
+                    let request = ConnectorHostIpcRequest::CalendarDisconnect {
+                        account_id: account_id.clone(),
+                        delete_local_data: purge.is_active(),
+                    };
+                    let (tx, rx) = mpsc::channel();
+                    thread::spawn(move || {
+                        let _ = tx.send(send_connector_host_request(&request));
+                    });
+                    let group_done = group_next.clone();
+                    let rows_done = rows_next.clone();
+                    let status_done = status_next.clone();
+                    glib::timeout_add_local(Duration::from_millis(50), move || {
+                        match rx.try_recv() {
+                            Ok(Ok(response)) if response.status == "ok" => {
+                                status_done.set_text("Account disconnected; credentials removed");
+                                refresh_calendar_accounts(&group_done, &rows_done, &status_done);
+                                glib::ControlFlow::Break
+                            }
+                            Ok(Ok(response)) => {
+                                status_done.set_text(
+                                    response.message.as_deref().unwrap_or("Disconnect failed"),
+                                );
+                                glib::ControlFlow::Break
+                            }
+                            Ok(Err(error)) => {
+                                status_done.set_text(&error);
+                                glib::ControlFlow::Break
+                            }
+                            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                            Err(_) => glib::ControlFlow::Break,
+                        }
+                    });
+                });
+                group.add(&row);
+                rows.borrow_mut().push(row.upcast());
+            }
+            glib::ControlFlow::Break
+        }
+        Ok(Ok(response)) => {
+            status.set_text(
+                response
+                    .message
+                    .as_deref()
+                    .unwrap_or("Could not load accounts"),
+            );
+            glib::ControlFlow::Break
+        }
+        Ok(Err(error)) => {
+            status.set_text(&error);
+            glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(_) => glib::ControlFlow::Break,
+    });
+}
+
+fn save_calendar_preferences(
+    account_id: String,
+    selected: Rc<RefCell<BTreeSet<String>>>,
+    reminder_minutes: Rc<Cell<u32>>,
+    status: StatusBanner,
+) {
+    let calendar_ids = selected.borrow().iter().cloned().collect::<Vec<_>>();
+    if calendar_ids.is_empty() {
+        status.set_text("Keep at least one calendar selected");
+        return;
+    }
+    let request = ConnectorHostIpcRequest::CalendarUpdatePreferences {
+        account_id,
+        calendar_ids,
+        reminder_minutes: reminder_minutes.get(),
+    };
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(send_connector_host_request(&request));
+    });
+    status.set_text("Saving calendar preferences…");
+    glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+        Ok(Ok(response)) if response.status == "ok" => {
+            status.set_text("Calendar preferences saved");
+            glib::ControlFlow::Break
+        }
+        Ok(Ok(response)) => {
+            status.set_text(
+                response
+                    .message
+                    .as_deref()
+                    .unwrap_or("Could not save preferences"),
+            );
+            glib::ControlFlow::Break
+        }
+        Ok(Err(error)) => {
+            status.set_text(&error);
+            glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(_) => glib::ControlFlow::Break,
+    });
+}
+
+fn discover_calendar_preferences(
+    account_id: &str,
+    current_reminder: u32,
+    group: &adw::PreferencesGroup,
+    rows: &DynamicRows,
+    status: &StatusBanner,
+) {
+    status.set_text("Loading provider calendars…");
+    let request = ConnectorHostIpcRequest::CalendarDiscover {
+        account_id: account_id.into(),
+    };
+    let account_id = account_id.to_string();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(send_connector_host_request(&request));
+    });
+    let group = group.clone();
+    let rows = rows.clone();
+    let status = status.clone();
+    glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+        Ok(Ok(response)) if response.status == "ok" => {
+            let selected = Rc::new(RefCell::new(
+                response
+                    .available_calendars
+                    .iter()
+                    .filter(|calendar| calendar.selected)
+                    .map(|calendar| calendar.id.clone())
+                    .collect::<BTreeSet<_>>(),
+            ));
+            let reminder = Rc::new(Cell::new(current_reminder));
+            let reminder_row = adw::ActionRow::new();
+            reminder_row.set_title(&format!("{account_id} reminder"));
+            reminder_row.set_subtitle("Notification time before each event");
+            let labels = [
+                "Off",
+                "5 minutes",
+                "10 minutes",
+                "15 minutes",
+                "30 minutes",
+                "1 hour",
+            ];
+            let values = [0_u32, 5, 10, 15, 30, 60];
+            let dropdown = gtk::DropDown::from_strings(&labels);
+            dropdown.set_selected(
+                values
+                    .iter()
+                    .position(|value| *value == current_reminder)
+                    .unwrap_or(2) as u32,
+            );
+            reminder_row.add_suffix(&dropdown);
+            group.add(&reminder_row);
+            rows.borrow_mut().push(reminder_row.upcast());
+            let reminder_account = account_id.clone();
+            let reminder_selected = selected.clone();
+            let reminder_value = reminder.clone();
+            let reminder_status = status.clone();
+            dropdown.connect_selected_notify(move |dropdown| {
+                reminder_value.set(values[dropdown.selected() as usize]);
+                save_calendar_preferences(
+                    reminder_account.clone(),
+                    reminder_selected.clone(),
+                    reminder_value.clone(),
+                    reminder_status.clone(),
+                );
+            });
+            for calendar in response.available_calendars {
+                let row = adw::ActionRow::new();
+                row.set_title(&calendar.name);
+                row.set_subtitle(if calendar.primary {
+                    "Primary calendar"
+                } else {
+                    &calendar.id
+                });
+                let toggle = gtk::Switch::new();
+                toggle.set_active(calendar.selected);
+                toggle.set_valign(gtk::Align::Center);
+                row.add_suffix(&toggle);
+                group.add(&row);
+                rows.borrow_mut().push(row.upcast());
+                let toggle_account = account_id.clone();
+                let toggle_id = calendar.id;
+                let toggle_selected = selected.clone();
+                let toggle_reminder = reminder.clone();
+                let toggle_status = status.clone();
+                toggle.connect_active_notify(move |toggle| {
+                    if toggle.is_active() {
+                        toggle_selected.borrow_mut().insert(toggle_id.clone());
+                    } else {
+                        toggle_selected.borrow_mut().remove(&toggle_id);
+                        if toggle_selected.borrow().is_empty() {
+                            toggle_selected.borrow_mut().insert(toggle_id.clone());
+                            toggle.set_active(true);
+                            toggle_status.set_text("Keep at least one calendar selected");
+                            return;
+                        }
+                    }
+                    save_calendar_preferences(
+                        toggle_account.clone(),
+                        toggle_selected.clone(),
+                        toggle_reminder.clone(),
+                        toggle_status.clone(),
+                    );
+                });
+            }
+            status.set_text("Choose calendars and reminder timing");
+            glib::ControlFlow::Break
+        }
+        Ok(Ok(response)) => {
+            status.set_text(
+                response
+                    .message
+                    .as_deref()
+                    .unwrap_or("Could not load calendars"),
+            );
+            glib::ControlFlow::Break
+        }
+        Ok(Err(error)) => {
+            status.set_text(&error);
+            glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(_) => glib::ControlFlow::Break,
+    });
+}
+
+fn calendar_provider_group(
+    title: &str,
+    provider: &'static str,
+    microsoft: bool,
+) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    group.set_title(title);
+    let account = adw::EntryRow::new();
+    account.set_title("Account name");
+    account.set_text(if microsoft { "work-m365" } else { "google" });
+    group.add(&account);
+    let client = adw::EntryRow::new();
+    client.set_title("OAuth client ID");
+    group.add(&client);
+    let secret = adw::PasswordEntryRow::new();
+    secret.set_title("Client secret (Google only)");
+    if microsoft {
+        secret.set_visible(false);
+    }
+    group.add(&secret);
+    let tenant = adw::EntryRow::new();
+    tenant.set_title("Tenant");
+    tenant.set_text("common");
+    if !microsoft {
+        tenant.set_visible(false);
+    }
+    group.add(&tenant);
+    let status = StatusBanner::new("Not connected");
+    group.add(&status.widget());
+    let row = adw::ActionRow::new();
+    row.set_title("Connect account");
+    row.set_subtitle(if microsoft {
+        "Browser sign-in using PKCE with Calendars.ReadWrite"
+    } else {
+        "Browser sign-in using PKCE with calendar read and event write access"
+    });
+    let button = gtk::Button::with_label("Connect");
+    button.add_css_class("suggested-action");
+    button.add_css_class("pill");
+    row.add_suffix(&button);
+    group.add(&row);
+    button.connect_clicked(move |button| {
+        let account_id = account.text().trim().to_string();
+        let client_id = client.text().trim().to_string();
+        if account_id.is_empty() || client_id.is_empty() {
+            status.set_text("Enter an account name and OAuth client ID");
+            return;
+        }
+        button.set_sensitive(false);
+        status.set_text("Starting secure sign-in…");
+        let request = ConnectorHostIpcRequest::CalendarConnect {
+            provider: provider.into(),
+            account_id,
+            client_id,
+            client_secret: (!microsoft && !secret.text().is_empty())
+                .then(|| secret.text().to_string()),
+            tenant: microsoft.then(|| tenant.text().to_string()),
+        };
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(send_connector_host_request(&request));
+        });
+        let status_poll = status.clone();
+        let button_poll = button.clone();
+        glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+            Ok(Ok(response)) => {
+                let Some(flow) = response.oauth else {
+                    status_poll.set_text(
+                        response
+                            .message
+                            .as_deref()
+                            .unwrap_or("Could not start sign-in"),
+                    );
+                    button_poll.set_sensitive(true);
+                    return glib::ControlFlow::Break;
+                };
+                if let Some(uri) = &flow.verification_uri {
+                    let _ = gtk::gio::AppInfo::launch_default_for_uri(
+                        uri,
+                        None::<&gtk::gio::AppLaunchContext>,
+                    );
+                }
+                status_poll.set_text(
+                    &flow
+                        .user_code
+                        .as_ref()
+                        .map(|code| format!("Enter code {code} in the browser"))
+                        .unwrap_or_else(|| "Finish signing in with your browser".into()),
+                );
+                let flow_id = flow.flow_id;
+                let status_done = status_poll.clone();
+                let button_done = button_poll.clone();
+                glib::timeout_add_local(Duration::from_secs(1), move || {
+                    match send_connector_host_request(
+                        &ConnectorHostIpcRequest::CalendarOAuthStatus {
+                            flow_id: flow_id.clone(),
+                        },
+                    ) {
+                        Ok(response) => match response.oauth {
+                            Some(flow) if flow.state == "connected" => {
+                                status_done.set_text(
+                                    "Connected · enable calendar consent in the AI Console to sync",
+                                );
+                                button_done.set_sensitive(true);
+                                glib::ControlFlow::Break
+                            }
+                            Some(flow) if flow.state == "error" => {
+                                status_done
+                                    .set_text(flow.message.as_deref().unwrap_or("Sign-in failed"));
+                                button_done.set_sensitive(true);
+                                glib::ControlFlow::Break
+                            }
+                            _ => glib::ControlFlow::Continue,
+                        },
+                        Err(error) => {
+                            status_done.set_text(&error);
+                            button_done.set_sensitive(true);
+                            glib::ControlFlow::Break
+                        }
+                    }
+                });
+                glib::ControlFlow::Break
+            }
+            Ok(Err(error)) => {
+                status_poll.set_text(&error);
+                button_poll.set_sensitive(true);
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(_) => {
+                status_poll.set_text("Sign-in worker stopped");
+                button_poll.set_sensitive(true);
+                glib::ControlFlow::Break
+            }
+        });
+    });
+    group
 }
 
 fn populate_bluetooth_list(
@@ -8182,6 +9074,334 @@ fn play_test_speaker_sound() {
     UiSoundPlayer::new().play(&buffer);
 }
 
+fn window_rule_summary(rule: &WindowRule) -> String {
+    let app = (!rule.app_id.trim().is_empty()).then_some(rule.app_id.trim());
+    let title = (!rule.title_contains.trim().is_empty()).then_some(rule.title_contains.trim());
+    match (app, title) {
+        (Some(app), Some(title)) => format!("{app} · title contains “{title}”"),
+        (Some(app), None) => app.to_string(),
+        (None, Some(title)) => format!("Title contains “{title}”"),
+        (None, None) => "New window rule".to_string(),
+    }
+}
+
+fn add_window_rule_entry_row(
+    section: &adw::ExpanderRow,
+    title: &str,
+    placeholder: &str,
+    value: &str,
+) -> gtk::Entry {
+    let row = adw::ActionRow::new();
+    row.set_title(title);
+    let entry = gtk::Entry::new();
+    entry.set_placeholder_text(Some(placeholder));
+    entry.set_text(value);
+    entry.set_hexpand(true);
+    row.add_suffix(&entry);
+    section.add_row(&row);
+    entry
+}
+
+fn repopulate_window_rule_rows(
+    group: &adw::PreferencesGroup,
+    rows: &DynamicRows,
+    settings: &Rc<RefCell<Settings>>,
+) {
+    clear_dynamic_rows(group, rows);
+    let rules = settings.borrow().apps.window_rules.clone();
+    if rules.is_empty() {
+        let row = adw::ActionRow::new();
+        row.set_title("No window rules yet");
+        row.set_subtitle("Add one to choose where a matching application opens");
+        add_dynamic_row(group, rows, &row);
+        return;
+    }
+
+    for (index, rule) in rules.into_iter().enumerate() {
+        let section = adw::ExpanderRow::new();
+        section.set_title(&format!("Rule {}", index + 1));
+        section.set_subtitle(&window_rule_summary(&rule));
+        section.set_enable_expansion(true);
+
+        let app_id = add_window_rule_entry_row(
+            &section,
+            "Application ID / X11 class",
+            "org.example.Application",
+            &rule.app_id,
+        );
+        {
+            let settings = settings.clone();
+            let section = section.clone();
+            app_id.connect_changed(move |entry| {
+                let mut current = settings.borrow_mut();
+                if let Some(rule) = current.apps.window_rules.get_mut(index) {
+                    rule.app_id = entry.text().to_string();
+                    section.set_subtitle(&window_rule_summary(rule));
+                    persist_settings(&current);
+                }
+            });
+        }
+
+        let title = add_window_rule_entry_row(
+            &section,
+            "Title contains",
+            "Optional text in the window title",
+            &rule.title_contains,
+        );
+        {
+            let settings = settings.clone();
+            let section = section.clone();
+            title.connect_changed(move |entry| {
+                let mut current = settings.borrow_mut();
+                if let Some(rule) = current.apps.window_rules.get_mut(index) {
+                    rule.title_contains = entry.text().to_string();
+                    section.set_subtitle(&window_rule_summary(rule));
+                    persist_settings(&current);
+                }
+            });
+        }
+
+        let workspace_row = adw::ActionRow::new();
+        workspace_row.set_title("Workspace");
+        workspace_row.set_subtitle("0 keeps the active workspace; use 1 or higher to choose one");
+        let workspace = gtk::SpinButton::with_range(0.0, 99.0, 1.0);
+        workspace.set_value(f64::from(rule.workspace.unwrap_or(0)));
+        workspace_row.add_suffix(&workspace);
+        section.add_row(&workspace_row);
+        {
+            let settings = settings.clone();
+            workspace.connect_value_changed(move |spin| {
+                let mut current = settings.borrow_mut();
+                if let Some(rule) = current.apps.window_rules.get_mut(index) {
+                    rule.workspace =
+                        (spin.value_as_int() > 0).then_some(spin.value_as_int() as u32);
+                    persist_settings(&current);
+                }
+            });
+        }
+
+        let output = add_window_rule_entry_row(
+            &section,
+            "Display connector",
+            "Optional, e.g. HDMI-A-1",
+            rule.output.as_deref().unwrap_or_default(),
+        );
+        {
+            let settings = settings.clone();
+            output.connect_changed(move |entry| {
+                let mut current = settings.borrow_mut();
+                if let Some(rule) = current.apps.window_rules.get_mut(index) {
+                    let connector = entry.text().trim().to_string();
+                    rule.output = (!connector.is_empty()).then_some(connector);
+                    persist_settings(&current);
+                }
+            });
+        }
+
+        let placement_controls: [(&str, Option<bool>, WindowRuleToggle); 2] = [
+            ("Floating", rule.floating, |rule, value| {
+                rule.floating = value
+            }),
+            ("Maximize", rule.maximize, |rule, value| {
+                rule.maximize = value
+            }),
+        ];
+        for (title, value, update) in placement_controls {
+            let row = adw::ActionRow::new();
+            row.set_title(title);
+            let dropdown = dropdown_from_strings(
+                &["Use default", "No", "Yes"],
+                match value {
+                    None => 0,
+                    Some(false) => 1,
+                    Some(true) => 2,
+                },
+            );
+            row.add_suffix(&dropdown);
+            section.add_row(&row);
+            let settings = settings.clone();
+            dropdown.connect_selected_notify(move |dropdown| {
+                let value = match dropdown.selected() {
+                    1 => Some(false),
+                    2 => Some(true),
+                    _ => None,
+                };
+                let mut current = settings.borrow_mut();
+                if let Some(rule) = current.apps.window_rules.get_mut(index) {
+                    update(rule, value);
+                    persist_settings(&current);
+                }
+            });
+        }
+
+        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let up = gtk::Button::with_label("Move up");
+        let down = gtk::Button::with_label("Move down");
+        let remove = gtk::Button::with_label("Remove");
+        for button in [&up, &down, &remove] {
+            button.add_css_class("pill");
+            controls.append(button);
+        }
+        up.set_sensitive(index > 0);
+        down.set_sensitive(index + 1 < settings.borrow().apps.window_rules.len());
+        section.add_suffix(&controls);
+
+        for (button, direction) in [(&up, -1isize), (&down, 1isize)] {
+            let group = group.clone();
+            let rows = rows.clone();
+            let settings = settings.clone();
+            button.connect_clicked(move |_| {
+                let mut current = settings.borrow_mut();
+                let destination = index as isize + direction;
+                if destination >= 0 && destination < current.apps.window_rules.len() as isize {
+                    current.apps.window_rules.swap(index, destination as usize);
+                    persist_settings(&current);
+                }
+                drop(current);
+                repopulate_window_rule_rows(&group, &rows, &settings);
+            });
+        }
+        {
+            let group = group.clone();
+            let rows = rows.clone();
+            let settings = settings.clone();
+            remove.connect_clicked(move |_| {
+                let mut current = settings.borrow_mut();
+                if index < current.apps.window_rules.len() {
+                    current.apps.window_rules.remove(index);
+                    persist_settings(&current);
+                }
+                drop(current);
+                repopulate_window_rule_rows(&group, &rows, &settings);
+            });
+        }
+
+        add_dynamic_row(group, rows, &section);
+    }
+}
+
+fn repopulate_startup_app_rows(
+    group: &adw::PreferencesGroup,
+    rows: &DynamicRows,
+    settings: &Rc<RefCell<Settings>>,
+) {
+    clear_dynamic_rows(group, rows);
+    let apps = settings.borrow().apps.startup_apps.clone();
+    if apps.is_empty() {
+        let row = adw::ActionRow::new();
+        row.set_title("No startup applications yet");
+        row.set_subtitle("Add an application or executable to launch after sign-in");
+        add_dynamic_row(group, rows, &row);
+        return;
+    }
+
+    for (index, app) in apps.into_iter().enumerate() {
+        let section = adw::ExpanderRow::new();
+        section.set_title(if app.name.trim().is_empty() {
+            "Unnamed startup application"
+        } else {
+            app.name.trim()
+        });
+        section.set_subtitle(&app.command);
+        section.set_enable_expansion(true);
+
+        let enabled = add_input_switch_row(
+            &section,
+            "Launch at sign-in",
+            "Runs once when a new FocalDesk session starts",
+            app.enabled,
+            true,
+        );
+        {
+            let settings = settings.clone();
+            enabled.connect_active_notify(move |switch| {
+                let mut current = settings.borrow_mut();
+                if let Some(app) = current.apps.startup_apps.get_mut(index) {
+                    app.enabled = switch.is_active();
+                    persist_settings(&current);
+                }
+            });
+        }
+
+        let name = add_window_rule_entry_row(&section, "Name", "Optional label", &app.name);
+        {
+            let settings = settings.clone();
+            let section = section.clone();
+            name.connect_changed(move |entry| {
+                let mut current = settings.borrow_mut();
+                if let Some(app) = current.apps.startup_apps.get_mut(index) {
+                    app.name = entry.text().to_string();
+                    section.set_title(if app.name.trim().is_empty() {
+                        "Unnamed startup application"
+                    } else {
+                        app.name.trim()
+                    });
+                    persist_settings(&current);
+                }
+            });
+        }
+
+        let command = add_window_rule_entry_row(
+            &section,
+            "Command",
+            "Executable or absolute script path",
+            &app.command,
+        );
+        {
+            let settings = settings.clone();
+            let section = section.clone();
+            command.connect_changed(move |entry| {
+                let mut current = settings.borrow_mut();
+                if let Some(app) = current.apps.startup_apps.get_mut(index) {
+                    app.command = entry.text().to_string();
+                    section.set_subtitle(&app.command);
+                    persist_settings(&current);
+                }
+            });
+        }
+
+        let arguments = add_window_rule_entry_row(
+            &section,
+            "Arguments",
+            "Optional space-separated arguments",
+            &app.arguments.join(" "),
+        );
+        {
+            let settings = settings.clone();
+            arguments.connect_changed(move |entry| {
+                let mut current = settings.borrow_mut();
+                if let Some(app) = current.apps.startup_apps.get_mut(index) {
+                    app.arguments = entry
+                        .text()
+                        .split_whitespace()
+                        .map(ToOwned::to_owned)
+                        .collect();
+                    persist_settings(&current);
+                }
+            });
+        }
+
+        let remove = gtk::Button::with_label("Remove");
+        remove.add_css_class("pill");
+        section.add_suffix(&remove);
+        {
+            let group = group.clone();
+            let rows = rows.clone();
+            let settings = settings.clone();
+            remove.connect_clicked(move |_| {
+                let mut current = settings.borrow_mut();
+                if index < current.apps.startup_apps.len() {
+                    current.apps.startup_apps.remove(index);
+                    persist_settings(&current);
+                }
+                drop(current);
+                repopulate_startup_app_rows(&group, &rows, &settings);
+            });
+        }
+        add_dynamic_row(group, rows, &section);
+    }
+}
+
 fn applications_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Applications");
@@ -8268,6 +9488,61 @@ fn applications_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
 
     page.add(&defaults_group);
 
+    let rules_group = adw::PreferencesGroup::new();
+    rules_group.set_title("Window Rules");
+    rules_group.set_description(Some(
+        "Rules apply to new windows in order. Session-restored windows retain their saved placement.",
+    ));
+    let rule_rows: DynamicRows = Rc::new(RefCell::new(Vec::new()));
+    repopulate_window_rule_rows(&rules_group, &rule_rows, &settings);
+    let add_rule = add_button_row(
+        &rules_group,
+        "Add window rule",
+        Some("Match an application ID, X11 class, or window title"),
+        "Add",
+    );
+    {
+        let rules_group = rules_group.clone();
+        let rule_rows = rule_rows.clone();
+        let settings = settings.clone();
+        add_rule.connect_clicked(move |_| {
+            settings
+                .borrow_mut()
+                .apps
+                .window_rules
+                .push(WindowRule::default());
+            repopulate_window_rule_rows(&rules_group, &rule_rows, &settings);
+        });
+    }
+    page.add(&rules_group);
+
+    let startup_group = adw::PreferencesGroup::new();
+    startup_group.set_title("Startup Applications");
+    startup_group.set_description(Some(
+        "Enabled entries launch once after sign-in. They are separate from session restore.",
+    ));
+    let startup_rows: DynamicRows = Rc::new(RefCell::new(Vec::new()));
+    repopulate_startup_app_rows(&startup_group, &startup_rows, &settings);
+    let add_startup = add_button_row(
+        &startup_group,
+        "Add startup application",
+        Some("The command is launched without a shell"),
+        "Add",
+    );
+    {
+        let startup_group = startup_group.clone();
+        let startup_rows = startup_rows.clone();
+        let settings = settings.clone();
+        add_startup.connect_clicked(move |_| {
+            settings.borrow_mut().apps.startup_apps.push(StartupApp {
+                enabled: true,
+                ..StartupApp::default()
+            });
+            repopulate_startup_app_rows(&startup_group, &startup_rows, &settings);
+        });
+    }
+    page.add(&startup_group);
+
     let actions_group = adw::PreferencesGroup::new();
     actions_group.set_title("Actions");
     let reset = add_button_row(
@@ -8284,6 +9559,10 @@ fn applications_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
         let file_manager = file_manager.clone();
         let email = email.clone();
         let pin_email = pin_email.clone();
+        let rules_group = rules_group.clone();
+        let rule_rows = rule_rows.clone();
+        let startup_group = startup_group.clone();
+        let startup_rows = startup_rows.clone();
         move |_| {
             settings.borrow_mut().apps = focaldesk_settings_core::default_settings().apps;
             let apps = settings.borrow().apps.clone();
@@ -8294,6 +9573,8 @@ fn applications_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
             email.set_text(&apps.email);
             set_switch_if_changed(&pin_email, apps.pin_email_to_shelf);
             persist_settings(&settings.borrow());
+            repopulate_window_rule_rows(&rules_group, &rule_rows, &settings);
+            repopulate_startup_app_rows(&startup_group, &startup_rows, &settings);
         }
     });
     page.add(&actions_group);
@@ -8474,6 +9755,30 @@ fn workspaces_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
         });
     }
 
+    let transition_row = adw::ActionRow::new();
+    transition_row.set_title("Workspace transition");
+    transition_row.set_subtitle("Choose the visual effect used when switching workspaces");
+    let transition_choices = gtk::StringList::new(&["Slide", "Materialize", "None"]);
+    let transition = gtk::DropDown::new(Some(transition_choices), None::<&gtk::Expression>);
+    transition.set_selected(match settings.borrow().workspaces.transition_style {
+        WorkspaceTransitionStyle::Slide => 0,
+        WorkspaceTransitionStyle::Materialize => 1,
+        WorkspaceTransitionStyle::None => 2,
+    });
+    transition_row.add_suffix(&transition);
+    behavior_group.add(&transition_row);
+    {
+        let settings = settings.clone();
+        transition.connect_selected_notify(move |dropdown| {
+            settings.borrow_mut().workspaces.transition_style = match dropdown.selected() {
+                1 => WorkspaceTransitionStyle::Materialize,
+                2 => WorkspaceTransitionStyle::None,
+                _ => WorkspaceTransitionStyle::Slide,
+            };
+            persist_settings(&settings.borrow());
+        });
+    }
+
     let restore_session = add_switch_row(
         &behavior_group,
         "Restore session",
@@ -8531,6 +9836,95 @@ fn workspaces_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     }
     page.add(&behavior_group);
 
+    let names_group = adw::PreferencesGroup::new();
+    names_group.set_title("Workspace Names");
+    names_group.set_description(Some("Names apply immediately to existing workspaces."));
+    for workspace in 1..=9u32 {
+        let entry = add_entry_row(
+            &names_group,
+            &format!("Workspace {workspace}"),
+            &format!("Workspace {workspace}"),
+        );
+        if let Some(name) = settings.borrow().workspaces.workspace_names.get(&workspace) {
+            entry.set_text(name);
+        }
+        let settings = settings.clone();
+        entry.connect_changed(move |entry| {
+            let name = entry.text().trim().to_string();
+            let mut current = settings.borrow_mut();
+            if name.is_empty() {
+                current.workspaces.workspace_names.remove(&workspace);
+            } else {
+                current.workspaces.workspace_names.insert(workspace, name);
+            }
+            persist_settings(&current);
+        });
+    }
+    page.add(&names_group);
+
+    let wallpaper_group = adw::PreferencesGroup::new();
+    wallpaper_group.set_title("Workspace Wallpapers");
+    wallpaper_group.set_description(Some(
+        "Optional local image paths. Empty entries use the active theme wallpaper.",
+    ));
+    for workspace in 1..=9u32 {
+        let row = adw::ActionRow::new();
+        row.set_title(&format!("Workspace {workspace}"));
+        let entry = gtk::Entry::new();
+        entry.set_placeholder_text(Some("Optional image path"));
+        entry.set_hexpand(true);
+        let browse = gtk::Button::with_label("Browse…");
+        browse.set_tooltip_text(Some("Choose a local wallpaper image"));
+        row.add_suffix(&entry);
+        row.add_suffix(&browse);
+        wallpaper_group.add(&row);
+        if let Some(path) = settings
+            .borrow()
+            .workspaces
+            .workspace_wallpapers
+            .get(&workspace)
+        {
+            entry.set_text(path);
+        }
+        let settings = settings.clone();
+        entry.connect_changed(move |entry| {
+            let path = entry.text().trim().to_string();
+            let mut current = settings.borrow_mut();
+            if path.is_empty() {
+                current.workspaces.workspace_wallpapers.remove(&workspace);
+            } else {
+                current
+                    .workspaces
+                    .workspace_wallpapers
+                    .insert(workspace, path);
+            }
+            persist_settings(&current);
+        });
+        browse.connect_clicked(move |_| {
+            let dialog = gtk::FileDialog::new();
+            dialog.set_title(&format!("Choose Wallpaper for Workspace {workspace}"));
+            let filter = gtk::FileFilter::new();
+            filter.set_name(Some("Wallpaper images"));
+            for pattern in ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.exr"] {
+                filter.add_pattern(pattern);
+            }
+            dialog.set_default_filter(Some(&filter));
+            dialog.open(None::<&gtk::Window>, None::<&gtk::gio::Cancellable>, {
+                let entry = entry.clone();
+                move |result| {
+                    let Ok(file) = result else {
+                        return;
+                    };
+                    let Some(path) = file.path() else {
+                        return;
+                    };
+                    entry.set_text(&path.to_string_lossy());
+                }
+            });
+        });
+    }
+    page.add(&wallpaper_group);
+
     let keybind_group = adw::PreferencesGroup::new();
     keybind_group.set_title("Keybind Hints");
     add_info_row(&keybind_group, "Switch to workspace 1", None, "Alt+1");
@@ -8556,6 +9950,440 @@ fn workspaces_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     page.add(&keybind_group);
 
     adw::NavigationPage::new(&page, "Workspaces")
+}
+
+fn load_input_devices() -> Result<Vec<InputDeviceSnapshot>, String> {
+    match send_desktop_request(&IpcRequest::GetInputDevices).map_err(|error| error.to_string())? {
+        IpcResponse::InputDevices { devices } => Ok(devices),
+        IpcResponse::Error { message } => Err(message),
+        response => Err(format!("unexpected input-device response: {response:?}")),
+    }
+}
+
+fn add_input_switch_row(
+    section: &adw::ExpanderRow,
+    title: &str,
+    subtitle: &str,
+    active: bool,
+    sensitive: bool,
+) -> gtk::Switch {
+    let row = adw::ActionRow::new();
+    row.set_title(title);
+    row.set_subtitle(subtitle);
+    let control = gtk::Switch::new();
+    control.set_active(active);
+    control.set_sensitive(sensitive);
+    row.add_suffix(&control);
+    row.set_activatable_widget(Some(&control));
+    section.add_row(&row);
+    control
+}
+
+fn input_device_row(
+    device: InputDeviceSnapshot,
+    settings: Rc<RefCell<Settings>>,
+) -> adw::ExpanderRow {
+    let section = adw::ExpanderRow::new();
+    section.set_title(&device.name);
+    section.set_subtitle(&format!(
+        "{} · {:04x}:{:04x}",
+        if device.touchpad {
+            "Touchpad"
+        } else {
+            "Pointer"
+        },
+        device.vendor_id,
+        device.product_id
+    ));
+    section.set_enable_expansion(true);
+
+    let device_id = device.id.clone();
+    let configured = settings
+        .borrow()
+        .input
+        .devices
+        .get(&device_id)
+        .cloned()
+        .unwrap_or_default();
+
+    let enabled = add_input_switch_row(
+        &section,
+        "Device enabled",
+        if device.can_disable {
+            "Stop or resume events from this pointer"
+        } else {
+            "Cannot be disabled because it also provides keyboard input"
+        },
+        device.enabled,
+        device.can_disable,
+    );
+    if device.can_disable {
+        let settings = settings.clone();
+        let device_id = device_id.clone();
+        enabled.connect_active_notify(move |control| {
+            settings
+                .borrow_mut()
+                .input
+                .devices
+                .entry(device_id.clone())
+                .or_default()
+                .enabled = Some(control.is_active());
+            persist_settings(&settings.borrow());
+        });
+    }
+
+    if device.tap_finger_count > 0 {
+        let tap = add_input_switch_row(
+            &section,
+            "Tap to click",
+            "A light finger tap performs a primary click",
+            device.tap_to_click,
+            true,
+        );
+        let settings = settings.clone();
+        let device_id = device_id.clone();
+        tap.connect_active_notify(move |control| {
+            settings
+                .borrow_mut()
+                .input
+                .devices
+                .entry(device_id.clone())
+                .or_default()
+                .tap_to_click = Some(control.is_active());
+            persist_settings(&settings.borrow());
+        });
+    }
+
+    if device.supports_disable_while_typing {
+        let dwt = add_input_switch_row(
+            &section,
+            "Disable while typing",
+            "Ignore accidental touchpad movement while keys are pressed",
+            device.disable_while_typing,
+            true,
+        );
+        let settings = settings.clone();
+        let device_id = device_id.clone();
+        dwt.connect_active_notify(move |control| {
+            settings
+                .borrow_mut()
+                .input
+                .devices
+                .entry(device_id.clone())
+                .or_default()
+                .disable_while_typing = Some(control.is_active());
+            persist_settings(&settings.borrow());
+        });
+    }
+
+    if device.supports_acceleration {
+        let mut profiles = vec![("System default", InputAccelerationProfile::Default)];
+        if device.supports_adaptive_acceleration {
+            profiles.push(("Adaptive", InputAccelerationProfile::Adaptive));
+        }
+        if device.supports_flat_acceleration {
+            profiles.push(("Flat", InputAccelerationProfile::Flat));
+        }
+        let labels = profiles.iter().map(|(label, _)| *label).collect::<Vec<_>>();
+        let selected = profiles
+            .iter()
+            .position(|(_, profile)| *profile == configured.acceleration_profile)
+            .unwrap_or(0) as u32;
+        let dropdown = gtk::DropDown::from_strings(&labels);
+        dropdown.set_selected(selected);
+        let row = adw::ActionRow::new();
+        row.set_title("Acceleration profile");
+        row.set_subtitle("Adaptive follows movement speed; flat keeps a constant response");
+        row.add_suffix(&dropdown);
+        section.add_row(&row);
+        {
+            let settings = settings.clone();
+            let device_id = device_id.clone();
+            dropdown.connect_selected_notify(move |control| {
+                let Some((_, profile)) = profiles.get(control.selected() as usize) else {
+                    return;
+                };
+                settings
+                    .borrow_mut()
+                    .input
+                    .devices
+                    .entry(device_id.clone())
+                    .or_default()
+                    .acceleration_profile = *profile;
+                persist_settings(&settings.borrow());
+            });
+        }
+
+        let speed = gtk::Scale::with_range(gtk::Orientation::Horizontal, -1.0, 1.0, 0.05);
+        speed.set_width_request(180);
+        speed.set_draw_value(true);
+        speed.set_value(
+            configured
+                .acceleration_speed
+                .unwrap_or(device.acceleration_speed),
+        );
+        let row = adw::ActionRow::new();
+        row.set_title("Device acceleration");
+        row.set_subtitle("Fine-tune this device independently of global pointer speed");
+        row.add_suffix(&speed);
+        section.add_row(&row);
+        {
+            let settings = settings.clone();
+            let device_id = device_id.clone();
+            speed.connect_value_changed(move |control| {
+                settings
+                    .borrow_mut()
+                    .input
+                    .devices
+                    .entry(device_id.clone())
+                    .or_default()
+                    .acceleration_speed = Some(control.value());
+                persist_settings(&settings.borrow());
+            });
+        }
+    }
+
+    let mut scroll_methods = vec![("System default", InputScrollMethod::Default)];
+    if device.supports_two_finger_scroll {
+        scroll_methods.push(("Two-finger", InputScrollMethod::TwoFinger));
+    }
+    if device.supports_edge_scroll {
+        scroll_methods.push(("Edge", InputScrollMethod::Edge));
+    }
+    if device.supports_button_scroll {
+        scroll_methods.push(("Button scrolling", InputScrollMethod::OnButtonDown));
+    }
+    if device.supports_disabled_scroll {
+        scroll_methods.push(("Disabled", InputScrollMethod::Disabled));
+    }
+    if scroll_methods.len() > 1 {
+        let labels = scroll_methods
+            .iter()
+            .map(|(label, _)| *label)
+            .collect::<Vec<_>>();
+        let selected = scroll_methods
+            .iter()
+            .position(|(_, method)| *method == configured.scroll_method)
+            .unwrap_or(0) as u32;
+        let dropdown = gtk::DropDown::from_strings(&labels);
+        dropdown.set_selected(selected);
+        let row = adw::ActionRow::new();
+        row.set_title("Scroll method");
+        row.set_subtitle("Only methods supported by this device are shown");
+        row.add_suffix(&dropdown);
+        section.add_row(&row);
+        let settings = settings.clone();
+        let device_id = device_id.clone();
+        dropdown.connect_selected_notify(move |control| {
+            let Some((_, method)) = scroll_methods.get(control.selected() as usize) else {
+                return;
+            };
+            settings
+                .borrow_mut()
+                .input
+                .devices
+                .entry(device_id.clone())
+                .or_default()
+                .scroll_method = *method;
+            persist_settings(&settings.borrow());
+        });
+    }
+
+    for (title, subtitle, active, field) in [
+        (
+            "Left-handed mode",
+            "Swap the primary and secondary pointer buttons",
+            device.left_handed,
+            0u8,
+        ),
+        (
+            "Middle-click emulation",
+            "Press the left and right buttons together for a middle click",
+            device.middle_button_emulation,
+            1u8,
+        ),
+    ] {
+        let supported = if field == 0 {
+            device.supports_left_handed
+        } else {
+            device.supports_middle_button_emulation
+        };
+        if !supported {
+            continue;
+        }
+        let control = add_input_switch_row(&section, title, subtitle, active, true);
+        let settings = settings.clone();
+        let device_id = device_id.clone();
+        control.connect_active_notify(move |control| {
+            let mut settings_ref = settings.borrow_mut();
+            let device_settings = settings_ref
+                .input
+                .devices
+                .entry(device_id.clone())
+                .or_default();
+            if field == 0 {
+                device_settings.left_handed = Some(control.is_active());
+            } else {
+                device_settings.middle_button_emulation = Some(control.is_active());
+            }
+            drop(settings_ref);
+            persist_settings(&settings.borrow());
+        });
+    }
+
+    section
+}
+
+fn mouse_touchpad_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
+    let page = adw::PreferencesPage::new();
+    page.set_title("Mouse & Touchpad");
+
+    let pointer_group = adw::PreferencesGroup::new();
+    pointer_group.set_title("Pointer");
+    pointer_group.set_description(Some(
+        "Pointer changes apply immediately to mice, touchpads, and trackpoints.",
+    ));
+
+    let pointer_speed = add_scale_row(
+        &pointer_group,
+        "Pointer speed",
+        0.25,
+        2.0,
+        0.05,
+        f64::from(settings.borrow().input.pointer_speed),
+    );
+    pointer_speed.set_draw_value(true);
+    {
+        let settings = settings.clone();
+        pointer_speed.connect_value_changed(move |scale| {
+            settings.borrow_mut().input.pointer_speed = scale.value() as f32;
+            persist_settings(&settings.borrow());
+        });
+    }
+
+    let natural_scroll = add_switch_row(
+        &pointer_group,
+        "Natural scrolling",
+        Some("Move content in the same direction as your fingers"),
+        settings.borrow().input.natural_scroll,
+    );
+    {
+        let settings = settings.clone();
+        natural_scroll.connect_active_notify(move |switch| {
+            settings.borrow_mut().input.natural_scroll = switch.is_active();
+            persist_settings(&settings.borrow());
+        });
+    }
+    page.add(&pointer_group);
+
+    let device_group = adw::PreferencesGroup::new();
+    device_group.set_title("Devices");
+    device_group.set_description(Some(
+        "Settings are saved per hardware device and applied again when it reconnects.",
+    ));
+    match load_input_devices() {
+        Ok(devices) if devices.is_empty() => add_info_row(
+            &device_group,
+            "No pointer devices reported",
+            Some("Open this page again after connecting a device"),
+            "Not connected",
+        ),
+        Ok(devices) => {
+            for device in devices {
+                device_group.add(&input_device_row(device, settings.clone()));
+            }
+        }
+        Err(error) => add_info_row(
+            &device_group,
+            "Device controls unavailable",
+            Some(&error),
+            "Compositor offline",
+        ),
+    }
+    page.add(&device_group);
+
+    let gesture_group = adw::PreferencesGroup::new();
+    gesture_group.set_title("Touchpad Gestures");
+    gesture_group.set_description(Some(
+        "A dominant horizontal swipe changes the workspace on the display under the pointer. Unreserved gestures remain available to applications.",
+    ));
+
+    let swipe_fingers = add_dropdown_row(
+        &gesture_group,
+        "Workspace swipe",
+        Some("Choose how many fingers reserve a swipe for FocalDesk"),
+        &["Disabled", "Three fingers", "Four fingers"],
+        match settings.borrow().input.workspace_swipe_fingers {
+            3 => 1,
+            4 => 2,
+            _ => 0,
+        },
+    );
+    {
+        let settings = settings.clone();
+        swipe_fingers.connect_selected_notify(move |dropdown| {
+            settings.borrow_mut().input.workspace_swipe_fingers = match dropdown.selected() {
+                1 => 3,
+                2 => 4,
+                _ => 0,
+            };
+            persist_settings(&settings.borrow());
+        });
+    }
+
+    let swipe_distance = add_scale_row(
+        &gesture_group,
+        "Activation distance",
+        40.0,
+        400.0,
+        10.0,
+        settings.borrow().input.workspace_swipe_distance,
+    );
+    swipe_distance.set_draw_value(true);
+    {
+        let settings = settings.clone();
+        swipe_distance.connect_value_changed(move |scale| {
+            settings.borrow_mut().input.workspace_swipe_distance = scale.value();
+            persist_settings(&settings.borrow());
+        });
+    }
+    page.add(&gesture_group);
+
+    let reset_group = adw::PreferencesGroup::new();
+    reset_group.set_title("Defaults");
+    let reset = add_button_row(
+        &reset_group,
+        "Reset pointer and gestures",
+        Some("Restore pointer speed, scrolling, and workspace swipe defaults"),
+        "Reset",
+    );
+    {
+        let settings = settings.clone();
+        let pointer_speed = pointer_speed.clone();
+        let natural_scroll = natural_scroll.clone();
+        let swipe_fingers = swipe_fingers.clone();
+        let swipe_distance = swipe_distance.clone();
+        reset.connect_clicked(move |_| {
+            let defaults = focaldesk_settings_core::default_settings().input;
+            settings.borrow_mut().input.pointer_speed = defaults.pointer_speed;
+            settings.borrow_mut().input.natural_scroll = defaults.natural_scroll;
+            settings.borrow_mut().input.workspace_swipe_fingers = defaults.workspace_swipe_fingers;
+            settings.borrow_mut().input.workspace_swipe_distance =
+                defaults.workspace_swipe_distance;
+            pointer_speed.set_value(f64::from(defaults.pointer_speed));
+            set_switch_if_changed(&natural_scroll, defaults.natural_scroll);
+            swipe_fingers.set_selected(match defaults.workspace_swipe_fingers {
+                3 => 1,
+                4 => 2,
+                _ => 0,
+            });
+            swipe_distance.set_value(defaults.workspace_swipe_distance);
+            persist_settings(&settings.borrow());
+        });
+    }
+    page.add(&reset_group);
+
+    adw::NavigationPage::new(&page, "Mouse & Touchpad")
 }
 
 fn keyboard_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
@@ -8718,6 +10546,578 @@ fn keyboard_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     adw::NavigationPage::new(&page, "Keyboard")
 }
 
+fn accessibility_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
+    let page = adw::PreferencesPage::new();
+    page.set_title("Accessibility");
+
+    let keyboard = adw::PreferencesGroup::new();
+    keyboard.set_title("Keyboard");
+    keyboard.set_description(Some(
+        "Keyboard filters apply immediately to the current session and all applications",
+    ));
+
+    let sticky = add_switch_row(
+        &keyboard,
+        "Sticky Keys",
+        Some("Use modifier keys one at a time instead of holding them"),
+        settings.borrow().input.accessibility.sticky_keys,
+    );
+    {
+        let settings = settings.clone();
+        sticky.connect_active_notify(move |toggle| {
+            settings.borrow_mut().input.accessibility.sticky_keys = toggle.is_active();
+            persist_settings(&settings.borrow());
+        });
+    }
+
+    let shortcut = add_switch_row(
+        &keyboard,
+        "Sticky Keys shortcut",
+        Some("Ask before toggling Sticky Keys when Shift is pressed five times"),
+        settings.borrow().input.accessibility.sticky_keys_shortcut,
+    );
+    {
+        let settings = settings.clone();
+        shortcut.connect_active_notify(move |toggle| {
+            settings
+                .borrow_mut()
+                .input
+                .accessibility
+                .sticky_keys_shortcut = toggle.is_active();
+            persist_settings(&settings.borrow());
+        });
+    }
+
+    let feedback = add_switch_row(
+        &keyboard,
+        "Visual feedback",
+        Some("Show a brief notification for toggles and latched modifiers"),
+        settings.borrow().input.accessibility.visual_feedback,
+    );
+    {
+        let settings = settings.clone();
+        feedback.connect_active_notify(move |toggle| {
+            settings.borrow_mut().input.accessibility.visual_feedback = toggle.is_active();
+            persist_settings(&settings.borrow());
+        });
+    }
+
+    let slow = add_switch_row(
+        &keyboard,
+        "Slow Keys",
+        Some("Accept a key only after it has been held for the configured delay"),
+        settings.borrow().input.accessibility.slow_keys,
+    );
+    let slow_delay = add_scale_row(
+        &keyboard,
+        "Slow Keys delay (ms)",
+        100.0,
+        2_000.0,
+        50.0,
+        settings.borrow().input.accessibility.slow_keys_delay_ms as f64,
+    );
+    slow_delay.set_sensitive(slow.is_active());
+    {
+        let settings = settings.clone();
+        let slow_delay = slow_delay.clone();
+        slow.connect_active_notify(move |toggle| {
+            let enabled = toggle.is_active();
+            slow_delay.set_sensitive(enabled);
+            settings.borrow_mut().input.accessibility.slow_keys = enabled;
+            persist_settings(&settings.borrow());
+        });
+    }
+    {
+        let settings = settings.clone();
+        slow_delay.connect_value_changed(move |scale| {
+            settings.borrow_mut().input.accessibility.slow_keys_delay_ms =
+                scale.value().round() as u32;
+            persist_settings(&settings.borrow());
+        });
+    }
+
+    let bounce = add_switch_row(
+        &keyboard,
+        "Bounce Keys",
+        Some("Ignore repeated presses of the same key for a short interval"),
+        settings.borrow().input.accessibility.bounce_keys,
+    );
+    let bounce_delay = add_scale_row(
+        &keyboard,
+        "Bounce Keys interval (ms)",
+        100.0,
+        2_000.0,
+        50.0,
+        settings.borrow().input.accessibility.bounce_keys_delay_ms as f64,
+    );
+    bounce_delay.set_sensitive(bounce.is_active());
+    {
+        let settings = settings.clone();
+        let bounce_delay = bounce_delay.clone();
+        bounce.connect_active_notify(move |toggle| {
+            let enabled = toggle.is_active();
+            bounce_delay.set_sensitive(enabled);
+            settings.borrow_mut().input.accessibility.bounce_keys = enabled;
+            persist_settings(&settings.borrow());
+        });
+    }
+    {
+        let settings = settings.clone();
+        bounce_delay.connect_value_changed(move |scale| {
+            settings
+                .borrow_mut()
+                .input
+                .accessibility
+                .bounce_keys_delay_ms = scale.value().round() as u32;
+            persist_settings(&settings.borrow());
+        });
+    }
+
+    page.add(&keyboard);
+
+    let vision = adw::PreferencesGroup::new();
+    vision.set_title("Vision and motion");
+    vision.set_description(Some(
+        "Magnification follows the pointer and can follow the keyboard-focused window",
+    ));
+    let magnifier = add_switch_row(
+        &vision,
+        "Screen magnifier",
+        Some("Magnify each display around its current focus point"),
+        settings.borrow().accessibility.magnifier_enabled,
+    );
+    let zoom = add_scale_row(
+        &vision,
+        "Magnification",
+        1.0,
+        8.0,
+        0.25,
+        settings.borrow().accessibility.magnifier_zoom as f64,
+    );
+    zoom.set_sensitive(magnifier.is_active());
+    {
+        let settings = settings.clone();
+        let zoom = zoom.clone();
+        magnifier.connect_active_notify(move |toggle| {
+            let enabled = toggle.is_active();
+            zoom.set_sensitive(enabled);
+            settings.borrow_mut().accessibility.magnifier_enabled = enabled;
+            persist_settings(&settings.borrow());
+        });
+    }
+    {
+        let settings = settings.clone();
+        zoom.connect_value_changed(move |scale| {
+            settings.borrow_mut().accessibility.magnifier_zoom = scale.value() as f32;
+            settings
+                .borrow_mut()
+                .accessibility
+                .magnifier_output_zoom
+                .clear();
+            persist_settings(&settings.borrow());
+        });
+    }
+
+    let follow_focus = add_switch_row(
+        &vision,
+        "Follow keyboard focus",
+        Some("Move the magnified view to the focused window when using the keyboard"),
+        settings.borrow().accessibility.magnifier_follow_focus,
+    );
+    {
+        let settings = settings.clone();
+        follow_focus.connect_active_notify(move |toggle| {
+            settings.borrow_mut().accessibility.magnifier_follow_focus = toggle.is_active();
+            persist_settings(&settings.borrow());
+        });
+    }
+
+    let cursor_size = add_scale_row(
+        &vision,
+        "Pointer size",
+        24.0,
+        96.0,
+        8.0,
+        settings.borrow().accessibility.cursor_size as f64,
+    );
+    {
+        let settings = settings.clone();
+        cursor_size.connect_value_changed(move |scale| {
+            settings.borrow_mut().accessibility.cursor_size = scale.value().round() as u32;
+            persist_settings(&settings.borrow());
+        });
+    }
+    add_info_row(
+        &vision,
+        "Magnifier shortcuts",
+        Some("Adjust the focused display without opening Settings"),
+        "Super++ / Super+-",
+    );
+    page.add(&vision);
+
+    let keyboard = adw::PreferencesGroup::new();
+    keyboard.set_title("On-screen keyboard");
+    let on_screen_keyboard = add_switch_row(
+        &keyboard,
+        "Enable on-screen keyboard",
+        Some("Starts the trusted Maliit keyboard for touch and accessibility text entry"),
+        settings.borrow().accessibility.on_screen_keyboard_enabled,
+    );
+    {
+        let settings = settings.clone();
+        on_screen_keyboard.connect_active_notify(move |toggle| {
+            settings
+                .borrow_mut()
+                .accessibility
+                .on_screen_keyboard_enabled = toggle.is_active();
+            persist_settings(&settings.borrow());
+        });
+    }
+    add_info_row(
+        &keyboard,
+        "Behavior",
+        Some("Maliit shows and hides itself when text fields request input"),
+        "Automatic",
+    );
+    page.add(&keyboard);
+
+    let color = adw::PreferencesGroup::new();
+    color.set_title("Color and light");
+    color.set_description(Some(
+        "Display-only adjustments; screen sharing and screenshots keep application colors unchanged",
+    ));
+    let night_light = add_switch_row(
+        &color,
+        "Night Light",
+        Some("Warm the display at night to reduce blue light"),
+        settings.borrow().accessibility.night_light.enabled,
+    );
+    let temperature = add_scale_row(
+        &color,
+        "Color temperature (K)",
+        1_000.0,
+        6_500.0,
+        100.0,
+        settings
+            .borrow()
+            .accessibility
+            .night_light
+            .temperature_kelvin as f64,
+    );
+    temperature.set_sensitive(night_light.is_active());
+    {
+        let settings = settings.clone();
+        let temperature = temperature.clone();
+        night_light.connect_active_notify(move |toggle| {
+            temperature.set_sensitive(toggle.is_active());
+            settings.borrow_mut().accessibility.night_light.enabled = toggle.is_active();
+            persist_settings(&settings.borrow());
+        });
+    }
+    {
+        let settings = settings.clone();
+        temperature.connect_value_changed(move |scale| {
+            settings
+                .borrow_mut()
+                .accessibility
+                .night_light
+                .temperature_kelvin = scale.value().round() as u32;
+            persist_settings(&settings.borrow());
+        });
+    }
+    let transition = add_scale_row(
+        &color,
+        "Night Light transition (minutes)",
+        0.0,
+        60.0,
+        5.0,
+        settings
+            .borrow()
+            .accessibility
+            .night_light
+            .transition_minutes as f64,
+    );
+    {
+        let settings = settings.clone();
+        transition.connect_value_changed(move |scale| {
+            settings
+                .borrow_mut()
+                .accessibility
+                .night_light
+                .transition_minutes = scale.value().round() as u16;
+            persist_settings(&settings.borrow());
+        });
+    }
+    let schedule_selected = match settings.borrow().accessibility.night_light.schedule {
+        NightLightSchedule::Manual => 0,
+        NightLightSchedule::Custom => 1,
+        NightLightSchedule::Automatic => 2,
+    };
+    let schedule = add_dropdown_row(
+        &color,
+        "Night Light schedule",
+        Some("Automatic uses local solar times; custom hours are used until coordinates are set"),
+        &["Manual", "Custom hours", "Sunset to sunrise"],
+        schedule_selected,
+    );
+    {
+        let settings = settings.clone();
+        schedule.connect_selected_notify(move |dropdown| {
+            settings.borrow_mut().accessibility.night_light.schedule = match dropdown.selected() {
+                1 => NightLightSchedule::Custom,
+                2 => NightLightSchedule::Automatic,
+                _ => NightLightSchedule::Manual,
+            };
+            persist_settings(&settings.borrow());
+        });
+    }
+    let latitude_row = adw::ActionRow::new();
+    latitude_row.set_title("Solar schedule latitude");
+    latitude_row.set_subtitle("Use decimal degrees; positive is north.");
+    let latitude = gtk::SpinButton::with_range(-90.0, 90.0, 0.0001);
+    latitude.set_digits(4);
+    latitude.set_numeric(true);
+    latitude.set_value(
+        settings
+            .borrow()
+            .accessibility
+            .night_light
+            .latitude
+            .unwrap_or(0.0),
+    );
+    latitude_row.add_suffix(&latitude);
+    color.add(&latitude_row);
+    {
+        let settings = settings.clone();
+        latitude.connect_value_changed(move |scale| {
+            settings.borrow_mut().accessibility.night_light.latitude = Some(scale.value());
+            persist_settings(&settings.borrow());
+        });
+    }
+    let longitude_row = adw::ActionRow::new();
+    longitude_row.set_title("Solar schedule longitude");
+    longitude_row.set_subtitle("Use decimal degrees; negative is west.");
+    let longitude = gtk::SpinButton::with_range(-180.0, 180.0, 0.0001);
+    longitude.set_digits(4);
+    longitude.set_numeric(true);
+    longitude.set_value(
+        settings
+            .borrow()
+            .accessibility
+            .night_light
+            .longitude
+            .unwrap_or(0.0),
+    );
+    longitude_row.add_suffix(&longitude);
+    color.add(&longitude_row);
+    {
+        let settings = settings.clone();
+        longitude.connect_value_changed(move |scale| {
+            settings.borrow_mut().accessibility.night_light.longitude = Some(scale.value());
+            persist_settings(&settings.borrow());
+        });
+    }
+    let filter_selected = match settings.borrow().accessibility.color_filter {
+        ColorFilter::Off => 0,
+        ColorFilter::Grayscale => 1,
+        ColorFilter::Protanopia => 2,
+        ColorFilter::Deuteranopia => 3,
+        ColorFilter::Tritanopia => 4,
+    };
+    let color_filter = add_dropdown_row(
+        &color,
+        "Color filter",
+        Some("Color-vision aids are applied after monitor calibration"),
+        &[
+            "Off",
+            "Grayscale",
+            "Protanopia",
+            "Deuteranopia",
+            "Tritanopia",
+        ],
+        filter_selected,
+    );
+    {
+        let settings = settings.clone();
+        color_filter.connect_selected_notify(move |dropdown| {
+            settings.borrow_mut().accessibility.color_filter = match dropdown.selected() {
+                1 => ColorFilter::Grayscale,
+                2 => ColorFilter::Protanopia,
+                3 => ColorFilter::Deuteranopia,
+                4 => ColorFilter::Tritanopia,
+                _ => ColorFilter::Off,
+            };
+            persist_settings(&settings.borrow());
+        });
+    }
+    page.add(&color);
+
+    let ambient = adw::PreferencesGroup::new();
+    ambient.set_title("Ambient light adaptation");
+    ambient.set_description(Some(
+        "Uses only a local hardware light sensor when one is available; no location or network data is used",
+    ));
+    let ambient_enabled = add_switch_row(
+        &ambient,
+        "Adapt display brightness",
+        Some("Dim the final display output in low ambient light"),
+        settings.borrow().accessibility.ambient_light_enabled,
+    );
+    let ambient_floor = add_scale_row(
+        &ambient,
+        "Minimum brightness",
+        0.35,
+        1.0,
+        0.05,
+        settings.borrow().accessibility.ambient_min_brightness as f64,
+    );
+    ambient_floor.set_sensitive(ambient_enabled.is_active());
+    {
+        let settings = settings.clone();
+        let ambient_floor = ambient_floor.clone();
+        ambient_enabled.connect_active_notify(move |toggle| {
+            ambient_floor.set_sensitive(toggle.is_active());
+            settings.borrow_mut().accessibility.ambient_light_enabled = toggle.is_active();
+            persist_settings(&settings.borrow());
+        });
+    }
+    {
+        let settings = settings.clone();
+        ambient_floor.connect_value_changed(move |scale| {
+            settings.borrow_mut().accessibility.ambient_min_brightness = scale.value() as f32;
+            persist_settings(&settings.borrow());
+        });
+    }
+    add_info_row(
+        &ambient,
+        "Sensor availability",
+        Some("Unsupported or permission-denied sensors leave your display unchanged"),
+        "Local IIO",
+    );
+    page.add(&ambient);
+
+    let preview = adw::PreferencesGroup::new();
+    preview.set_title("Color-filter preview and contrast check");
+    preview.set_description(Some(
+        "Use these reference colors to compare the selected filter with familiar colors in your apps",
+    ));
+    add_info_row(
+        &preview,
+        "Primary color plates",
+        Some("Red  •  Green  •  Blue  •  Yellow  •  Magenta  •  Cyan"),
+        "Reference",
+    );
+    add_info_row(
+        &preview,
+        "Neutral ramp",
+        Some("White  •  75% gray  •  50% gray  •  25% gray  •  Black"),
+        "Reference",
+    );
+    add_info_row(
+        &preview,
+        "Contrast reference",
+        Some("Black on white is 21:1. Keep important text at 4.5:1 or higher."),
+        "AA",
+    );
+    add_info_row(
+        &preview,
+        "Color shortcuts",
+        Some("Toggle Night Light or cycle filters without opening Settings"),
+        "Super+Shift+N / Super+Shift+C",
+    );
+    let reset_all = gtk::Button::with_label("Reset color comfort");
+    reset_all.add_css_class("pill");
+    let reset_row = adw::ActionRow::new();
+    reset_row.set_title("Restore neutral color comfort");
+    reset_row.set_subtitle("Turn off Night Light and color filters, and re-enable all displays");
+    reset_row.add_suffix(&reset_all);
+    preview.add(&reset_row);
+    {
+        let settings = settings.clone();
+        reset_all.connect_clicked(move |_| {
+            let mut settings = settings.borrow_mut();
+            settings.accessibility.night_light.enabled = false;
+            settings.accessibility.color_filter = ColorFilter::Off;
+            settings
+                .accessibility
+                .display_comfort_disabled_outputs
+                .clear();
+            persist_settings(&settings);
+        });
+    }
+    page.add(&preview);
+
+    let outputs = adw::PreferencesGroup::new();
+    outputs.set_title("Display comfort by monitor");
+    outputs.set_description(Some(
+        "Disable Night Light and color filters on a monitor without changing other displays",
+    ));
+    let configured_outputs = settings.borrow().displays.outputs.clone();
+    if configured_outputs.is_empty() {
+        add_info_row(
+            &outputs,
+            "No configured displays",
+            Some("Connect a display or open Displays to configure output-specific controls"),
+            "",
+        );
+    }
+    for output in configured_outputs
+        .into_iter()
+        .filter(|output| output.enabled)
+    {
+        let connector = output.connector;
+        let enabled = !settings
+            .borrow()
+            .accessibility
+            .display_comfort_disabled_outputs
+            .get(&connector)
+            .copied()
+            .unwrap_or(false);
+        let toggle = add_switch_row(
+            &outputs,
+            &connector,
+            Some("Apply Night Light and color filters to this display"),
+            enabled,
+        );
+        let reset_connector = connector.clone();
+        let toggle_settings = settings.clone();
+        toggle.connect_active_notify(move |switch| {
+            let mut settings = toggle_settings.borrow_mut();
+            if switch.is_active() {
+                settings
+                    .accessibility
+                    .display_comfort_disabled_outputs
+                    .remove(&connector);
+            } else {
+                settings
+                    .accessibility
+                    .display_comfort_disabled_outputs
+                    .insert(connector.clone(), true);
+            }
+            persist_settings(&settings);
+        });
+        let reset = gtk::Button::with_label("Reset to neutral");
+        reset.add_css_class("pill");
+        let reset_row = adw::ActionRow::new();
+        reset_row.set_title(&format!("{reset_connector} neutral override"));
+        reset_row.set_subtitle("Exclude Night Light and color filters on this monitor");
+        reset_row.add_suffix(&reset);
+        outputs.add(&reset_row);
+        let settings = settings.clone();
+        reset.connect_clicked(move |_| {
+            let mut settings = settings.borrow_mut();
+            settings
+                .accessibility
+                .display_comfort_disabled_outputs
+                .insert(reset_connector.clone(), true);
+            persist_settings(&settings);
+        });
+    }
+    page.add(&outputs);
+
+    adw::NavigationPage::new(&page, "Accessibility")
+}
+
 fn privacy_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Privacy");
@@ -8768,8 +11168,8 @@ fn privacy_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     history_group.set_title("History");
     let recent_files = add_switch_row(
         &history_group,
-        "Recent applications",
-        Some("Remember launched applications for the Launcher's Recent section"),
+        "Recent activity",
+        Some("Remember launched applications and opened files for Launcher search"),
         settings.borrow().privacy.recent_files,
     );
     {
@@ -8825,22 +11225,22 @@ fn privacy_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     }
     let clear_history = add_button_row(
         &history_group,
-        "Clear recent applications",
-        Some("Remove every application from the Launcher's Recent section"),
+        "Clear recent activity",
+        Some("Remove applications and files from the Launcher's recent results"),
         "Clear",
     );
     clear_history.connect_clicked({
         let history_status = history_status.clone();
-        move |_| match clear_recent_apps() {
-            Ok(()) => history_status.set_text("Recent applications cleared"),
+        move |_| match clear_recent_activity() {
+            Ok(()) => history_status.set_text("Recent activity cleared"),
             Err(err) => {
                 warn!(
                     target: "focaldesk",
                     session_id = session_id(),
                     error = %err,
-                    "failed to clear recent applications"
+                    "failed to clear recent activity"
                 );
-                history_status.set_text("Could not clear recent applications")
+                history_status.set_text("Could not clear recent activity")
             }
         }
     });
@@ -9899,6 +12299,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preferences_save_preserves_external_control_panel_assignment() {
+        let mut stale = focaldesk_settings_core::default_settings();
+        stale.privacy.location_services = true;
+        let mut latest = focaldesk_settings_core::default_settings();
+        let mut output: OutputConfig = serde_json::from_value(serde_json::json!({
+            "connector": "HDMI-A-5", "enabled": true, "role": "ControlPanel",
+            "x": 0, "y": 0, "width": 1920, "height": 1080,
+            "refresh_mhz": 60000, "scale": 1.0, "primary": false
+        }))
+        .unwrap();
+        output.x = 123;
+        latest.displays.outputs.push(output);
+        let merged = settings_for_preferences_save(&stale, latest);
+        assert!(merged.privacy.location_services);
+        assert_eq!(merged.displays.outputs.len(), 1);
+        assert_eq!(
+            merged.displays.outputs[0].role,
+            focaldesk_settings_core::OutputRole::ControlPanel
+        );
+        assert_eq!(merged.displays.outputs[0].x, 123);
+    }
+
+    #[test]
     fn shortcut_normalization_detects_aliases_duplicates_and_extra_keys() {
         assert_eq!(
             normalized_shortcut("Meta+Shift+Return").unwrap(),
@@ -10320,6 +12743,7 @@ mod tests {
             physical_width_mm: None,
             physical_height_mm: None,
             primary: true,
+            role: focaldesk_settings_core::OutputRole::Normal,
             transform: "Normal".to_string(),
             color_profile: DisplayColorProfile::Auto,
             icc_profile_path: None,
@@ -10365,6 +12789,7 @@ mod tests {
             physical_width_mm: None,
             physical_height_mm: None,
             primary: name == "DP-3",
+            role: focaldesk_settings_core::OutputRole::Normal,
             transform: "Normal".to_string(),
             color_profile: DisplayColorProfile::Auto,
             icc_profile_path: None,

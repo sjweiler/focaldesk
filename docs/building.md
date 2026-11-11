@@ -51,6 +51,7 @@ sudo dnf install \
   gtk4-devel \
   gtk4-layer-shell-devel \
   libadwaita-devel \
+  poppler-utils \
   xorg-x11-server-Xwayland
 ```
 
@@ -80,6 +81,7 @@ sudo apt install -y \
   libgbm-dev \
   libgtk-4-dev \
   libadwaita-1-dev \
+  poppler-utils \
   libpam0g-dev
 ```
 
@@ -270,7 +272,13 @@ recovered page flip to discard their independent GTK GPU caches.
 `install-desktop` removes the legacy FocalDesk-owned NVIDIA `s2idle` override if
 an older installation left it behind.
 
-Log out, select **FocalDesk** in the display manager, and sign in. Keep a known
+Before logging in, install the desktop services below and run
+`just install-launcher`. The compositor/session recipes alone do not install
+the rail, dock, launch daemon, controls, or settings daemon. On Fedora, use
+`just install-services-fedora` for the complete service bundle.
+
+Log out, select **FocalDesk** in the display manager (Plasma Login Manager,
+GDM, or another Wayland session manager), and sign in. Keep a known
 working session installed so you can recover from compositor or driver failures.
 
 ## Install desktop services

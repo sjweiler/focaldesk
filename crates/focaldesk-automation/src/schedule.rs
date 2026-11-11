@@ -70,8 +70,8 @@ fn parse_interval(spec: &str) -> Result<Schedule, String> {
 
     let duration = match unit {
         "s" => Duration::from_secs(amount),
-        "m" => Duration::from_secs(amount * 60),
-        "h" => Duration::from_secs(amount * 3600),
+        "m" => Duration::from_secs(amount.checked_mul(60).ok_or("Interval is too large")?),
+        "h" => Duration::from_secs(amount.checked_mul(3600).ok_or("Interval is too large")?),
         other => {
             return Err(format!(
                 "unknown interval unit '{other}' — expected s, m, or h"
@@ -147,6 +147,11 @@ mod tests {
     #[test]
     fn rejects_zero_interval() {
         assert!(Schedule::parse("every 0m").is_err());
+    }
+
+    #[test]
+    fn rejects_overflowing_interval() {
+        assert!(Schedule::parse("every 18446744073709551615h").is_err());
     }
 
     #[test]

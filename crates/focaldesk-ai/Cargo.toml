@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+focaldesk-logging = { path = "../focaldesk-logging" }
+base64 = "0.22"
 anyhow = "1"
+chrono = { workspace = true }
 async-trait = "0.1"
 dirs = "6"
 ed25519-dalek = "3.0.0-rc.1"
@@ -16,13 +19,13 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 futures-util = "0.3"
 hmac = "0.12"
 rand = { workspace = true }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 pdf-extract = "0.12.1"
-quick-xml = "0.38"
+quick-xml = "0.41"
 sha2.workspace = true
-zip = { version = "6.0", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9.0", default-features = false, features = ["deflate-flate2"] }
 toml = "0.8"
 url = "2"
 tracing = { workspace = true }

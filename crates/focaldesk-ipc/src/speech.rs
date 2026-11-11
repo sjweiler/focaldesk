@@ -20,6 +20,7 @@ pub enum SpeechPriority {
 pub enum SpeechCommand {
     Speak,
     Stop,
+    Status,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -47,6 +48,15 @@ impl SpeechIpcRequest {
     pub fn stop() -> Self {
         Self {
             command: Some(SpeechCommand::Stop),
+            text: None,
+            priority: SpeechPriority::Normal,
+            replace: false,
+        }
+    }
+
+    pub fn status() -> Self {
+        Self {
+            command: Some(SpeechCommand::Status),
             text: None,
             priority: SpeechPriority::Normal,
             replace: false,

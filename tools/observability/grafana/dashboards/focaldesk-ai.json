@@ -1,0 +1,865 @@
+{
+  "uid": "focaldesk-ai",
+  "title": "FocalDesk AI Operations",
+  "schemaVersion": 39,
+  "version": 3,
+  "tags": [
+    "focaldesk",
+    "opentelemetry"
+  ],
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "description": "Service telemetry freshness, active work, selected-range sample counts, conservative latency estimates, and streaming responsiveness. Nested stages overlap; sparse p95 is hidden below 20 observations.",
+  "links": [
+    {
+      "title": "Distributed traces",
+      "url": "http://localhost:16686",
+      "targetBlank": true
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "service",
+        "label": "Service",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "focaldesk-prometheus"
+        },
+        "query": "label_values(focaldesk_operation_requests_total, service_name)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": "focaldesk-server|focal-vector",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "regex": "/^(focaldesk-server|focal-vector)$/"
+      },
+      {
+        "name": "stage",
+        "label": "Stage",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "focaldesk-prometheus"
+        },
+        "query": "label_values(focaldesk_operation_requests_total, stage)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "All service exporters",
+      "type": "stat",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 8,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "focaldesk-prometheus"
+      },
+      "description": "Recent exported heartbeat AND a successful Collector scrape. Does not prove the application event loop is responsive; inspect active work and oldest age.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "focaldesk_service_telemetry_fresh",
+          "legendFormat": "{{service_name}}",
+          "instant": true,
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "noValue": "No data",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "STALE / MISSING",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "RECENT",
+                  "color": "green"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 2,
+      "title": "Heartbeat age \u2014 all services",
+      "type": "stat",
+      "gridPos": {
+        "x": 8,
+        "y": 0,
+        "w": 8,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "focaldesk-prometheus"
+      },
+      "description": "Elapsed time since SDK collection, not the latest Prometheus scrape. -1 means no heartbeat has arrived.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(time() - max by (service_name) (focaldesk_service_heartbeat_seconds)) and on (service_name) focaldesk_service_expected or on (service_name) (focaldesk_service_expected * -1)",
+          "legendFormat": "{{service_name}}",
+          "instant": true,
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "noValue": "No data",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "-1": {
+                  "text": "NO TELEMETRY",
+                  "color": "red"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 3,
+      "title": "Collector scrape",
+      "type": "stat",
+      "gridPos": {
+        "x": 16,
+        "y": 0,
+        "w": 8,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "focaldesk-prometheus"
+      },
+      "description": "",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(up{job=\"focaldesk\"}) or vector(0)",
+          "legendFormat": "Collector",
+          "instant": true,
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "noValue": "No data",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "DOWN",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "UP",
+                  "color": "green"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 4,
+      "title": "Completed samples in selected range",
+      "type": "stat",
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 24,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "focaldesk-prometheus"
+      },
+      "description": "Reset-aware estimated increases over the selected range. Percentiles below use this same range. At least 20 completed observations are required to show p95.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service_name,stage) (increase(focaldesk_operation_requests_total{service_name=~\"$service\",stage=~\"$stage\"}[$__range])) > 0",
+          "legendFormat": "{{service_name}} / {{stage}}",
+          "instant": true,
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "noValue": "No completed operations"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 5,
+      "title": "Median latency \u2014 selected range",
+      "type": "stat",
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "focaldesk-prometheus"
+      },
+      "description": "Histogram estimate, not an exact percentile. Shown only with sufficient completed observations in the selected range.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(histogram_quantile(0.5, sum by (le,service_name,stage) (increase(focaldesk_operation_duration_seconds_bucket{service_name=~\"$service\",stage=~\"$stage\"}[$__range]))) and on (service_name,stage) (sum by (service_name,stage) (increase(focaldesk_operation_requests_total{service_name=~\"$service\",stage=~\"$stage\"}[$__range])) >= 1))",
+          "legendFormat": "{{service_name}} / {{stage}}",
+          "instant": true,
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "noValue": "No completed operations"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 6,
+      "title": "p95 latency \u2014 selected range",
+      "type": "stat",
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "focaldesk-prometheus"
+      },
+      "description": "Histogram estimate, not an exact percentile. Shown only with sufficient completed observations in the selected range.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(histogram_quantile(0.95, sum by (le,service_name,stage) (increase(focaldesk_operation_duration_seconds_bucket{service_name=~\"$service\",stage=~\"$stage\"}[$__range]))) and on (service_name,stage) (sum by (service_name,stage) (increase(focaldesk_operation_requests_total{service_name=~\"$service\",stage=~\"$stage\"}[$__range])) >= 20)) or on (service_name,stage) ((sum by (service_name,stage) (increase(focaldesk_operation_requests_total{service_name=~\"$service\",stage=~\"$stage\"}[$__range])) > 0) * (0 / 0))",
+          "legendFormat": "{{service_name}} / {{stage}}",
+          "instant": true,
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "noValue": "Limited data (<20)"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 7,
+      "title": "Active operations",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 14,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "focaldesk-prometheus"
+      },
+      "description": "Zero means idle only when telemetry is fresh. Nested stages overlap. Age can reveal stalled work; no hard stall threshold is assumed.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "focaldesk_operation_active{service_name=~\"$service\",stage=~\"$stage\"} and on (service_name) (focaldesk_service_telemetry_fresh == 1)",
+          "legendFormat": "{{service_name}} / {{stage}}",
+          "instant": false,
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "noValue": "No data"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Oldest active operation",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 14,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "focaldesk-prometheus"
+      },
+      "description": "Zero means idle only when telemetry is fresh. Nested stages overlap. Age can reveal stalled work; no hard stall threshold is assumed.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "focaldesk_operation_oldest_seconds{service_name=~\"$service\",stage=~\"$stage\"} and on (service_name) (focaldesk_service_telemetry_fresh == 1)",
+          "legendFormat": "{{service_name}} / {{stage}}",
+          "instant": false,
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "noValue": "No data"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 9,
+      "title": "Streaming time to first content \u2014 median",
+      "type": "stat",
+      "gridPos": {
+        "x": 0,
+        "y": 20,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "focaldesk-prometheus"
+      },
+      "description": "Inference start to first nonempty content chunk, including model startup and retries. Provider-side measurement; excludes retrieval and UI delivery.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le,service_name) (increase(focaldesk_inference_first_content_seconds_bucket{service_name=~\"$service\"}[$__range])))",
+          "legendFormat": "{{service_name}}",
+          "instant": true,
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "noValue": "No streamed content"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 10,
+      "title": "Streaming output tokens / second",
+      "type": "stat",
+      "gridPos": {
+        "x": 12,
+        "y": 20,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "focaldesk-prometheus"
+      },
+      "description": "Provider-reported output tokens divided by successful-stream wall time, including startup. Not raw GPU decode speed. Missing usage produces no throughput observation.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service_name) (increase(focaldesk_inference_output_tokens_total{service_name=~\"$service\"}[$__range])) / sum by (service_name) (increase(focaldesk_inference_stream_duration_seconds_sum{service_name=~\"$service\"}[$__range]))",
+          "legendFormat": "{{service_name}}",
+          "instant": true,
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "noValue": "No reported stream usage"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 11,
+      "title": "Completed operations / second",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "focaldesk-prometheus"
+      },
+      "description": "",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service_name,stage) (rate(focaldesk_operation_requests_total{service_name=~\"$service\",stage=~\"$stage\"}[$__rate_interval]))",
+          "legendFormat": "{{service_name}} / {{stage}}",
+          "instant": false,
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "noValue": "No data"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 12,
+      "title": "Error rate (includes timeouts)",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "focaldesk-prometheus"
+      },
+      "description": "",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum by (service_name,stage) (rate(focaldesk_operation_requests_total{service_name=~\"$service\",stage=~\"$stage\",outcome=~\"error|timeout\"}[$__rate_interval])) or on (service_name,stage) (sum by (service_name,stage) (rate(focaldesk_operation_requests_total{service_name=~\"$service\",stage=~\"$stage\"}[$__rate_interval])) * 0)) / sum by (service_name,stage) (rate(focaldesk_operation_requests_total{service_name=~\"$service\",stage=~\"$stage\"}[$__rate_interval]))",
+          "legendFormat": "{{service_name}} / {{stage}}",
+          "instant": false,
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "noValue": "No data"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 13,
+      "title": "Timeouts / second",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "focaldesk-prometheus"
+      },
+      "description": "",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service_name,stage) (rate(focaldesk_operation_requests_total{service_name=~\"$service\",stage=~\"$stage\",outcome=\"timeout\"}[$__rate_interval])) or on (service_name,stage) (sum by (service_name,stage) (rate(focaldesk_operation_requests_total{service_name=~\"$service\",stage=~\"$stage\"}[$__rate_interval])) * 0)",
+          "legendFormat": "{{service_name}} / {{stage}}",
+          "instant": false,
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "noValue": "No data"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 14,
+      "title": "Cancellations / second",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "focaldesk-prometheus"
+      },
+      "description": "",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service_name,stage) (rate(focaldesk_operation_requests_total{service_name=~\"$service\",stage=~\"$stage\",outcome=\"cancelled\"}[$__rate_interval])) or on (service_name,stage) (sum by (service_name,stage) (rate(focaldesk_operation_requests_total{service_name=~\"$service\",stage=~\"$stage\"}[$__rate_interval])) * 0)",
+          "legendFormat": "{{service_name}} / {{stage}}",
+          "instant": false,
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "noValue": "No data"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 15,
+      "title": "Completed operations \u2014 selected range",
+      "type": "table",
+      "gridPos": {
+        "x": 0,
+        "y": 48,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "focaldesk-prometheus"
+      },
+      "description": "Estimated counter increase over the selected range, accounting for resets. Fractional values are possible because Prometheus extrapolates between scrapes.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service_name,stage,outcome) (increase(focaldesk_operation_requests_total{service_name=~\"$service\",stage=~\"$stage\"}[$__range])) > 0",
+          "legendFormat": "{{service_name}} / {{stage}}",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "noValue": "No data"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 16,
+      "title": "Completed operations \u2014 process lifetime",
+      "type": "table",
+      "gridPos": {
+        "x": 12,
+        "y": 48,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "focaldesk-prometheus"
+      },
+      "description": "Current process totals. These reset when the process restarts.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service_name,stage,outcome) (focaldesk_operation_requests_total{service_name=~\"$service\",stage=~\"$stage\"}) > 0",
+          "legendFormat": "{{service_name}} / {{stage}}",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "noValue": "No data"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 17,
+      "title": "Ollama time by phase \u2014 selected-range mean",
+      "type": "bargauge",
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "focaldesk-prometheus"
+      },
+      "description": "Ollama-reported model loading, prompt processing, and token generation per completed provider attempt. Nanoseconds are converted to seconds. Missing fields are omitted; real zeros are retained. Warm-up-only requests are excluded. Means are not latency percentiles.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service_name,phase) (increase(focaldesk_ollama_phase_duration_seconds_sum{service_name=~\"$service\"}[$__range])) / sum by (service_name,phase) (increase(focaldesk_ollama_phase_duration_seconds_count{service_name=~\"$service\"}[$__range]))",
+          "legendFormat": "{{service_name}} / {{phase}}",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "noValue": "No reported phase timings"
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "basic",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 18,
+      "title": "Ollama generation tokens / second",
+      "type": "stat",
+      "gridPos": {
+        "x": 12,
+        "y": 26,
+        "w": 12,
+        "h": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "focaldesk-prometheus"
+      },
+      "description": "Provider-reported generated tokens divided by reported generation time. Excludes model loading and prompt processing; compare with end-to-end streaming throughput above. Successful completed attempts with paired positive values only.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service_name) (increase(focaldesk_ollama_generated_tokens_total{service_name=~\"$service\"}[$__range])) / sum by (service_name) (increase(focaldesk_ollama_generation_time_seconds_total{service_name=~\"$service\"}[$__range]))",
+          "legendFormat": "{{service_name}}",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "noValue": "No reported generation usage"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto"
+      }
+    }
+  ]
+}

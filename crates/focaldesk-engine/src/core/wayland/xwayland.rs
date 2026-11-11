@@ -28,7 +28,7 @@ fn constrained_window_geometry(
     work_area: Option<Rectangle<i32, Logical>>,
 ) -> Option<Rectangle<i32, Logical>> {
     if fullscreen {
-        output
+        work_area.or(output)
     } else if maximized {
         work_area.or(output)
     } else {
@@ -201,7 +201,7 @@ impl XwmHandler for DesktopState {
                 .window_id_for_x11_surface(&window)
                 .map(|window_id| self.xwayland_output_id_for_window(window_id))
                 .unwrap_or_else(|| {
-                    self.output_under_pointer(self.input.pointer_pos)
+                    self.output_under_pointer(self.input.pointer_pos.into())
                         .unwrap_or(self.primary_output)
                 });
             geometry = self.xwayland_clamp_to_output_geometry(output_id, geometry);
@@ -248,7 +248,7 @@ impl XwmHandler for DesktopState {
         }
 
         let output_id = self
-            .output_under_pointer(self.input.pointer_pos)
+            .output_under_pointer(self.input.pointer_pos.into())
             .unwrap_or(self.primary_output);
         if self.xwayland_request_fills_output(output_id, geometry.size) {
             if let Some(work) = self.work_recess_for_output(output_id) {
@@ -494,13 +494,13 @@ mod tests {
     use smithay::utils::Rectangle;
 
     #[test]
-    fn fullscreen_geometry_wins_over_maximized_work_area() {
+    fn fullscreen_geometry_respects_reserved_work_area() {
         let output = Rectangle::from_loc_and_size((0, 0), (3840, 2160));
         let work_area = Rectangle::from_loc_and_size((0, 40), (3840, 2120));
 
         assert_eq!(
             constrained_window_geometry(true, true, Some(output), Some(work_area)),
-            Some(output)
+            Some(work_area)
         );
     }
 

@@ -18,8 +18,10 @@ saves them. Invalid or conflicting overrides are ignored individually.
 | `Super+L` | Lock the session | Working |
 | `Super+V` | Open clipboard history | Working |
 | `Super+Shift+V` | Toggle voice capture | Experimental |
+| `Super++` / `Super+-` | Increase or decrease magnification on the focused display | Working |
 | `Super+F7` | Focus the previous window | Working |
 | `Super+F8` | Focus the next window | Working |
+| `Alt+Tab` / `Shift+Alt+Tab` | Cycle applications forward or backward | Working |
 | `Super+Left` / `Super+Right` | Place or restore the focused window in a side-by-side split | Requires **Enable split screen** |
 | `Super+Up` / `Super+Down` | Place or restore the focused window in a top/bottom split | Requires **Enable split screen** |
 | `Super+Z` | Open the split-layout chooser for the focused window | Requires **Enable split screen** |
@@ -45,8 +47,10 @@ These bindings are not registered by the nested winit backend.
 | Shortcut | Action |
 | --- | --- |
 | `Super+Space` | Toggle the application launcher |
-| `Print` | Capture the focused output |
+| `Print` | Select an area to capture; `Esc` or right-click cancels |
 | `Shift+Print` | Capture all outputs |
+| `Ctrl+Print` | Capture the focused output |
+| `Super+Shift+S` | Select an area to capture (alternate shortcut) |
 
 DRM screenshots are written below `~/Pictures/Screenshots` with the output name,
 timestamp, and a sequence number in the filename. They are 16-bit Display P3
@@ -66,7 +70,7 @@ workspace exists.
 | `Alt+0` | Open the complete workspace list |
 
 This document follows the bindings in
-`crates/focaldesk-flow/src/keybinds.rs`, which is the current source of truth.
+`crates/focaldesk-shortcuts/src/keybinds.rs`, which is the current source of truth.
 
 ## Configuration syntax
 
@@ -94,6 +98,8 @@ Supported action names are `launch_terminal`, `launch_ai_console`, `launch_brows
 `toggle_launcher`, `close_focused`, `lock_screen`, `focus_next`,
 `focus_previous`, `focus_shell_next`, `focus_shell_previous`,
 `toggle_clipboard_history`, `toggle_voice_capture`, `split_left`,
+`magnifier_zoom_in`, `magnifier_zoom_out`, `toggle_night_light`,
+`cycle_color_filter`,
 `split_right`, `split_top`, `split_bottom`, `toggle_split_layout`,
 `swap_split_left`, `swap_split_right`, `swap_split_top`, `swap_split_bottom`,
 `resize_split_left`, `resize_split_right`, `resize_split_top`,

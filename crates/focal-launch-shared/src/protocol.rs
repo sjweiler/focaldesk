@@ -16,6 +16,10 @@ pub struct LaunchRequest {
     /// serialized launch clients remain compatible.
     #[serde(default)]
     pub auto_hdr: bool,
+    /// Workspace active when the launch was requested. Launchers pass this to
+    /// descendants so delayed windows do not follow a later workspace switch.
+    #[serde(default)]
+    pub workspace: Option<u32>,
     pub source: LaunchSource,
 }
 

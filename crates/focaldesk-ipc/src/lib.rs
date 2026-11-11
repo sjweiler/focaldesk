@@ -75,6 +75,8 @@ pub enum IpcRequest {
     GetDisplayRuntimeStatus,
     /// Returns a bounded, secret-free snapshot of compositor-owned desktop state.
     GetDesktopSnapshot,
+    /// Returns bounded capability and current-state metadata for pointer devices.
+    GetInputDevices,
     GetThemeEditorStatus {
         protocol_version: u16,
     },
@@ -95,11 +97,25 @@ pub enum IpcRequest {
     ExecuteDesktopAction {
         action: DesktopAction,
     },
-    /// Sent by a trusted shell client after its first configured frame.
+    /// Tracks whether a trusted shell client has painted the UI that replaces
+    /// the compositor fallback. VUI clients first report `ready: false` while
+    /// remapping, then report `true` after their first rendered frame.
     ShellReady {
         namespace: String,
         output_count: usize,
+        /// Output whose replacement chrome is ready. `None` is accepted for
+        /// older shell clients and applies to every output.
+        #[serde(default)]
+        connector: Option<String>,
+        /// VUI clients clear readiness before remapping and set it after the
+        /// first successful Vello frame. Older clients default to ready.
+        #[serde(default = "shell_ready_default")]
+        ready: bool,
     },
+}
+
+const fn shell_ready_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +174,7 @@ pub enum DesktopSplitKeyboardAction {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShellPanel {
+    QuickSettings,
     Network,
     Bluetooth,
     Audio,
@@ -293,6 +310,9 @@ pub enum IpcResponse {
     DesktopSnapshot {
         snapshot: DesktopSnapshot,
     },
+    InputDevices {
+        devices: Vec<InputDeviceSnapshot>,
+    },
     ThemeEditorStatus {
         protocol_version: u16,
         preview_active: bool,
@@ -315,6 +335,36 @@ pub enum IpcResponse {
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputDeviceSnapshot {
+    pub id: String,
+    pub name: String,
+    pub sysname: String,
+    pub vendor_id: u32,
+    pub product_id: u32,
+    pub touchpad: bool,
+    pub enabled: bool,
+    pub can_disable: bool,
+    pub tap_finger_count: u32,
+    pub tap_to_click: bool,
+    pub supports_disable_while_typing: bool,
+    pub disable_while_typing: bool,
+    pub supports_acceleration: bool,
+    pub supports_adaptive_acceleration: bool,
+    pub supports_flat_acceleration: bool,
+    pub acceleration_profile: Option<String>,
+    pub acceleration_speed: f64,
+    pub supports_two_finger_scroll: bool,
+    pub supports_edge_scroll: bool,
+    pub supports_button_scroll: bool,
+    pub supports_disabled_scroll: bool,
+    pub scroll_method: Option<String>,
+    pub supports_left_handed: bool,
+    pub left_handed: bool,
+    pub supports_middle_button_emulation: bool,
+    pub middle_button_emulation: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -549,9 +599,10 @@ pub fn send_desktop_config(config: FocalDeskConfig) -> Result<(), String> {
 }
 
 pub use connector_host::{
-    CONNECTOR_HOST_SOCKET_ENV, CONNECTOR_HOST_SOCKET_NAME, ConnectorHostIpcRequest,
-    ConnectorHostIpcResponse, ConnectorRuntimeStatus, connector_host_socket_path,
-    send_connector_host_request,
+    CONNECTOR_HOST_SOCKET_ENV, CONNECTOR_HOST_SOCKET_NAME, CalendarAccountSnapshot,
+    CalendarAvailableSnapshot, CalendarEventSnapshot, CalendarOAuthSnapshot,
+    ConnectorHostIpcRequest, ConnectorHostIpcResponse, ConnectorRuntimeStatus,
+    connector_host_socket_path, send_connector_host_request,
 };
 pub use controls::{
     CONTROL_SOCKET_ENV, CONTROL_SOCKET_NAME, ControlIpcRequest, ControlIpcResponse, ControlSetting,
@@ -588,6 +639,24 @@ pub use updates::{
 mod theme_editor_tests {
     use super::*;
     use focaldesk_themes::{ThemeColor, ThemePaint, ThemePaintIntent};
+
+    #[test]
+    fn shell_ready_defaults_legacy_requests_to_global_ready() {
+        let request: IpcRequest = serde_json::from_value(serde_json::json!({
+            "type": "ShellReady",
+            "namespace": "focaldesk-system-rail",
+            "output_count": 1
+        }))
+        .unwrap();
+        assert!(matches!(
+            request,
+            IpcRequest::ShellReady {
+                connector: None,
+                ready: true,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn theme_editor_preview_round_trips_through_versioned_transport() {

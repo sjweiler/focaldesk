@@ -1,0 +1,34 @@
+rule_files:
+  - /etc/prometheus/health-rules.yaml
+evaluation_interval: 5s
+tests:
+  - interval: 5s
+    input_series:
+      - series: 'focaldesk_service_heartbeat_seconds{service_name="focaldesk-server"}'
+        values: '0 5 10 15 20 25 30'
+      - series: 'focaldesk_service_heartbeat_seconds{service_name="focal-vector"}'
+        values: '0 0 0 0 0 0 0'
+      - series: 'up{job="focaldesk"}'
+        values: '1 1 1 1 1 1 1'
+    promql_expr_test:
+      - expr: focaldesk_service_telemetry_fresh
+        eval_time: 30s
+        exp_samples:
+          - labels: 'focaldesk_service_telemetry_fresh{service_name="focaldesk-server"}'
+            value: 1
+          - labels: 'focaldesk_service_telemetry_fresh{service_name="focal-vector"}'
+            value: 0
+          - labels: 'focaldesk_service_telemetry_fresh{service_name="focaldesk-ai-console"}'
+            value: 0
+  - interval: 5s
+    input_series:
+      - series: 'focaldesk_service_heartbeat_seconds{service_name="focaldesk-server"}'
+        values: '0 5 10 15 20 25 30'
+      - series: 'up{job="focaldesk"}'
+        values: '1 1 1 1 1 1 0'
+    promql_expr_test:
+      - expr: 'focaldesk_service_telemetry_fresh{service_name="focaldesk-server"}'
+        eval_time: 30s
+        exp_samples:
+          - labels: 'focaldesk_service_telemetry_fresh{service_name="focaldesk-server"}'
+            value: 0

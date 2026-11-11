@@ -22,6 +22,10 @@ path = "wallpaper.png"
 fit = "fill"
 dim = 0.0
 
+[document.backing]
+rail_opacity = 0.74
+dock_opacity = 0.82
+
 [document.semantic.surfaces.bar.normal]
 space = "srgb"
 r = 0.10000000149011612

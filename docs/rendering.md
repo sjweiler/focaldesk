@@ -42,6 +42,12 @@ bounded damage history for its GBM buffers, repaints the regions an acquired
 buffer missed, and falls back to a full repaint if that history is incomplete.
 The same current-frame regions are forwarded as KMS damage clips.
 
+Raw-Ash shaders use Vulkan's top-left framebuffer coordinates with a
+positive-height viewport, matching damage render areas and scissors. Their
+SPIR-V compilation disables Naga's automatic vertex Y flip. Applying that flip
+in both the scene and output passes can conceal the mismatch on complete
+frames while partial repaints leave vertically mirrored regions stale.
+
 The shell pass now renders configured wallpaper fit/tint/dim behavior, cached
 font-atlas text, state-tinted SVG icons, antialiased rounded panels, and
 notification text above clients while keeping cursors foremost. Advanced GLES
@@ -61,6 +67,16 @@ published back to each reservation object for implicit consumers. Explicit
 `linux-drm-syncobj-v1` commit blockers and Wayland buffer retention remain in
 place. SHM textures use Vulkan staging uploads. There is no
 Vulkan display surface, Vulkan WSI swapchain, GLES copy, or EGL import bridge.
+
+The opt-in VUI shell (`FOCALDESK_VUI=1`) also stays on this raw-Ash boundary.
+It builds VUI scenes with `vui-ash` on the compositor's existing Vulkan
+instance, logical device, and graphics queue, then registers the resulting
+sampleable image directly with the Ash texture pass. The raw DRM path therefore
+uses neither Vello/wgpu, a CPU readback, nor a cross-device DMA-BUF bridge for
+VUI. Queue ordering provides frame synchronization; target recreation waits for
+host sampling to finish, and device-loss recovery abandons child handles before
+the host Vulkan device. The nested winit/wgpu development backend retains its
+Vello renderer as a compatibility path.
 
 `focaldmd` selects the renderer before the user session starts. The Vulkan DRM
 backend creates an explicit-sync GBM swapchain for every enabled connected

@@ -39,6 +39,8 @@ pub const DESKTOP_POLICY: PeerPolicy<'static> = PeerPolicy {
         "focaldesk-panel",
         "focaldesk-system-rail",
         "focaldesk-task-shelf",
+        "focaldesk-companion-dashboard",
+        "focaldesk-launcher",
         "focaldesk-settings",
         "focaldesk-portal",
         "focaldesk-cli",
@@ -46,12 +48,14 @@ pub const DESKTOP_POLICY: PeerPolicy<'static> = PeerPolicy {
         "focaldesk-mcp",
         "focald-voice",
         "focald-connectors",
+        "focaldesk-server",
     ],
     allowed_units: &[
         "focaldesk-dock.service",
         "focaldesk-panel.service",
         "focaldesk-system-rail.service",
         "focaldesk-task-shelf.service",
+        "focaldesk-companion-dashboard.service",
         "focaldesk-server.service",
         "focald-voice.service",
         "focald-connectors.service",
@@ -73,12 +77,19 @@ pub const CONTROL_POLICY: PeerPolicy<'static> = PeerPolicy {
 pub const DIALOG_POLICY: PeerPolicy<'static> = PeerPolicy {
     endpoint: "dialog",
     allowed_executables: &["focaldesk-polkitd", "focaldesk-portal", "focaldesk-server"],
-    allowed_units: &["focaldesk-polkitd.service", "focaldesk-server.service"],
+    allowed_units: &[
+        "focaldesk-polkitd.service",
+        "focaldesk-server.service",
+        // The screencast chooser is launched by xdg-desktop-portal-wlr, so the
+        // helper inherits that unit rather than focaldesk-portald.service.
+        "xdg-desktop-portal-wlr.service",
+    ],
 };
 
 pub const NOTIFICATIONS_POLICY: PeerPolicy<'static> = PeerPolicy {
     endpoint: "notifications",
     allowed_executables: &[
+        "focaldesk-system-rail",
         "focaldesk-desktop",
         "focaldesk-automation",
         "focaldesk-cli",
@@ -88,6 +99,7 @@ pub const NOTIFICATIONS_POLICY: PeerPolicy<'static> = PeerPolicy {
         "focald-connectors",
     ],
     allowed_units: &[
+        "focaldesk-system-rail.service",
         "focaldesk-automation.service",
         "focaldesk-updatesd.service",
         "focald-connectors.service",
@@ -96,14 +108,30 @@ pub const NOTIFICATIONS_POLICY: PeerPolicy<'static> = PeerPolicy {
 
 pub const POWER_POLICY: PeerPolicy<'static> = PeerPolicy {
     endpoint: "power",
-    allowed_executables: &["focaldesk-desktop", "focaldesk-settings"],
-    allowed_units: &[],
+    allowed_executables: &[
+        "focaldesk-system-rail",
+        "focaldesk-desktop",
+        "focaldesk-settings",
+        "focaldesk-companion-dashboard",
+    ],
+    allowed_units: &[
+        "focaldesk-system-rail.service",
+        "focaldesk-companion-dashboard.service",
+    ],
 };
 
 pub const UPDATES_POLICY: PeerPolicy<'static> = PeerPolicy {
     endpoint: "updates",
-    allowed_executables: &["focaldesk-desktop", "focaldesk-cli", "focaldesk-updatesd"],
-    allowed_units: &["focaldesk-updatesd.service"],
+    allowed_executables: &[
+        "focaldesk-system-rail",
+        "focaldesk-desktop",
+        "focaldesk-cli",
+        "focaldesk-updatesd",
+    ],
+    allowed_units: &[
+        "focaldesk-system-rail.service",
+        "focaldesk-updatesd.service",
+    ],
 };
 
 pub const AI_POLICY: PeerPolicy<'static> = PeerPolicy {
@@ -112,14 +140,24 @@ pub const AI_POLICY: PeerPolicy<'static> = PeerPolicy {
         "focaldesk-desktop",
         "focaldesk-cli",
         "focaldesk-ai-console",
+        "focaldesk-calendar",
+        "focaldesk-companion-dashboard",
         "focald-connectors",
     ],
-    allowed_units: &["focald-connectors.service"],
+    allowed_units: &[
+        "focaldesk-companion-dashboard.service",
+        "focald-connectors.service",
+    ],
 };
 
 pub const CONNECTOR_HOST_POLICY: PeerPolicy<'static> = PeerPolicy {
     endpoint: "connector-host",
-    allowed_executables: &["focaldesk-cli", "focaldesk-ai-console"],
+    allowed_executables: &[
+        "focaldesk-cli",
+        "focaldesk-ai-console",
+        "focaldesk-settings",
+        "focaldesk-calendar",
+    ],
     allowed_units: &[],
 };
 
@@ -155,8 +193,17 @@ pub const VOICE_POLICY: PeerPolicy<'static> = PeerPolicy {
 
 pub const SPEECH_POLICY: PeerPolicy<'static> = PeerPolicy {
     endpoint: "speech",
-    allowed_executables: &["focald-mic", "focald-speech", "focaldesk-ai-console"],
-    allowed_units: &["focald-mic.service", "focald-speech.service"],
+    allowed_executables: &[
+        "focald-mic",
+        "focald-speech",
+        "focaldesk-ai-console",
+        "focaldesk-companion-dashboard",
+    ],
+    allowed_units: &[
+        "focald-mic.service",
+        "focald-speech.service",
+        "focaldesk-companion-dashboard.service",
+    ],
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -223,7 +270,18 @@ pub fn bind_user_socket(path: &Path) -> io::Result<UnixListener> {
 /// Reject clients from a different effective user, even if socket permissions
 /// are accidentally broadened by packaging or an administrator.
 pub fn require_same_user(stream: &impl AsFd) -> io::Result<()> {
-    peer_identity(stream).map(|_| ())
+    let credentials = getsockopt(stream, PeerCredentials).map_err(io::Error::other)?;
+    let expected = Uid::effective().as_raw();
+    if credentials.uid() != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "IPC peer uid {} does not match service uid {expected}",
+                credentials.uid()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 pub fn require_authorized_peer(
@@ -394,14 +452,17 @@ fn policy_allows(identity: &PeerIdentity, policy: PeerPolicy<'_>) -> bool {
         // replaced during an upgrade. The inode is still pinned and verified
         // above, so this suffix is state, not part of the executable name.
         .map(|name| name.strip_suffix(" (deleted)").unwrap_or(name));
-    let executable_allowed = executable.is_some_and(|name| {
-        policy.allowed_executables.contains(&name) && executable_identity_is_trusted(identity)
-    });
+    let executable_allowed =
+        executable.is_some_and(|name| policy.allowed_executables.contains(&name));
+    let trusted_executable_allowed = executable_allowed && executable_identity_is_trusted(identity);
     let unit_allowed = identity
         .unit
         .as_deref()
         .is_some_and(|unit| policy.allowed_units.contains(&unit));
-    executable_allowed || unit_allowed
+    // User services may run from a per-user installation and therefore cannot
+    // satisfy the root-owned executable check. A matching service unit is only
+    // sufficient when it also launched the expected FocalDesk executable.
+    trusted_executable_allowed || (unit_allowed && executable_allowed)
 }
 
 fn executable_identity_is_trusted(identity: &PeerIdentity) -> bool {
@@ -436,6 +497,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn calendar_can_access_ai_and_connector_endpoints() {
+        let identity = PeerIdentity {
+            uid: 1000,
+            pid: 42,
+            executable: PathBuf::from("/usr/local/bin/focaldesk-calendar"),
+            unit: None,
+            executable_trusted: true,
+        };
+        assert!(policy_allows(&identity, AI_POLICY));
+        assert!(policy_allows(&identity, CONNECTOR_HOST_POLICY));
+        let untrusted = PeerIdentity {
+            executable_trusted: false,
+            ..identity
+        };
+        assert!(!policy_allows(&untrusted, AI_POLICY));
+    }
+
+    #[test]
     fn desktop_policy_allows_trusted_shell_clients() {
         assert!(
             DESKTOP_POLICY
@@ -457,6 +536,48 @@ mod tests {
                 .allowed_units
                 .contains(&"focaldesk-system-rail.service")
         );
+        assert!(
+            DESKTOP_POLICY
+                .allowed_executables
+                .contains(&"focaldesk-launcher")
+        );
+    }
+
+    #[test]
+    fn connector_host_policy_allows_settings() {
+        assert!(
+            CONNECTOR_HOST_POLICY
+                .allowed_executables
+                .contains(&"focaldesk-settings")
+        );
+    }
+
+    #[test]
+    fn rail_popover_services_require_the_expected_executable_and_unit() {
+        let rail = PeerIdentity {
+            uid: 1000,
+            pid: 42,
+            executable: PathBuf::from("/home/user/.local/bin/focaldesk-system-rail"),
+            unit: Some("focaldesk-system-rail.service".into()),
+            executable_trusted: false,
+        };
+        for policy in [NOTIFICATIONS_POLICY, POWER_POLICY, UPDATES_POLICY] {
+            assert!(policy_allows(&rail, policy));
+            assert!(!policy_allows(
+                &PeerIdentity {
+                    unit: Some("other.service".into()),
+                    ..rail.clone()
+                },
+                policy
+            ));
+            assert!(!policy_allows(
+                &PeerIdentity {
+                    executable: PathBuf::from("/tmp/other"),
+                    ..rail.clone()
+                },
+                policy
+            ));
+        }
     }
 
     #[test]
@@ -583,7 +704,13 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_policy_accepts_an_allowed_executable_or_unit() {
+    fn endpoint_policy_requires_expected_executable_for_allowed_unit() {
+        assert!(
+            DIALOG_POLICY
+                .allowed_units
+                .contains(&"xdg-desktop-portal-wlr.service")
+        );
+
         let by_executable = PeerIdentity {
             uid: 1000,
             pid: 42,
@@ -594,7 +721,7 @@ mod tests {
         let by_unit = PeerIdentity {
             uid: 1000,
             pid: 43,
-            executable: PathBuf::from("/usr/bin/launcher-wrapper"),
+            executable: PathBuf::from("/home/user/.local/bin/focaldesk-polkitd"),
             unit: Some("focaldesk-polkitd.service".to_string()),
             executable_trusted: false,
         };
@@ -605,6 +732,11 @@ mod tests {
         };
         assert!(policy_allows(&by_executable, policy));
         assert!(policy_allows(&by_unit, policy));
+        let wrong_executable = PeerIdentity {
+            executable: PathBuf::from("/home/user/.local/bin/launcher-wrapper"),
+            ..by_unit
+        };
+        assert!(!policy_allows(&wrong_executable, policy));
     }
 
     #[test]

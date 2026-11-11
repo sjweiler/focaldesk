@@ -1,8 +1,8 @@
 [Unit]
 Description=FocalDesk server
 PartOf=focaldesk-session.target
-Wants=focal-vector.service
-After=focaldesk-dialogd.service focal-vector.service
+Wants=focal-vector.service focaldesk-browserd.service
+After=focaldesk-dialogd.service focal-vector.service focaldesk-browserd.service
 
 [Service]
 Type=simple
@@ -13,6 +13,8 @@ Environment=FOCALDESK_AI_SOCKET=%t/focaldesk/focaldesk-ai.sock
 Environment=FOCALDESK_CONTROL_CENTER_SOCKET=%t/focaldesk/control-center.sock
 Environment=FOCAL_VECTOR_SOCKET=%t/focaldesk/focal-vector.sock
 Environment=FOCALDESK_MEMORY_BACKEND=focal-vector
+Environment=FOCALDESK_OLLAMA_KEEP_ALIVE=20m
+Environment=FOCALDESK_OLLAMA_PREWARM=1
 EnvironmentFile=-%h/.config/focaldesk/focaldesk-server.env
 # The boot service has no reliable terminal for an interactive fallback. Allow
 # chat for this logged-in session so the console can reach configured providers.

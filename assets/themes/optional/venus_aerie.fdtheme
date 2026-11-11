@@ -1,0 +1,122 @@
+package_version = 1
+slug = "venus-aerie"
+
+[document]
+format_version = 1
+name = "Venus Aerie"
+dynamic_range = "sdr"
+hdr_luminance_nits = 1000.0
+
+[document.paint]
+mode = "solid"
+
+[document.paint.color]
+space = "srgb"
+r = 0.90
+g = 0.60
+b = 0.25
+a = 1.0
+
+[document.backing]
+rail_opacity = 0.68
+dock_opacity = 0.76
+
+[document.semantic.surfaces.bar.normal]
+space = "srgb"
+r = 0.145
+g = 0.125
+b = 0.110
+a = 1.0
+
+[document.semantic.surfaces.dock.normal]
+space = "srgb"
+r = 0.085
+g = 0.075
+b = 0.070
+a = 1.0
+
+[document.semantic.surfaces.button.normal]
+space = "srgb"
+r = 0.190
+g = 0.160
+b = 0.130
+a = 1.0
+
+[document.semantic.surfaces.active_button.normal]
+space = "srgb"
+r = 0.90
+g = 0.60
+b = 0.25
+a = 1.0
+
+[document.semantic.surfaces.popup.normal]
+space = "srgb"
+r = 0.145
+g = 0.125
+b = 0.110
+a = 1.0
+
+[document.semantic.surfaces.window_frame.normal]
+space = "srgb"
+r = 0.085
+g = 0.075
+b = 0.070
+a = 1.0
+
+[document.semantic.typography]
+font_weight = 500
+size = 14.0
+letter_spacing = 0.0
+
+[document.semantic.typography.primary]
+space = "srgb"
+r = 0.950
+g = 0.930
+b = 0.890
+a = 1.0
+
+[document.semantic.typography.secondary]
+space = "srgb"
+r = 0.730
+g = 0.690
+b = 0.630
+a = 1.0
+
+[document.semantic.layout]
+bar_height = 64.0
+dock_width = 56.0
+padding = 8.0
+gap = 6.0
+icon_size = 44.0
+
+[document.semantic.edges]
+border_width = 1.0
+shadow = 0.4
+glow = 0.05
+radius = 4.0
+
+[document.semantic.edges.border_color]
+space = "srgb"
+r = 0.420
+g = 0.320
+b = 0.210
+a = 1.0
+
+[document.semantic.edges.inner_highlight]
+space = "srgb"
+r = 1.0
+g = 0.870
+b = 0.680
+a = 0.10
+
+[document.semantic.color_behavior]
+gamut = "srgb"
+dynamic_range = "sdr"
+sdr_white_nits = 203.0
+luminance_cap_nits = 1400.0
+gamut_mapping = "perceptual"
+
+[document.semantic.wallpaper]
+blur = 0.0
+saturation = 1.0
+automatic_accent = false

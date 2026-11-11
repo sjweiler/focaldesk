@@ -1,4 +1,4 @@
-use focaldesk_themes::ThemeDocument;
+use focaldesk_themes::{ThemeDocument, ThemePackage};
 use std::path::Path;
 
 #[test]
@@ -9,6 +9,23 @@ fn packaged_system_default_is_a_valid_theme_document() {
     assert_eq!(document.name, "Default");
     assert_eq!(
         document.wallpaper.path.as_deref(),
-        Some("/usr/share/focaldesk/wallpaper/focaldesk_wallpaper.png")
+        Some("/usr/share/focaldesk/wallpaper/Prismara-HDR1400.exr")
     );
+}
+
+#[test]
+fn optional_legacy_themes_are_valid_portable_packages() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/themes/optional");
+    for (filename, slug, name) in [
+        ("venus_aerie", "venus-aerie", "Venus Aerie"),
+        ("moonbase", "moonbase", "Moonbase"),
+        ("classic", "classic", "Classic"),
+        ("lunar_transport", "lunar-transport", "Lunar Transport"),
+        ("deepspace", "deep-space", "Deep Space"),
+    ] {
+        let package = ThemePackage::load(&root.join(format!("{filename}.fdtheme")))
+            .unwrap_or_else(|error| panic!("{slug} package should be valid: {error:#}"));
+        assert_eq!(package.slug, slug);
+        assert_eq!(package.document.name, name);
+    }
 }

@@ -1,0 +1,17 @@
+[package]
+name = "focaldesk-calendar-app"
+version = "0.1.0"
+edition = "2024"
+description = "FocalDesk desktop calendar"
+license = "MIT"
+
+[[bin]]
+name = "focaldesk-calendar"
+path = "src/main.rs"
+
+[dependencies]
+gtk4 = { version = "0.9", features = ["v4_12"] }
+chrono = { workspace = true }
+focaldesk-ipc = { path = "../../crates/focaldesk-ipc" }
+focaldesk-ai = { path = "../../crates/focaldesk-ai" }
+libc = { workspace = true }

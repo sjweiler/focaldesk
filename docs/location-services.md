@@ -54,3 +54,18 @@ Per-app location decisions are stored by `xdg-permission-store`. Focaldesk
 Settings lists both allowed and denied location decisions under Saved App
 Permissions. Revoking one deletes only that application's `location/location`
 entry, so the portal asks the application again on its next location request.
+
+## Companion weather and app subscriptions
+
+The companion subscribes to `privacy.location_services` and the saved night
+light latitude/longitude. Enabling location or changing coordinates triggers a
+forecast refresh. Disabling location clears the weather and stops subsequent
+refreshes; a response already in flight cannot restore the old weather.
+
+GTK clients can use `focaldesk_shell_gtk::settings_subscription::subscribe` with
+dotted settings keys and retain the returned subscription for as long as they
+need updates. It delivers an initial saved snapshot and subsequent changes to
+those keys on the GLib main context. Directory monitoring handles both direct
+writes and atomic file replacement, without polling or requiring compositor
+reloads. Malformed intermediate writes are ignored. This is separate from
+`watch_desktop_keys`, which subscribes to compositor configuration/runtime keys.

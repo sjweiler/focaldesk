@@ -5,5 +5,5 @@ mod config;
 pub use config::{
     configured_theme, load_config, migrate_legacy_config, save_config, ClockFormat, DockConfig,
     DockPosition, DockSize, DockVisibility, FocalDeskConfig, PanelConfig, PanelPosition,
-    ShellConfig, ShellStyle,
+    RailBackdrop, ShellConfig, ShellStyle,
 };

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
-use focaldesk_remote_protocol::{receive_fd, Event, Request, MAX_FRAME_BYTES};
+use focaldesk_remote_protocol::{receive_fd, CapturePurpose, Event, Request, MAX_FRAME_BYTES};
 use focaldesk_remote_protocol::{DamageRect, MAX_DAMAGE_RECTS};
 use ironrdp_server::{
     BitmapUpdate, CredentialDecision, CredentialValidationError, CredentialValidator, Credentials,
@@ -425,7 +425,13 @@ fn capture_socket_path() -> Result<PathBuf> {
 fn connect_capture(output_id: u64) -> Result<(UnixStream, Event)> {
     let stream = UnixStream::connect(capture_socket_path()?)
         .context("connect to compositor capture socket")?;
-    focaldesk_remote_protocol::write_message(&stream, &Request::StartCapture { output_id })?;
+    focaldesk_remote_protocol::write_message(
+        &stream,
+        &Request::StartCapture {
+            output_id,
+            purpose: CapturePurpose::RemoteDesktop,
+        },
+    )?;
     let event = focaldesk_remote_protocol::read_message::<Event>(&stream)?;
     match event {
         Event::CaptureStarted { .. } => Ok((stream, event)),

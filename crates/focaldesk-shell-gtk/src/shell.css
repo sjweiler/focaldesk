@@ -4,6 +4,63 @@ window.focal-shell-window {
   font-family: "IBM Plex Sans", sans-serif;
 }
 
+/* Full-screen touchscreen Companion Dashboard. */
+window.companion-dashboard-window,
+window.companion-dashboard-window > * {
+  background: @fd_shell_bg;
+}
+.companion-dashboard { color: @fd_shell_text; background: @fd_shell_bg; }
+.companion-header, .companion-footer { padding: 16px 26px; border-bottom: 1px solid @fd_shell_border; background: @fd_shell_surface; }
+.companion-footer { border-top: 1px solid @fd_shell_border; border-bottom: none; }
+.companion-brand { font-size: 27px; font-weight: 800; }
+.companion-nav, .companion-outline-button { padding: 8px 16px; border: 1px solid transparent; background: transparent; color: @fd_shell_text; }
+.companion-nav:hover, .companion-outline-button:hover { background: @fd_shell_surface_hover; border-color: @fd_shell_border; }
+.companion-nav.suggested-action { background: @fd_shell_surface_active; border-color: @fd_shell_border; }
+.companion-workspace-picker > contents {
+  background: @fd_shell_surface;
+  color: @fd_shell_text;
+  border: 1px solid @fd_shell_border;
+  border-radius: 10px;
+  box-shadow: 0 8px 24px @fd_shell_shadow;
+}
+.companion-workspace-picker-body { background: @fd_shell_surface; color: @fd_shell_text; }
+.companion-workspace-picker .companion-outline-button {
+  background: @fd_shell_surface_raised;
+  color: @fd_shell_text;
+  border-color: @fd_shell_border;
+  font-weight: 700;
+}
+.companion-workspace-picker .companion-outline-button:hover {
+  background: @fd_shell_surface_active;
+  border-color: @fd_shell_accent;
+}
+.companion-header-clock { font-size: 22px; font-weight: 700; }
+.companion-body { padding: 16px 20px; }
+.companion-card { padding: 16px; border: 1px solid @fd_shell_border; border-radius: 12px; background: @fd_shell_surface; box-shadow: inset 0 1px @fd_shell_highlight; }
+.companion-card-title, .companion-section-title { font-size: 16px; font-weight: 700; color: @fd_shell_text_dim; }
+.companion-big-time { font-size: 72px; font-weight: 800; }
+.companion-subtitle { font-size: 19px; }
+.companion-weather-icon { min-width: 48px; font-size: 43px; color: @fd_shell_accent; }
+.companion-weather-condition { font-size: 19px; font-weight: 700; }
+.companion-weather-temperature { font-size: 31px; font-weight: 800; }
+.companion-weather-details { font-size: 15px; color: @fd_shell_text_dim; }
+.companion-album { min-height: 92px; font-size: 62px; color: @fd_shell_text_dim; }
+.companion-media-text { font-size: 18px; font-weight: 700; }
+.companion-media-controls { font-size: 16px; color: @fd_shell_text_dim; }
+.companion-listening { font-size: 17px; }
+.companion-waveform { font-size: 42px; color: @fd_shell_accent; }
+.companion-field { min-height: 74px; padding: 14px; border: 1px solid @fd_shell_border; border-radius: 8px; font-size: 20px; background: alpha(@fd_shell_bg, 0.45); }
+.companion-control-label { font-size: 17px; }
+.companion-value { color: @fd_shell_text_dim; }
+.companion-workspace { min-width: 92px; min-height: 78px; font-size: 22px; font-weight: 700; border: 1px solid @fd_shell_border; background: @fd_shell_surface_raised; }
+.companion-workspace:hover, .companion-workspace.suggested-action { background: @fd_shell_surface_active; border-color: @fd_shell_accent; }
+.companion-workspaces-title { font-size: 38px; font-weight: 800; }
+.companion-workspace-output { min-width: 360px; }
+.companion-workspace-summary { font-size: 17px; color: @fd_shell_text_dim; }
+.companion-workspace-tile { min-height: 112px; font-size: 20px; }
+.companion-footer-label { font-size: 16px; }
+.companion-mic { min-width: 110px; min-height: 72px; border-radius: 40px; font-weight: 700; background: @fd_shell_surface_active; }
+
 window.focal-dock-window {
   background: transparent;
   border: none;
@@ -210,8 +267,8 @@ window.task-shelf-window {
 
 .system-rail {
   padding: 9px 7px;
-  background-color: alpha(@fd_shell_bg, 0.78);
-  background-image: linear-gradient(145deg, alpha(@fd_shell_highlight, 0.20), alpha(@fd_shell_surface_raised, 0.74) 18%, alpha(@fd_shell_bg, 0.72) 58%, alpha(@fd_shell_glass_bottom, 0.86));
+  /* The compositor paints the rail wallpaper and its configured tint. */
+  background: transparent;
   border-color: alpha(@fd_shell_rim, 0.76);
 }
 
@@ -247,8 +304,8 @@ window.task-shelf-window {
 .shelf-button {
   padding: 0;
   border: 1px solid alpha(@fd_shell_border, 0.14);
-  background: alpha(@fd_shell_surface, 0.10);
-  color: @fd_shell_icon;
+  background: alpha(@fd_shell_backing, 0.86);
+  color: #e2ecf7;
   box-shadow: inset 0 1px alpha(@fd_shell_highlight, 0.08);
 }
 
@@ -260,13 +317,13 @@ window.task-shelf-window {
 
 .rail-button:hover,
 .shelf-button:hover {
-  background: alpha(@fd_shell_text, 0.10);
+  background: #263d50;
   border-color: alpha(@fd_shell_border, 0.55);
 }
 
 .rail-button.active,
 .shelf-button.active {
-  background: alpha(@fd_shell_accent, 0.16);
+  background: #1c4966;
   border-color: alpha(@fd_shell_accent, 0.38);
   color: @fd_shell_icon_active;
 }
@@ -293,8 +350,8 @@ window.task-shelf-window {
   margin: 2px 3px;
   font-size: 18px;
   font-weight: 650;
-  color: @fd_shell_icon;
-  background: alpha(@fd_shell_surface_raised, 0.22);
+  color: #e2ecf7;
+  background: alpha(@fd_shell_backing, 0.90);
   border-color: alpha(@fd_shell_border, 0.24);
 }
 
@@ -339,7 +396,7 @@ window.task-shelf-window {
 
 .rail-battery-control,
 .rail-clock-control {
-  background: alpha(@fd_shell_surface_raised, 0.22);
+  background: alpha(@fd_shell_backing, 0.90);
   border-color: alpha(@fd_shell_border, 0.24);
 }
 
@@ -371,9 +428,9 @@ window.task-shelf-window {
 }
 
 .shelf-separator {
-  min-width: 1px;
-  margin: 9px 2px;
-  background: alpha(@fd_shell_border, 0.62);
+  min-width: 2px;
+  margin: 7px 4px;
+  background: alpha(@fd_shell_text, 0.82);
 }
 
 .shelf-overflow {
@@ -450,3 +507,22 @@ window.task-shelf-overflow-window {
   font-size: 10px;
   font-weight: 800;
 }
+
+/* Native rail popovers keep service controls readable over any wallpaper. */
+popover.rail-popover > contents {
+  background: #101923;
+  color: #e2ecf7;
+  border: 1px solid #587a99;
+  border-radius: 14px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+.rail-popover button, .rail-popover combobox {
+  min-height: 32px;
+  color: #e2ecf7;
+  background: #223346;
+  border-radius: 8px;
+}
+.rail-popover button:hover { background: #304b64; }
+.rail-popover button:focus-visible { outline: 2px solid #78caff; }
+.rail-popover-status { color: #b8d6ec; font-size: 12px; }
+.rail-notification { padding: 8px; background: #1b2939; border-radius: 8px; }

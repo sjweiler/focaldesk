@@ -16,10 +16,10 @@ use crate::core::render::{
 use crate::core::ui_builder::{AiFlowMode, UiBuildOptions};
 use crate::core::ui_state::UiState;
 use crate::core::{OutputState, SceneState};
-use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_logging::FLogLevel;
 use focaldesk_themes::theme::BuiltInThemeId;
 use focaldesk_themes::FlowTheme;
+use focaldesk_types::CompositorBackend;
 use focaldesk_types::OutputId;
 use focaldesk_ui::chrome::ChromeMetrics;
 use focaldesk_ui::desktop_frame::DesktopFrameCtx;
@@ -40,7 +40,7 @@ fn rect_area(rect: Rectangle<i32, Physical>) -> i64 {
     i64::from(rect.size.w.max(0)) * i64::from(rect.size.h.max(0))
 }
 
-fn damage_area_percent(
+pub(crate) fn damage_area_percent(
     damage: &[Rectangle<i32, Physical>],
     output_size: Size<i32, Physical>,
 ) -> i64 {
@@ -59,7 +59,10 @@ fn damage_area_permyriad(
     (damage_area * 10_000 / output_area.max(1)).clamp(0, 10_000)
 }
 
-fn is_full_damage(damage: &[Rectangle<i32, Physical>], output_size: Size<i32, Physical>) -> bool {
+pub(crate) fn is_full_damage(
+    damage: &[Rectangle<i32, Physical>],
+    output_size: Size<i32, Physical>,
+) -> bool {
     damage.len() == 1 && damage[0] == Rectangle::from_loc_and_size((0, 0), output_size)
 }
 
@@ -241,6 +244,10 @@ pub fn prepare_output(
         );
     }
 
+    if state.has_workspace_transition(output_id) {
+        state.mark_output_full_damage(output_id, crate::core::desktop::DamageSource::Unknown);
+    }
+
     let frame_damage = {
         let pending_damage = state
             .outputs
@@ -249,7 +256,11 @@ pub fn prepare_output(
             .pending_damage
             .clone();
         let full_damage = Rectangle::from_loc_and_size((0, 0), buffer_size);
-        if force_full_damage || state.render.redraw_all {
+        let magnifier_active = state.magnifier_view_for_output(output_id).zoom > 1.001;
+        if force_full_damage
+            || state.render.redraw_all
+            || (magnifier_active && !pending_damage.is_empty())
+        {
             if state.render.redraw_all {
                 state.record_damage_source(crate::core::desktop::DamageSource::FullRedrawFallback);
             }
@@ -262,6 +273,7 @@ pub fn prepare_output(
                 damage_area_percent(&frame_damage, buffer_size),
                 true,
                 state.render.redraw_all,
+                &frame_damage,
             );
             frame_damage
         } else {
@@ -276,6 +288,7 @@ pub fn prepare_output(
                 damage_area_percent(&frame_damage, buffer_size),
                 is_full_damage(&frame_damage, buffer_size),
                 false,
+                &frame_damage,
             );
             frame_damage
         }
@@ -289,7 +302,18 @@ pub fn prepare_output(
         );
         crate::core::wayland::color_management_protocol::notify_preferred_color_changed(state);
     }
-    let wallpaper_path = state.theme.active_theme().wallpaper.path.clone();
+    let active_workspace = state
+        .outputs
+        .get(&output_id)
+        .map(|output| output.active_workspace.0)
+        .unwrap_or(state.active_workspace.0);
+    let wallpaper_path = state
+        .workspaces
+        .workspace_wallpapers
+        .get(&active_workspace)
+        .filter(|path| !path.trim().is_empty())
+        .cloned()
+        .or_else(|| state.theme.active_theme().wallpaper.path.clone());
     state
         .render
         .ensure_wallpaper_loaded(renderer, wallpaper_path.as_deref());
@@ -547,23 +571,17 @@ pub fn build_output_client_elements(
         .map(|o| o.handle.clone())
         .expect("output missing");
 
-    let active_workspace = state
-        .outputs
-        .get(&output_id)
-        .map(|o| o.active_workspace)
-        .unwrap_or_else(|| state.focused_workspace());
-
-    let layers_on = state.outputs.get(&output_id).map(|o| &o.handle);
-
     let output = state.outputs.get(&output_id).expect("output missing");
+    let output_width = output.logical_size.w;
     state.import_mapped_surfaces_for_output(renderer, output.logical_origin, output.logical_size);
+    let workspace_views = state.workspace_render_views(output_id, output_width, Instant::now());
 
     state.render.build_client_elements_for_output(
         &state.space,
         &state.windows,
-        active_workspace,
+        &workspace_views,
         &output_handle,
-        layers_on,
+        Some(&output_handle),
         renderer,
     )
 }
@@ -579,16 +597,17 @@ pub fn build_output_popup_elements(
         .map(|o| o.handle.clone())
         .expect("output missing");
 
-    let active_workspace = state
+    let output_width = state
         .outputs
         .get(&output_id)
-        .map(|o| o.active_workspace)
-        .unwrap_or_else(|| state.focused_workspace());
+        .map(|output| output.logical_size.w)
+        .unwrap_or(1);
+    let workspace_views = state.workspace_render_views(output_id, output_width, Instant::now());
 
     let mut elements = state.render.build_popup_elements_for_output(
         &state.space,
         &state.windows,
-        active_workspace,
+        &workspace_views,
         &output_handle,
         renderer,
     );
@@ -659,7 +678,7 @@ pub fn draw_output_stage(
         rendering_output: prepared.frame_ctx.rendering_output,
         now: prepared.frame_ctx.now,
         start_time: state.render.start_time,
-        flip_egui_y: state.backend_kind == BackendKind::Drm,
+        flip_egui_y: state.backend_kind == CompositorBackend::Drm,
         portal_capture: prepared.frame_ctx.portal_capture,
     };
     if matches!(
@@ -700,6 +719,7 @@ pub fn draw_output_stage(
     );
     let split_dividers = state.split_divider_rects_for_output(prepared.frame_ctx.rendering_output);
     let snap_preview = state.snap_preview_rect_for_output(prepared.frame_ctx.rendering_output);
+    let screenshot_selection = state.screenshot_selection_rect(prepared.frame_ctx.rendering_output);
     let split_resize_percent = state.split_resize_percent_for_output(
         prepared.frame_ctx.rendering_output,
         prepared.frame_ctx.now,
@@ -741,6 +761,7 @@ pub fn draw_output_stage(
         split_dividers: &split_dividers,
         split_resize_percent,
         snap_preview,
+        screenshot_selection,
         draw_software_cursor: prepared.draw_software_cursor,
         ui_focus: state.ui.focused,
         current_workspace: active_workspace,
@@ -755,9 +776,11 @@ pub fn draw_output_stage(
         notification_unread_count: state.notification_unread_count,
         update_available_count: state.update_state.available_count(),
         lock_screen: &lock_screen,
-        flip_egui_y: state.backend_kind == BackendKind::Drm,
+        flip_egui_y: state.backend_kind == CompositorBackend::Drm,
         client_compositing,
         chrome_glass_pass,
+        rail_backdrop: state.rail_backdrop(),
+        panel_darkness: state.panel_darkness(),
         defer_egui_to_sdr,
         surface_colors: &state.surface_colors,
     };

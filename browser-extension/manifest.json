@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "FocalDesk Browser",
+  "version": "0.1.0",
+  "description": "Ask the local FocalDesk AI about selected text or the current page.",
+  "permissions": ["activeTab", "contextMenus", "nativeMessaging", "storage"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": { "default_title": "Ask FocalDesk" }
+}

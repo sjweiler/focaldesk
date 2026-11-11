@@ -6,7 +6,8 @@ members = [
     "crates/focaldesk-render",
     "crates/focaldesk-engine",
     "crates/focaldesk-remote-protocol",
-    "crates/focaldesk-flow",
+    "crates/focaldesk-input",
+    "crates/focaldesk-shortcuts",
     "crates/focaldesk-ai",
     "crates/focaldesk-memory",
     "crates/focaldesk-ipc",
@@ -27,6 +28,10 @@ members = [
     
 
     # apps
+    "apps/focaldesk-ai-console3/src-tauri",
+    "apps/focaldesk-calendar",
+    "apps/focalmail",
+    "apps/focaldesk-automation-studio",
     "apps/focaldesk-cli",
     "apps/focaldesk-color-tag-test",
     "apps/focaldesk-wp-color-test",
@@ -40,7 +45,9 @@ members = [
     # services
     "services/focaldesk-mcp",
     "services/focaldesk-remoted",
+    "services/focaldesk-recorder",
     "services/focaldesk-server",
+    "services/focaldesk-browserd",
     "services/focaldesk-ai-registry",
     "services/focaldesk-powerd",
     "services/focaldesk-notificationsd",
@@ -52,6 +59,7 @@ members = [
     "crates/focaldesk-audio",
     "crates/focaldesk-bluetooth",
     "crates/focaldesk-notifications",
+    "crates/focaldesk-calendar",
     "crates/focaldesk-updates",
     "crates/focaldesk-resources",
     "crates/focaldesk-cursor",
@@ -73,6 +81,8 @@ members = [
     "crates/focaldesk-shell-client",
     "apps/focal-panel",
     "apps/focal-dock",
+    "apps/focaldesk-companion",
+    "apps/focaldesk-browser-bridge",
 ]
 resolver = "2"
 
@@ -90,6 +100,7 @@ smithay = { git = "https://github.com/Smithay/smithay", rev = "a394efa7058e987c8
   "use_system_lib",
   "xwayland"
 ] }
+xkbcommon = { version = "0.9", default-features = false }
 anyhow = "1"
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "vulkan", "wgsl"] }
 ash = "0.38"
@@ -114,7 +125,7 @@ resvg = "0.41"
 tiny-skia = "0.11"
 chrono = "0.4"
 ab_glyph = "0.2"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "exr"] }
 png = "0.18"
 glow = "0.16"
 smithay-client-toolkit = "0.19.2"

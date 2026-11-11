@@ -165,7 +165,7 @@ struct AnthropicChatRequest {
 #[derive(Debug, Serialize)]
 struct AnthropicMessage {
     role: &'static str,
-    content: String,
+    content: serde_json::Value,
 }
 
 impl From<&ChatMessage> for AnthropicMessage {
@@ -176,7 +176,13 @@ impl From<&ChatMessage> for AnthropicMessage {
         };
         Self {
             role,
-            content: message.content.clone(),
+            content: if message.images.is_empty() {
+                serde_json::json!(message.content)
+            } else {
+                let mut blocks = vec![serde_json::json!({"type":"text","text":message.content})];
+                blocks.extend(message.images.iter().filter_map(|image|image.split_once(',')).map(|(header,data)|serde_json::json!({"type":"image","source":{"type":"base64","media_type":header.trim_start_matches("data:").trim_end_matches(";base64"),"data":data}})));
+                serde_json::Value::Array(blocks)
+            },
         }
     }
 }
@@ -205,6 +211,14 @@ enum AnthropicContentBlock {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn image_attachment_uses_provider_wire_format() {
+        let image = "data:image/png;base64,aW1hZ2U=";
+        let mut message = ChatMessage::user("Describe this image");
+        message.images.push(image.into());
+        let value = serde_json::to_value(AnthropicMessage::from(&message)).unwrap();
+        assert_eq!(value["content"][1]["source"]["data"], "aW1hZ2U=");
+    }
     use super::*;
     use crate::test_support::serve_once;
 
@@ -236,6 +250,7 @@ mod tests {
                 temperature: Some(0.1),
                 max_tokens: Some(88),
                 use_memory: false,
+                memory_sources: None,
             })
             .await
             .unwrap();
