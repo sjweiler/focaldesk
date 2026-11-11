@@ -4194,7 +4194,11 @@ fn texture_upload_byte_len(
 }
 
 fn bytes_per_pixel(format: FramePixelFormat) -> u32 {
-    if format == FramePixelFormat::Rgba16FloatLinear { 8 } else { 4 }
+    if format == FramePixelFormat::Rgba16FloatLinear {
+        8
+    } else {
+        4
+    }
 }
 
 fn validate_meshes(meshes: &[TexturedMesh]) -> Result<()> {

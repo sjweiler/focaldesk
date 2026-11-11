@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
-use focaldesk_settings_core::{load_settings, Settings};
+use focaldesk_settings_core::{Settings, load_settings};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{MissedTickBehavior, interval};
 use zbus::interface;
 
 const BUS_NAME: &str = "org.freedesktop.impl.portal.desktop.focaldesk";

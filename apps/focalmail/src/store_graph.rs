@@ -324,7 +324,8 @@ mod tests {
         let mut s = Store::init(Connection::open_in_memory().unwrap()).unwrap();
         for account in ["one@example.com", "two@example.com"] {
             let m = message(account, "same-id", "Inbox");
-            s.snapshot(account, &[m.clone()], "graph-delta-v1").unwrap();
+            s.snapshot(account, std::slice::from_ref(&m), "graph-delta-v1")
+                .unwrap();
             s.graph_prepare_folder(account, "inbox", "Inbox").unwrap();
             s.graph_apply_page(
                 account,

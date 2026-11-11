@@ -7773,12 +7773,16 @@ fn web_search_reply(query: &str, unavailable_reply: Option<&str>) -> String {
                 .iter()
                 .enumerate()
                 .map(|(index, result)| {
-                    let source = (!result.source.is_empty())
-                        .then(|| format!(" ({})", result.source))
-                        .unwrap_or_default();
-                    let snippet = (!result.snippet.is_empty())
-                        .then(|| format!("\n   {}", result.snippet))
-                        .unwrap_or_default();
+                    let source = if !result.source.is_empty() {
+                        format!(" ({})", result.source)
+                    } else {
+                        Default::default()
+                    };
+                    let snippet = if !result.snippet.is_empty() {
+                        format!("\n   {}", result.snippet)
+                    } else {
+                        Default::default()
+                    };
                     let published_at = if result.published_at.is_empty() {
                         "date unavailable".to_string()
                     } else {

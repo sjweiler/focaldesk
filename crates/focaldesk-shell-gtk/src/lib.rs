@@ -1251,12 +1251,13 @@ fn refresh_workspace_dashboard(
         let move_focused = gtk::Button::with_label("⇄  Move focused window");
         move_focused.add_css_class("companion-outline-button");
         move_focused.set_hexpand(true);
-        move_focused.connect_clicked(move |button| show_move_focused_window_picker(button));
+        move_focused.connect_clicked(show_move_focused_window_picker);
         card.append(&move_focused);
         container.attach(&card, (index % 2) as i32, (index / 2) as i32, 1, 1);
     }
 }
 
+#[allow(deprecated)] // Retain GTK 4.8-compatible dialogs and controls.
 fn rename_workspace_dialog(workspace: u32, current_name: &str) {
     let dialog = gtk::Dialog::builder()
         .modal(true)
@@ -1600,6 +1601,7 @@ impl CompanionPowerAction {
     }
 }
 
+#[allow(deprecated)] // Retain GTK 4.8-compatible dialogs and controls.
 fn companion_power_button(
     label: &str,
     action: CompanionPowerAction,
@@ -2042,6 +2044,7 @@ fn refresh_wifi_networks(container: &gtk::Box) {
     }
 }
 
+#[allow(deprecated)] // Retain GTK 4.8-compatible dialogs and controls.
 fn refresh_display_cards(container: &gtk::Box) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
@@ -2219,6 +2222,7 @@ fn refresh_display_cards(container: &gtk::Box) {
     }
 }
 
+#[allow(deprecated)] // Retain GTK 4.8-compatible dialogs and controls.
 fn hdr_display_control(output: &OutputSnapshot) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     row.set_halign(gtk::Align::Fill);
@@ -2294,6 +2298,7 @@ fn hdr_display_control(output: &OutputSnapshot) -> gtk::Box {
     row
 }
 
+#[allow(deprecated)] // Retain GTK 4.8-compatible dialogs and controls.
 fn orientation_picker(connector: &str, current: DisplayTransform) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Vertical, 5);
     row.append(&companion_label("Orientation", "companion-control-label"));
@@ -2367,6 +2372,7 @@ fn display_transform_from_id(id: &str) -> Option<DisplayTransform> {
     }
 }
 
+#[allow(deprecated)] // Retain GTK 4.8-compatible dialogs and controls.
 fn scale_picker(connector: &str, current: f64) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Vertical, 5);
     row.append(&companion_label("Scale", "companion-control-label"));
@@ -2496,6 +2502,7 @@ fn set_display_scale(connector: &str, scale: f32) -> Result<(), String> {
     }
 }
 
+#[allow(deprecated)] // Retain GTK 4.8-compatible dialogs and controls.
 fn refresh_picker(connector: &str, width: i32, height: i32, current: i32) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Vertical, 5);
     row.append(&companion_label("Refresh rate", "companion-control-label"));
@@ -2596,6 +2603,7 @@ fn available_display_modes(connector: &str) -> Vec<(i32, i32, i32)> {
         .unwrap_or_default()
 }
 
+#[allow(deprecated)] // Retain GTK 4.8-compatible dialogs and controls.
 fn resolution_picker(connector: &str, width: i32, height: i32, current_refresh: i32) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Vertical, 5);
     row.append(&companion_label("Resolution", "companion-control-label"));
@@ -2606,7 +2614,7 @@ fn resolution_picker(connector: &str, width: i32, height: i32, current_refresh: 
         .map(|(width, height, _)| (width, height))
         .collect::<Vec<_>>();
     resolutions.push((width, height));
-    resolutions.sort_unstable_by(|left, right| (right.0 * right.1).cmp(&(left.0 * left.1)));
+    resolutions.sort_unstable_by_key(|resolution| std::cmp::Reverse(resolution.0 * resolution.1));
     resolutions.dedup();
     for (mode_width, mode_height) in &resolutions {
         picker.append(
@@ -2635,7 +2643,7 @@ fn resolution_picker(connector: &str, width: i32, height: i32, current_refresh: 
         let dialog = gtk::MessageDialog::builder()
             .modal(true)
             .text("Change display resolution?")
-            .secondary_text(&format!(
+            .secondary_text(format!(
                 "This applies {width} × {height} at {:.2} Hz. The display may go blank briefly.",
                 refresh_mhz as f64 / 1000.0
             ))
@@ -2911,6 +2919,7 @@ struct PipewireNode {
     active: bool,
 }
 
+#[allow(deprecated)] // Retain GTK 4.8-compatible dialogs and controls.
 fn pipewire_device_picker(label: &str, section: &str) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Vertical, 5);
     row.append(&companion_label(label, "companion-control-label"));
@@ -3038,6 +3047,7 @@ fn companion_wake_word_label() -> String {
     }
 }
 
+#[allow(deprecated)] // Retain GTK 4.8-compatible dialogs and controls.
 fn open_companion_voice_preferences(parent: &gtk::ApplicationWindow, wake_word_label: &gtk::Label) {
     let voice = load_settings().voice;
     let dialog = gtk::Dialog::builder()

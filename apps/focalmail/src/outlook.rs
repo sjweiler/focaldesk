@@ -219,7 +219,7 @@ fn authorize_device_code(
     let deadline = Instant::now() + Duration::from_secs(prompt.expires_in);
     let mut interval = device["interval"].as_u64().unwrap_or(5).clamp(1, 60);
     let token = loop {
-        wait(&cancel, interval)?;
+        wait(cancel, interval)?;
         anyhow::ensure!(Instant::now() < deadline, "Microsoft sign-in timed out");
         let response = client
             .post(format!("{authority}/token"))

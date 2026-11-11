@@ -1180,9 +1180,9 @@ fn hlg_to_scene_linear(value: f32) -> f32 {
     let scene = if value < 0.5 {
         value * value / 3.0
     } else {
-        (((value - 0.559_910_73) / 0.178_832_77).exp() + 0.284_668_92) / 12.0
+        (((value - 0.559_910_7) / 0.178_832_77).exp() + 0.284_668_92) / 12.0
     };
-    let reference = (((0.75_f32 - 0.559_910_73) / 0.178_832_77).exp() + 0.284_668_92) / 12.0;
+    let reference = (((0.75_f32 - 0.559_910_7) / 0.178_832_77).exp() + 0.284_668_92) / 12.0;
     (scene.max(0.0) / reference).powf(1.2)
 }
 
@@ -2792,16 +2792,36 @@ impl RenderState {
 
         if matches!(stage, OutputRenderStage::All | OutputRenderStage::Overlay) {
             if let Some(selection) = inputs.screenshot_selection {
-                let output = Rectangle::<i32, Logical>::from_size((
-                    (f64::from(inputs.ctx.output_size.0) / inputs.ctx.output_scale.x).round() as i32,
-                    (f64::from(inputs.ctx.output_size.1) / inputs.ctx.output_scale.y).round() as i32,
-                ).into());
+                let output = Rectangle::<i32, Logical>::from_size(
+                    (
+                        (f64::from(inputs.ctx.output_size.0) / inputs.ctx.output_scale.x).round()
+                            as i32,
+                        (f64::from(inputs.ctx.output_size.1) / inputs.ctx.output_scale.y).round()
+                            as i32,
+                    )
+                        .into(),
+                );
                 let dim = [0.0, 0.0, 0.0, 0.55];
                 for strip in [
                     Rectangle::from_loc_and_size(output.loc, (output.size.w, selection.loc.y)),
-                    Rectangle::from_loc_and_size((0, selection.loc.y), (selection.loc.x, selection.size.h)),
-                    Rectangle::from_loc_and_size((selection.loc.x + selection.size.w, selection.loc.y), (output.size.w - selection.loc.x - selection.size.w, selection.size.h)),
-                    Rectangle::from_loc_and_size((0, selection.loc.y + selection.size.h), (output.size.w, output.size.h - selection.loc.y - selection.size.h)),
+                    Rectangle::from_loc_and_size(
+                        (0, selection.loc.y),
+                        (selection.loc.x, selection.size.h),
+                    ),
+                    Rectangle::from_loc_and_size(
+                        (selection.loc.x + selection.size.w, selection.loc.y),
+                        (
+                            output.size.w - selection.loc.x - selection.size.w,
+                            selection.size.h,
+                        ),
+                    ),
+                    Rectangle::from_loc_and_size(
+                        (0, selection.loc.y + selection.size.h),
+                        (
+                            output.size.w,
+                            output.size.h - selection.loc.y - selection.size.h,
+                        ),
+                    ),
                 ] {
                     if strip.size.w > 0 && strip.size.h > 0 {
                         Self::draw_solid_rect(
@@ -2816,9 +2836,15 @@ impl RenderState {
                 border[3] = 1.0;
                 for edge in [
                     Rectangle::from_loc_and_size(selection.loc, (selection.size.w, 2)),
-                    Rectangle::from_loc_and_size((selection.loc.x, selection.loc.y + selection.size.h - 2), (selection.size.w, 2)),
+                    Rectangle::from_loc_and_size(
+                        (selection.loc.x, selection.loc.y + selection.size.h - 2),
+                        (selection.size.w, 2),
+                    ),
                     Rectangle::from_loc_and_size(selection.loc, (2, selection.size.h)),
-                    Rectangle::from_loc_and_size((selection.loc.x + selection.size.w - 2, selection.loc.y), (2, selection.size.h)),
+                    Rectangle::from_loc_and_size(
+                        (selection.loc.x + selection.size.w - 2, selection.loc.y),
+                        (2, selection.size.h),
+                    ),
                 ] {
                     if edge.size.w > 0 && edge.size.h > 0 {
                         self.draw_rounded_rect(frame, edge, inputs.ctx.output_scale, 0.0, border)?;
@@ -2847,7 +2873,13 @@ impl RenderState {
                 );
                 let mut hint_background = theme.chrome.panel_color;
                 hint_background[3] = 0.96;
-                self.draw_rounded_rect(frame, hint_rect, inputs.ctx.output_scale, 10.0, hint_background)?;
+                self.draw_rounded_rect(
+                    frame,
+                    hint_rect,
+                    inputs.ctx.output_scale,
+                    10.0,
+                    hint_background,
+                )?;
                 let theme_id = theme.id.builtin_id().unwrap_or(BuiltInThemeId::Eagle);
                 self.draw_text_cached(
                     frame,

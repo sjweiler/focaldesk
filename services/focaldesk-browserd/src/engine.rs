@@ -22,21 +22,12 @@ struct Tab {
     page: Page,
     used: Instant,
 }
+#[derive(Default)]
 pub struct BrowserEngine {
     browser: Option<Browser>,
     handler: Option<JoinHandle<()>>,
     pages: HashMap<String, Tab>,
     next: u64,
-}
-impl Default for BrowserEngine {
-    fn default() -> Self {
-        Self {
-            browser: None,
-            handler: None,
-            pages: HashMap::new(),
-            next: 0,
-        }
-    }
 }
 impl BrowserEngine {
     async fn launch(&mut self) -> Result<()> {
@@ -214,19 +205,15 @@ impl BrowserEngine {
                                     .execute(GetNavigationHistoryParams::default())
                                     .await?
                                     .result;
-                                if current.current_index == target {
-                                    if let Ok(result) = page
+                                if current.current_index == target
+                                    && let Ok(result) = page
                                         .evaluate("({url:location.href,ready:document.readyState})")
                                         .await
-                                    {
-                                        if let Ok(value) = result.into_value::<Value>() {
-                                            if value["url"].as_str() == Some(expected_url.as_str())
-                                                && value["ready"] == "complete"
-                                            {
-                                                break;
-                                            }
-                                        }
-                                    }
+                                    && let Ok(value) = result.into_value::<Value>()
+                                    && value["url"].as_str() == Some(expected_url.as_str())
+                                    && value["ready"] == "complete"
+                                {
+                                    break;
                                 }
                                 tokio::time::sleep(Duration::from_millis(50)).await;
                             }

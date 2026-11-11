@@ -1,5 +1,5 @@
 use crate::{SemanticTheme, ThemeColor, ThemePaint, ThemePaintIntent};
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use focaldesk_ipc::{
-    send_desktop_request, send_dialog_request, DialogIpcRequest, DialogIpcResponse, IpcRequest,
-    IpcResponse,
+    DialogIpcRequest, DialogIpcResponse, IpcRequest, IpcResponse, send_desktop_request,
+    send_dialog_request,
 };
 use serde::Deserialize;
 use std::env;

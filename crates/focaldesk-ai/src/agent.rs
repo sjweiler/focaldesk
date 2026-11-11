@@ -147,6 +147,8 @@ pub struct AgentToolSpec {
     pub mutating: bool,
 }
 
+// async-trait adds must_use to futures that are already must_use.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait AgentToolExecutor: Send + Sync {
     fn tools(&self) -> Vec<AgentToolSpec>;

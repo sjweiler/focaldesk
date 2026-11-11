@@ -891,7 +891,7 @@ mod tests {
         );
         assert_eq!(
             capture_only.resolve(key(keysyms::KEY_Print), ModMask::empty()),
-            Some(KeyAction::TakeScreenshot)
+            Some(KeyAction::TakeScreenshotSelection)
         );
     }
 

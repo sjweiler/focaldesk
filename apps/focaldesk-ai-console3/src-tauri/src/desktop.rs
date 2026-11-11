@@ -1,17 +1,17 @@
 use base64::Engine as _;
 use focaldesk_ipc::{
-    MicrophoneIpcRequest, MicrophoneIpcResponse, SpeechIpcRequest, send_microphone_request,
-    send_speech_request,
+    send_microphone_request, send_speech_request, MicrophoneIpcRequest, MicrophoneIpcResponse,
+    SpeechIpcRequest,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashSet},
     path::PathBuf,
     process::{Command, Stdio},
     sync::{
-        Mutex,
         atomic::{AtomicBool, Ordering},
+        Mutex,
     },
     time::{Duration, Instant},
 };
@@ -242,7 +242,8 @@ pub async fn speak(text: Option<String>) -> Result<Value, String> {
 pub async fn gpu_status() -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(||{
         let mut child=match Command::new("nvidia-smi").args(["--query-gpu=name,utilization.gpu,memory.used,memory.total","--format=csv,noheader,nounits"]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn(){Ok(c)=>c,Err(_)=>return Ok(json!({"gpus":[],"available":false,"message":"NVIDIA telemetry is unavailable on this system"}))};
-        let start=Instant::now();loop{if child.try_wait().map_err(|e|e.to_string())?.is_some(){break;}if start.elapsed()>Duration::from_secs(3){let _=child.kill();let _=child.wait();return Err("GPU telemetry timed out".into());}std::thread::sleep(Duration::from_millis(30));}
+        let start=Instant::now();loop{if child.try_wait().map_err(|e|e.to_string())?.is_some(){break;}
+                if start.elapsed()>Duration::from_secs(3){let _=child.kill();let _=child.wait();return Err("GPU telemetry timed out".into());}std::thread::sleep(Duration::from_millis(30));}
         let output=child.wait_with_output().map_err(|e|e.to_string())?;
         let gpus=String::from_utf8_lossy(&output.stdout).lines().filter_map(|line|{let p=line.split(',').map(str::trim).collect::<Vec<_>>();if p.len()!=4{return None;}Some(json!({"name":p[0],"utilization_percent":p[1].parse::<f64>().ok(),"memory_used_mib":p[2].parse::<f64>().ok(),"memory_total_mib":p[3].parse::<f64>().ok()}))}).collect::<Vec<_>>();
         Ok(json!({"available":!gpus.is_empty(),"gpus":gpus}))

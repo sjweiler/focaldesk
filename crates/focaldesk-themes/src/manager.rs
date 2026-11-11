@@ -202,7 +202,7 @@ fn project_editor_document(
 mod tests {
     use super::*;
     use crate::{
-        ThemeColor, ThemeDynamicRange, ThemePaint, ThemePaintIntent, theme::BuiltInThemeId,
+        theme::BuiltInThemeId, ThemeColor, ThemeDynamicRange, ThemePaint, ThemePaintIntent,
     };
 
     fn document(color: ThemeColor) -> ThemeDocument {

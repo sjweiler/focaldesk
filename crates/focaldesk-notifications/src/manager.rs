@@ -1,6 +1,6 @@
 use crate::notification::{
-    Notification, NotificationAction, NotificationSnapshot, NotificationUrgency, DEFAULT_TIMEOUT,
-    MAX_VISIBLE_NOTIFICATIONS,
+    DEFAULT_TIMEOUT, MAX_VISIBLE_NOTIFICATIONS, Notification, NotificationAction,
+    NotificationSnapshot, NotificationUrgency,
 };
 use std::collections::VecDeque;
 use std::path::Path;
@@ -596,8 +596,10 @@ mod tests {
         manager.expire(Instant::now());
 
         assert!(!manager.invoke_action(id, "continue"));
-        assert!(manager.history_snapshots(Instant::now())[0]
-            .actions
-            .is_empty());
+        assert!(
+            manager.history_snapshots(Instant::now())[0]
+                .actions
+                .is_empty()
+        );
     }
 }

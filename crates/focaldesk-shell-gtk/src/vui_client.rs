@@ -194,7 +194,7 @@ pub(super) fn build(
                 .collect();
             match state.renderer.render(&frame, scale) {
                 Ok(mut image) => {
-                    for pixel in image.pixels.chunks_exact_mut(4) {
+                    for pixel in image.pixels.as_chunks_mut::<4>().0 {
                         // Cairo ARgb32 is native-endian premultiplied BGRA on
                         // the Linux targets supported by FocalDesk.
                         pixel.swap(0, 2);

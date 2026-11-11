@@ -20,10 +20,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize.workspace = true
 focaldesk-ui = { path = "../focaldesk-ui" }
 focaldesk-render = { path = "../focaldesk-render", default-features = false, optional = true }
-vui-core = { path = "../../../vello-ui/crates/vui-core", optional = true }
-vui-vello = { path = "../../../vello-ui/crates/vui-vello", optional = true }
-vui-ash = { path = "../../../vello-ui/crates/vui-ash", optional = true }
-vui-text = { path = "../../../vello-ui/crates/vui-text", optional = true }
+vui-core = { git = "https://github.com/sjweiler/vello-ui", rev = "1e46b0cd1d44cddac1b6cb9b0478f57e6afa9b1a", optional = true }
+vui-vello = { git = "https://github.com/sjweiler/vello-ui", rev = "1e46b0cd1d44cddac1b6cb9b0478f57e6afa9b1a", optional = true }
+vui-ash = { git = "https://github.com/sjweiler/vello-ui", rev = "1e46b0cd1d44cddac1b6cb9b0478f57e6afa9b1a", optional = true }
+vui-text = { git = "https://github.com/sjweiler/vello-ui", rev = "1e46b0cd1d44cddac1b6cb9b0478f57e6afa9b1a", optional = true }
 ash = { workspace = true, optional = true }
 focaldesk-ai = { path = "../focaldesk-ai" }
 focaldesk-permissions = { path = "../focaldesk-permissions" }

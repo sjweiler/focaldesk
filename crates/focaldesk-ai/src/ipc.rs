@@ -646,12 +646,11 @@ async fn handle_connection(service: Arc<AiService>, mut stream: UnixStream) -> R
         }
     );
 
-    if let Ok(envelope) = transport::decode_message::<serde_json::Value>(&input) {
-        if let Some(context) = envelope.get("trace_context") {
-            if let Ok(context) = serde_json::from_value(context.clone()) {
-                focaldesk_logging::telemetry::set_parent(&span, &context);
-            }
-        }
+    if let Ok(envelope) = transport::decode_message::<serde_json::Value>(&input)
+        && let Some(context) = envelope.get("trace_context")
+        && let Ok(context) = serde_json::from_value(context.clone())
+    {
+        focaldesk_logging::telemetry::set_parent(&span, &context);
     }
 
     focaldesk_logging::telemetry::record_correlation(&span);

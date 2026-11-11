@@ -1539,7 +1539,7 @@ mod provider_tests {
         let mut store = Store::init(Connection::open_in_memory().unwrap()).unwrap();
         let message = crate::fixtures::messages().remove(0);
         store
-            .snapshot(&message.account, &[message.clone()], "1")
+            .snapshot(&message.account, std::slice::from_ref(&message), "1")
             .unwrap();
         let draft = crate::drafts::Draft::new(message.account.clone());
         store.save_local_draft(&draft, Some(&[])).unwrap();

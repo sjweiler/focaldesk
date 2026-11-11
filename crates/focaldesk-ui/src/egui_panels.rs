@@ -2,8 +2,8 @@ use crate::desktop_frame::DesktopFrameCtx;
 use crate::types::{SettingKey, SplitLayoutPreset, SystemCommand, UiAction};
 use chrono::{Datelike, Local, NaiveDate};
 use focaldesk_ipc::{
-    send_notification_request, send_update_request, NotificationIpcRequest,
-    NotificationIpcResponse, UpdateIpcRequest, UpdateIpcResponse,
+    NotificationIpcRequest, NotificationIpcResponse, UpdateIpcRequest, UpdateIpcResponse,
+    send_notification_request, send_update_request,
 };
 use focaldesk_types::WindowId;
 use focaldesk_updates::UpdateSnapshot;
@@ -637,7 +637,7 @@ impl EguiPanelView for SplitAssistPanel {
                         rect,
                         7.0,
                         egui::Stroke::new(
-                            1.0,
+                            1.0_f32,
                             if active {
                                 egui::Color32::from_rgb(84, 188, 255)
                             } else {
@@ -894,7 +894,7 @@ fn split_preset_button(
             ui.painter().rect_stroke(
                 canvas,
                 5.0,
-                egui::Stroke::new(1.0, egui::Color32::from_gray(95)),
+                egui::Stroke::new(1.0_f32, egui::Color32::from_gray(95)),
                 egui::StrokeKind::Inside,
             );
             ui.painter()
@@ -1775,7 +1775,7 @@ impl EguiPanelView for DebugPanel {
 
 #[cfg(test)]
 mod split_keyboard_tests {
-    use super::{move_selection, split_available_presets, SplitLayoutAvailability};
+    use super::{SplitLayoutAvailability, move_selection, split_available_presets};
     use crate::types::SplitLayoutPreset;
 
     #[test]

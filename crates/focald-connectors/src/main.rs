@@ -831,10 +831,8 @@ fn authorization_code_from_loopback_callback(
                     bail!("OAuth callback contains multiple state values");
                 }
             }
-            "code" => {
-                if code.replace(value.into_owned()).is_some() {
-                    bail!("OAuth callback contains multiple authorization codes");
-                }
+            "code" if code.replace(value.into_owned()).is_some() => {
+                bail!("OAuth callback contains multiple authorization codes");
             }
             _ => {}
         }

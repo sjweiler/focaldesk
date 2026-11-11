@@ -1580,11 +1580,17 @@ fn collect_screenshot_selection_quads(desktop: &WgpuSceneDesktop<'_>) -> Vec<Sol
             Rectangle::from_loc_and_size((0, selection.loc.y), (selection.loc.x, selection.size.h)),
             Rectangle::from_loc_and_size(
                 (selection.loc.x + selection.size.w, selection.loc.y),
-                (screen.size.w - selection.loc.x - selection.size.w, selection.size.h),
+                (
+                    screen.size.w - selection.loc.x - selection.size.w,
+                    selection.size.h,
+                ),
             ),
             Rectangle::from_loc_and_size(
                 (0, selection.loc.y + selection.size.h),
-                (screen.size.w, screen.size.h - selection.loc.y - selection.size.h),
+                (
+                    screen.size.w,
+                    screen.size.h - selection.loc.y - selection.size.h,
+                ),
             ),
         ] {
             if strip.size.w > 0 && strip.size.h > 0 {
@@ -1632,7 +1638,10 @@ fn append_screenshot_selection_text(
     }
     let text = match desktop.state.screenshot_selection_rect(desktop.output_id) {
         Some(selection) if selection.size.w >= 2 && selection.size.h >= 2 => {
-            format!("{} × {}  •  Release to capture  •  Esc to cancel", selection.size.w, selection.size.h)
+            format!(
+                "{} × {}  •  Release to capture  •  Esc to cancel",
+                selection.size.w, selection.size.h
+            )
         }
         _ => "Click and drag to select an area  •  Esc to cancel".to_string(),
     };

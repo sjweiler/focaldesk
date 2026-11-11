@@ -484,6 +484,7 @@ fn bluetooth(view: &View) {
     );
 }
 
+#[allow(deprecated)] // ComboBoxText supports the GTK 4.8 baseline.
 fn audio(view: &View) {
     load(
         view,

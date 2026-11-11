@@ -7,6 +7,8 @@ use crate::model::NetworkState;
 pub mod networkmanager;
 pub mod rtnetlink;
 
+// async-trait adds must_use to futures that are already must_use.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait NetworkBackend: Send + Sync {
     async fn current_state(&self) -> Result<NetworkState>;

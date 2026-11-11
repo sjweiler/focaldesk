@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{MissedTickBehavior, interval};
 use zbus::interface;
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::OwnedValue;
@@ -46,7 +46,9 @@ fn urgency_hint(hints: &HashMap<String, OwnedValue>) -> NotificationUrgency {
 
 fn notification_actions(values: Vec<String>) -> Vec<NotificationAction> {
     values
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .take(16)
         .map(|pair| NotificationAction {
             key: pair[0].clone(),

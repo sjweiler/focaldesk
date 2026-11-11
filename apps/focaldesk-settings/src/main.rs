@@ -4269,7 +4269,7 @@ fn appearance_theme_options() -> Vec<(String, String)> {
             ))
         })
         .collect::<Vec<_>>();
-    installed.sort_by(|left, right| left.0.to_lowercase().cmp(&right.0.to_lowercase()));
+    installed.sort_by_key(|left| left.0.to_lowercase());
     options.extend(installed);
     options
 }

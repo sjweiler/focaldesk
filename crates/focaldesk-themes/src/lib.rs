@@ -15,15 +15,15 @@ pub use theme::{
 };
 
 pub use document::{
-    MAX_GRADIENT_STOPS, THEME_DOCUMENT_VERSION, ThemeBacking, ThemeDocument, ThemeWallpaper,
-    ThemeWallpaperFit,
+    ThemeBacking, ThemeDocument, ThemeWallpaper, ThemeWallpaperFit, MAX_GRADIENT_STOPS,
+    THEME_DOCUMENT_VERSION,
 };
 
-pub use gtk::{GtkAppThemeOptions, gtk_app_css, gtk_app_prefers_dark};
+pub use gtk::{gtk_app_css, gtk_app_prefers_dark, GtkAppThemeOptions};
 pub use manager::{ActiveTheme, ThemeManager};
 pub use package::{
-    InstalledTheme, MAX_THEME_ASSET_BYTES, THEME_PACKAGE_VERSION, ThemePackage, ThemePackageAsset,
-    theme_slug,
+    theme_slug, InstalledTheme, ThemePackage, ThemePackageAsset, MAX_THEME_ASSET_BYTES,
+    THEME_PACKAGE_VERSION,
 };
 pub use paint::{
     GradientInterpolation, GradientStop, ThemeColor, ThemeColorSpace, ThemeDynamicRange,

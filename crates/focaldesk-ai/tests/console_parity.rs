@@ -279,10 +279,10 @@ async fn indexing_scope_streaming_and_stop_use_real_ipc() {
             client_socket,
             ChatRequest::from_prompt("slow stream fixture"),
             |event| {
-                if let AiStreamEvent::Started { request_id, .. } = &event {
-                    if let Some(tx) = started_tx.take() {
-                        let _ = tx.send(request_id.clone());
-                    }
+                if let AiStreamEvent::Started { request_id, .. } = &event
+                    && let Some(tx) = started_tx.take()
+                {
+                    let _ = tx.send(request_id.clone());
                 }
                 captured.lock().unwrap().push(event);
                 Ok(())

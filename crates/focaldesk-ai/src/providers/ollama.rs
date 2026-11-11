@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use crate::provider::{retry_after, AiProvider, ProviderError};
+use crate::provider::{AiProvider, ProviderError, retry_after};
 use crate::types::{
     ChatMessage, ChatRequest, ChatResponse, ProviderInfo, ProviderModelInfo, TokenUsage,
 };
@@ -410,6 +410,60 @@ impl OllamaModelInfo {
     }
 }
 
+impl OllamaProvider {
+    async fn complete(&self, request: ChatRequest, json_mode: bool) -> Result<ChatResponse> {
+        let model = self.resolve_model(request.model.clone()).await?;
+
+        if request.messages.is_empty() {
+            bail!("chat request must include at least one message");
+        }
+
+        let payload = OllamaChatRequest {
+            model: model.clone(),
+            keep_alive: self.keep_alive.clone(),
+            messages: request.messages.iter().map(OllamaMessage::from).collect(),
+            stream: false,
+            format: if json_mode { Some("json") } else { None },
+            think: if json_mode { Some(false) } else { None },
+            options: OllamaOptions {
+                temperature: request.temperature,
+                num_predict: request.max_tokens,
+            },
+        };
+
+        let response = self
+            .client
+            .post(format!("{}/api/chat", self.base_url))
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|error| ProviderError::from_transport("Ollama chat request failed", error))?;
+        let status = response.status();
+        let retry_after = retry_after(response.headers());
+        let body = response.text().await.map_err(|error| {
+            ProviderError::from_transport("failed to read Ollama response body", error)
+        })?;
+
+        if !status.is_success() {
+            return Err(ProviderError::from_http("Ollama", status, &body)
+                .with_retry_after(retry_after)
+                .into());
+        }
+
+        let decoded: OllamaChatResponse =
+            serde_json::from_str(&body).context("failed to parse Ollama chat response")?;
+        decoded.timings.record(decoded.eval_count);
+
+        Ok(ChatResponse {
+            provider: self.id.clone(),
+            model: Some(model),
+            content: decoded.message.content,
+            usage: ollama_usage(decoded.prompt_eval_count, decoded.eval_count),
+            citations: Vec::new(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -645,9 +699,11 @@ mod tests {
             .chat_stream(ChatRequest::from_prompt("stream"), tx)
             .await
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("failed to parse Ollama stream event"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse Ollama stream event")
+        );
     }
 
     #[tokio::test]
@@ -684,59 +740,5 @@ mod tests {
         assert!(has_usage);
         assert_eq!(usage.input_tokens, 7);
         assert_eq!(usage.output_tokens, 2);
-    }
-}
-
-impl OllamaProvider {
-    async fn complete(&self, request: ChatRequest, json_mode: bool) -> Result<ChatResponse> {
-        let model = self.resolve_model(request.model.clone()).await?;
-
-        if request.messages.is_empty() {
-            bail!("chat request must include at least one message");
-        }
-
-        let payload = OllamaChatRequest {
-            model: model.clone(),
-            keep_alive: self.keep_alive.clone(),
-            messages: request.messages.iter().map(OllamaMessage::from).collect(),
-            stream: false,
-            format: if json_mode { Some("json") } else { None },
-            think: if json_mode { Some(false) } else { None },
-            options: OllamaOptions {
-                temperature: request.temperature,
-                num_predict: request.max_tokens,
-            },
-        };
-
-        let response = self
-            .client
-            .post(format!("{}/api/chat", self.base_url))
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|error| ProviderError::from_transport("Ollama chat request failed", error))?;
-        let status = response.status();
-        let retry_after = retry_after(response.headers());
-        let body = response.text().await.map_err(|error| {
-            ProviderError::from_transport("failed to read Ollama response body", error)
-        })?;
-
-        if !status.is_success() {
-            return Err(ProviderError::from_http("Ollama", status, &body)
-                .with_retry_after(retry_after)
-                .into());
-        }
-
-        let decoded: OllamaChatResponse =
-            serde_json::from_str(&body).context("failed to parse Ollama chat response")?;
-        decoded.timings.record(decoded.eval_count);
-
-        Ok(ChatResponse {
-            provider: self.id.clone(),
-            model: Some(model),
-            content: decoded.message.content,
-            usage: ollama_usage(decoded.prompt_eval_count, decoded.eval_count),
-            citations: Vec::new(),
-        })
     }
 }

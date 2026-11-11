@@ -28,6 +28,7 @@ while IFS= read -r -d '' document; do
         fi
     done < <(grep -oE '\]\([^)]+\)' "$document" || true)
 done < <(find "$repo_root" -type f -name '*.md' \
-    -not -path "$repo_root/target/*" -print0)
+    -not -path "$repo_root/target/*" \
+    -not -path "*/node_modules/*" -print0)
 
 exit "$status"

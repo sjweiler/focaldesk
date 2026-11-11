@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use focaldesk_themes::ThemePackage;
 use serde::{Deserialize, Serialize};
 use std::{

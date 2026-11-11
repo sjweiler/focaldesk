@@ -75,7 +75,7 @@ pub fn scale_chrome_layout(layout: &ChromeLayout, scale: f64) -> ChromeLayout<Ph
         let h = (r.size.h as f64 * scale).round() as i32;
         Rectangle::from_loc_and_size((x, y), (w.max(1), h.max(1)))
     };
-    let sc_opt = |o: Option<Rectangle<i32, Logical>>| o.map(&sc);
+    let sc_opt = |o: Option<Rectangle<i32, Logical>>| o.map(sc);
     let sc_vec = |v: &[Rectangle<i32, Logical>]| v.iter().copied().map(&sc).collect();
     ChromeLayout {
         topbar: TopBarLayout {

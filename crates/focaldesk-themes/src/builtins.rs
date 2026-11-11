@@ -1,5 +1,5 @@
-use crate::ThemeWallpaperFit;
 use crate::theme::*;
+use crate::ThemeWallpaperFit;
 
 /// A single conservative fallback used only when the system document or a
 /// selected package cannot load. User-facing themes are ThemeDocuments.

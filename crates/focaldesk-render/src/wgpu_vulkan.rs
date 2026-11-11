@@ -799,7 +799,11 @@ impl PresentRenderer for WgpuVulkanRenderer {
         let mut frame_retentions = Vec::<FrameRetention>::new();
         let max_texture_dimension = self.device.limits().max_texture_dimension_2d;
         for (surface_index, surface) in surfaces.iter().enumerate() {
-            let bytes_per_pixel = if surface.format == FramePixelFormat::Rgba16FloatLinear { 8 } else { 4 };
+            let bytes_per_pixel = if surface.format == FramePixelFormat::Rgba16FloatLinear {
+                8
+            } else {
+                4
+            };
             let Some(row_bytes) = surface.width.checked_mul(bytes_per_pixel) else {
                 continue;
             };
@@ -946,7 +950,11 @@ impl PresentRenderer for WgpuVulkanRenderer {
                 if width == 0 || height == 0 {
                     continue;
                 }
-                let bpp = if surface.format == FramePixelFormat::Rgba16FloatLinear { 8 } else { 4 };
+                let bpp = if surface.format == FramePixelFormat::Rgba16FloatLinear {
+                    8
+                } else {
+                    4
+                };
                 let offset = u64::from(y) * u64::from(surface.stride) + u64::from(x) * bpp;
                 self.queue.write_texture(
                     TexelCopyTextureInfo {

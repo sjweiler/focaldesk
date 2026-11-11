@@ -92,6 +92,17 @@ pub fn set_parent(span: &tracing::Span, carrier: &HashMap<String, String>) {
     let _ = span.set_parent(parent);
 }
 
+/// Add IDs to local request log context without exporting diagnostic messages.
+pub fn record_correlation(span: &tracing::Span) {
+    let context = span.context();
+    let trace = context.span();
+    let ids = trace.span_context();
+    if ids.is_valid() {
+        span.record("trace_id", ids.trace_id().to_string());
+        span.record("span_id", ids.span_id().to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,16 +152,5 @@ mod tests {
         assert!(spans.iter().all(|span| span.events.is_empty()));
         assert!(!format!("{spans:?}").contains("PRIVATE_"));
         provider.shutdown().unwrap();
-    }
-}
-
-/// Add IDs to local request log context without exporting diagnostic messages.
-pub fn record_correlation(span: &tracing::Span) {
-    let context = span.context();
-    let trace = context.span();
-    let ids = trace.span_context();
-    if ids.is_valid() {
-        span.record("trace_id", ids.trace_id().to_string());
-        span.record("span_id", ids.span_id().to_string());
     }
 }

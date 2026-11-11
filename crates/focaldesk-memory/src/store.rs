@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::{fs, os::unix::fs::PermissionsExt};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use focal_vector_client::{Client as FocalVectorClient, Metric, Point};
-use rusqlite::{Connection, Transaction, ffi::sqlite3_auto_extension, params};
+use rusqlite::{ffi::sqlite3_auto_extension, params, Connection, Transaction};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use zerocopy::IntoBytes;
@@ -1150,8 +1150,10 @@ fn decode_embedding(bytes: &[u8]) -> Result<Vec<f32>> {
         bail!("stored embedding has invalid byte length {}", bytes.len());
     }
     Ok(bytes
-        .chunks_exact(std::mem::size_of::<f32>())
-        .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("four-byte chunk")))
+        .as_chunks::<{ std::mem::size_of::<f32>() }>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_ne_bytes(*chunk))
         .collect())
 }
 

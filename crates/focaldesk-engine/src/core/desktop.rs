@@ -1767,6 +1767,8 @@ fn workspace_transition_views(
     ]
 }
 
+type ScreenshotSelection = (OutputId, Point<i32, Logical>, Point<i32, Logical>);
+
 pub struct DesktopState {
     // smithay protocol state
     pub display_handle: DisplayHandle,
@@ -1986,7 +1988,7 @@ pub struct DesktopState {
     pub screenshot_requested: Option<OutputId>,
     pub screenshot_all_requested: bool,
     /// (output, drag origin, current pointer), all in output-local logical coordinates.
-    pub screenshot_selection: Option<(OutputId, Point<i32, Logical>, Point<i32, Logical>)>,
+    pub screenshot_selection: Option<ScreenshotSelection>,
     /// The shortcut arms selection; the next left press supplies its origin.
     pub screenshot_selection_dragging: bool,
     /// Region to crop from the next clean output capture.
@@ -7722,8 +7724,12 @@ impl DesktopState {
     }
 
     pub fn request_screenshot_selection(&mut self) {
-        let output_id = self.output_under_pointer(self.pointer_pos).unwrap_or(self.focused_output);
-        let Some(output) = self.outputs.get(&output_id) else { return };
+        let output_id = self
+            .output_under_pointer(self.pointer_pos)
+            .unwrap_or(self.focused_output);
+        let Some(output) = self.outputs.get(&output_id) else {
+            return;
+        };
         let point = Point::from((
             (self.pointer_pos.x as i32 - output.logical_origin.x).clamp(0, output.logical_size.w),
             (self.pointer_pos.y as i32 - output.logical_origin.y).clamp(0, output.logical_size.h),
@@ -7738,7 +7744,9 @@ impl DesktopState {
         if !self.screenshot_selection_dragging {
             return self.screenshot_selection.is_some();
         }
-        let Some((output_id, _, current)) = self.screenshot_selection.as_mut() else { return false };
+        let Some((output_id, _, current)) = self.screenshot_selection.as_mut() else {
+            return false;
+        };
         let output_id = *output_id;
         let Some(output) = self.outputs.get(&output_id) else {
             self.screenshot_selection = None;
@@ -7753,7 +7761,9 @@ impl DesktopState {
     }
 
     pub fn begin_screenshot_selection(&mut self, position: Point<f64, Logical>) -> bool {
-        let Some((output_id, start, current)) = self.screenshot_selection.as_mut() else { return false };
+        let Some((output_id, start, current)) = self.screenshot_selection.as_mut() else {
+            return false;
+        };
         let output_id = *output_id;
         let Some(output) = self.outputs.get(&output_id) else {
             self.screenshot_selection = None;
@@ -7771,11 +7781,16 @@ impl DesktopState {
     }
 
     pub fn finish_screenshot_selection(&mut self) -> bool {
-        let Some((output_id, start, current)) = self.screenshot_selection.take() else { return false };
+        let Some((output_id, start, current)) = self.screenshot_selection.take() else {
+            return false;
+        };
         self.screenshot_selection_dragging = false;
         let rect = Rectangle::from_loc_and_size(
             (start.x.min(current.x), start.y.min(current.y)),
-            ((start.x - current.x).unsigned_abs() as i32, (start.y - current.y).unsigned_abs() as i32),
+            (
+                (start.x - current.x).unsigned_abs() as i32,
+                (start.y - current.y).unsigned_abs() as i32,
+            ),
         );
         self.mark_output_full_damage(output_id, DamageSource::Unknown);
         if rect.size.w >= 2 && rect.size.h >= 2 {
@@ -7786,25 +7801,36 @@ impl DesktopState {
     }
 
     pub fn cancel_screenshot_selection(&mut self) -> bool {
-        let Some((output_id, _, _)) = self.screenshot_selection.take() else { return false };
+        let Some((output_id, _, _)) = self.screenshot_selection.take() else {
+            return false;
+        };
         self.screenshot_selection_dragging = false;
         self.mark_output_full_damage(output_id, DamageSource::Unknown);
         true
     }
 
-    pub fn screenshot_selection_rect(&self, output_id: OutputId) -> Option<Rectangle<i32, Logical>> {
+    pub fn screenshot_selection_rect(
+        &self,
+        output_id: OutputId,
+    ) -> Option<Rectangle<i32, Logical>> {
         if !self.screenshot_selection_dragging {
             return None;
         }
         let (selection_output, start, current) = self.screenshot_selection?;
-        (selection_output == output_id).then(|| Rectangle::from_loc_and_size(
-            (start.x.min(current.x), start.y.min(current.y)),
-            ((start.x - current.x).unsigned_abs() as i32, (start.y - current.y).unsigned_abs() as i32),
-        ))
+        (selection_output == output_id).then(|| {
+            Rectangle::from_loc_and_size(
+                (start.x.min(current.x), start.y.min(current.y)),
+                (
+                    (start.x - current.x).unsigned_abs() as i32,
+                    (start.y - current.y).unsigned_abs() as i32,
+                ),
+            )
+        })
     }
 
     pub fn screenshot_selection_active(&self, output_id: OutputId) -> bool {
-        self.screenshot_selection.is_some_and(|(selection_output, _, _)| selection_output == output_id)
+        self.screenshot_selection
+            .is_some_and(|(selection_output, _, _)| selection_output == output_id)
     }
 
     pub fn take_screenshot_crop(&mut self, output_id: OutputId) -> Option<Rectangle<i32, Logical>> {

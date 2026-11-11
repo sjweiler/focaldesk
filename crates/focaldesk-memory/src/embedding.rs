@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 /// Turns text into a fixed-length vector. Implementations must always return
 /// vectors of `dimension()` length so they can be stored in a single
 /// sqlite-vec table (its column width is fixed at table-creation time).
+// async-trait adds must_use to futures that are already must_use.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     fn dimension(&self) -> usize;
@@ -73,7 +75,9 @@ impl EmbeddingProvider for OllamaEmbeddingProvider {
 
     #[tracing::instrument(name = "ai.embedding", target = "focaldesk.telemetry", skip_all)]
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let mut operation = focaldesk_logging::metrics::Operation::start(focaldesk_logging::metrics::Stage::Embedding);
+        let mut operation = focaldesk_logging::metrics::Operation::start(
+            focaldesk_logging::metrics::Stage::Embedding,
+        );
         let result: anyhow::Result<_> = async {
             if texts.is_empty() {
                 return Ok(Vec::new());
@@ -132,7 +136,14 @@ impl EmbeddingProvider for OllamaEmbeddingProvider {
         }.await;
         let outcome = match &result {
             Ok(_) => focaldesk_logging::metrics::Outcome::Ok,
-            Err(error) if error.chain().any(|e| e.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout)) => focaldesk_logging::metrics::Outcome::Timeout,
+            Err(error)
+                if error.chain().any(|e| {
+                    e.downcast_ref::<reqwest::Error>()
+                        .is_some_and(reqwest::Error::is_timeout)
+                }) =>
+            {
+                focaldesk_logging::metrics::Outcome::Timeout
+            }
             Err(_) => focaldesk_logging::metrics::Outcome::Error,
         };
         operation.finish(outcome);

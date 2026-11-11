@@ -17,7 +17,7 @@ async-trait = "0.1"
 dirs = "6"
 focal-vector-client = { git = "https://github.com/sjweiler/focal-vector", rev = "15f48794a3193bafb090448853d32e37463630ea" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rusqlite = { version = "0.37", features = ["bundled-full"] }
+rusqlite = { version = "0.41", features = ["bundled-full", "fallible_uint"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlite-vec = "0.1"

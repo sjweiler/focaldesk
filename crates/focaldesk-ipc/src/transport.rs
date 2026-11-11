@@ -563,8 +563,20 @@ mod tests {
         };
         for policy in [NOTIFICATIONS_POLICY, POWER_POLICY, UPDATES_POLICY] {
             assert!(policy_allows(&rail, policy));
-            assert!(!policy_allows(&PeerIdentity { unit: Some("other.service".into()), ..rail.clone() }, policy));
-            assert!(!policy_allows(&PeerIdentity { executable: PathBuf::from("/tmp/other"), ..rail.clone() }, policy));
+            assert!(!policy_allows(
+                &PeerIdentity {
+                    unit: Some("other.service".into()),
+                    ..rail.clone()
+                },
+                policy
+            ));
+            assert!(!policy_allows(
+                &PeerIdentity {
+                    executable: PathBuf::from("/tmp/other"),
+                    ..rail.clone()
+                },
+                policy
+            ));
         }
     }
 

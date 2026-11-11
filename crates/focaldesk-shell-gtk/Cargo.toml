@@ -13,9 +13,9 @@ focaldesk-logging = { path = "../focaldesk-logging" }
 focaldesk-config = { path = "../focaldesk-config" }
 focaldesk-settings-core = { path = "../focaldesk-settings-core" }
 focaldesk-themes = { path = "../focaldesk-themes" }
-vui-core = { path = "../../../vello-ui/crates/vui-core" }
-vui-vello = { path = "../../../vello-ui/crates/vui-vello" }
-vui-text = { path = "../../../vello-ui/crates/vui-text" }
+vui-core = { git = "https://github.com/sjweiler/vello-ui", rev = "1e46b0cd1d44cddac1b6cb9b0478f57e6afa9b1a" }
+vui-vello = { git = "https://github.com/sjweiler/vello-ui", rev = "1e46b0cd1d44cddac1b6cb9b0478f57e6afa9b1a" }
+vui-text = { git = "https://github.com/sjweiler/vello-ui", rev = "1e46b0cd1d44cddac1b6cb9b0478f57e6afa9b1a" }
 chrono.workspace = true
 gtk = { package = "gtk4", version = "0.9", features = ["v4_12"] }
 gtk4-layer-shell = "0.4"

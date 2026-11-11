@@ -19,10 +19,19 @@ pub enum BrowserRequest {
     Open {
         url: String,
     },
-    Navigate { page_id:String, url:String },
-    Back { page_id:String },
-    Forward { page_id:String },
-    Reload { page_id:String },
+    Navigate {
+        page_id: String,
+        url: String,
+    },
+    Back {
+        page_id: String,
+    },
+    Forward {
+        page_id: String,
+    },
+    Reload {
+        page_id: String,
+    },
     Read {
         page_id: String,
     },

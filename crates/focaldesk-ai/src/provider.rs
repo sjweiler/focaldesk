@@ -92,12 +92,16 @@ pub fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
+// async-trait adds must_use to futures that are already must_use.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait AiProvider: Send + Sync {
     fn info(&self) -> ProviderInfo;
 
     /// Optionally preload a local model without producing a chat answer.
-    async fn warm_up(&self) -> Result<()> { Ok(()) }
+    async fn warm_up(&self) -> Result<()> {
+        Ok(())
+    }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>>;
 

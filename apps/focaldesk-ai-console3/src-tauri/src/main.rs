@@ -3,7 +3,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).is_some_and(|arg| arg == "--check-image") {
         use base64::Engine as _;
-        use focaldesk_ai::{AiIpcRequest, AiIpcResponse, ChatRequest, send_ai_request};
+        use focaldesk_ai::{send_ai_request, AiIpcRequest, AiIpcResponse, ChatRequest};
         let path = args
             .get(2)
             .expect("--check-image requires a synthetic PNG path");
@@ -33,7 +33,7 @@ fn main() {
         }
     }
     if args.get(1).is_some_and(|arg| arg == "--check-stream-stop") {
-        use focaldesk_ai::{AiStreamEvent, ChatRequest, cancel_ai_stream, stream_ai_chat};
+        use focaldesk_ai::{cancel_ai_stream, stream_ai_chat, AiStreamEvent, ChatRequest};
         let mut request = ChatRequest::from_prompt(
             "Write 100 numbered lines about Rust programming, with a newline after each line. Start immediately with line 1.",
         );
@@ -68,7 +68,7 @@ fn main() {
         });
     }
     if args.get(1).is_some_and(|arg| arg == "--check-services") {
-        use focaldesk_ai::{AiIpcRequest, AiIpcResponse, send_ai_request};
+        use focaldesk_ai::{send_ai_request, AiIpcRequest, AiIpcResponse};
         let mut failed = false;
         for request in [
             AiIpcRequest::ListProviders,
@@ -99,7 +99,7 @@ fn main() {
         .is_some_and(|arg| arg == "--check-browser-agent")
     {
         use focaldesk_ai::{
-            AgentRequest, AgentRunState, AiIpcRequest, AiIpcResponse, send_ai_request,
+            send_ai_request, AgentRequest, AgentRunState, AiIpcRequest, AiIpcResponse,
         };
         let run_id = match send_ai_request(&AiIpcRequest::StartAgent { request: AgentRequest {
             agent_id: Some("browser".into()), provider: None, model: None,
@@ -149,7 +149,7 @@ fn main() {
     }
     if args.get(1).is_some_and(|arg| arg == "--check-capabilities") {
         use focaldesk_ai::{
-            AiIpcRequest, AiIpcResponse, ChatMessage, ChatRequest, send_ai_request,
+            send_ai_request, AiIpcRequest, AiIpcResponse, ChatMessage, ChatRequest,
         };
         let mut request = ChatRequest::from_prompt(
             "In this running FocalDesk session, what RAG and browser capabilities are actually available? Distinguish an empty index from missing RAG, and ordinary Chat from the Browser Assistant. Answer briefly from the supplied runtime facts.",
@@ -171,7 +171,7 @@ fn main() {
         }
     }
     if args.get(1).is_some_and(|arg| arg == "--check-chat") {
-        use focaldesk_ai::{AiIpcRequest, AiIpcResponse, ChatRequest, send_ai_request};
+        use focaldesk_ai::{send_ai_request, AiIpcRequest, AiIpcResponse, ChatRequest};
         let mut request =
             ChatRequest::from_prompt("Reply with exactly: FocalDesk connection works");
         request.max_tokens = None;

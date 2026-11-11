@@ -829,7 +829,10 @@ fn apply_saved_display_positions(
     outputs: &[focaldesk_settings_core::OutputConfig],
 ) {
     for display in displays {
-        if let Some(output) = outputs.iter().find(|output| output.connector == display.name) {
+        if let Some(output) = outputs
+            .iter()
+            .find(|output| output.connector == display.name)
+        {
             display.logical_x = output.x;
             display.logical_y = output.y;
         }
@@ -1369,11 +1372,20 @@ fn save_offscreen_screenshot(
         let scale_y = size.h as f64 / logical_size.h.max(1) as f64;
         let x = (crop.loc.x as f64 * scale_x).floor().max(0.0) as u32;
         let y = (crop.loc.y as f64 * scale_y).floor().max(0.0) as u32;
-        let right = ((crop.loc.x + crop.size.w) as f64 * scale_x).ceil().max(0.0) as u32;
-        let bottom = ((crop.loc.y + crop.size.h) as f64 * scale_y).ceil().max(0.0) as u32;
+        let right = ((crop.loc.x + crop.size.w) as f64 * scale_x)
+            .ceil()
+            .max(0.0) as u32;
+        let bottom = ((crop.loc.y + crop.size.h) as f64 * scale_y)
+            .ceil()
+            .max(0.0) as u32;
         let (width, height, cropped) = crate::core::screenshot::crop_rgb16(
-            &pixels, size.w as u32, size.h as u32, x, y,
-            right.saturating_sub(x), bottom.saturating_sub(y),
+            &pixels,
+            size.w as u32,
+            size.h as u32,
+            x,
+            y,
+            right.saturating_sub(x),
+            bottom.saturating_sub(y),
         )?;
         size = Size::from((width as i32, height as i32));
         pixels = cropped;
@@ -1865,14 +1877,15 @@ pub(super) fn reset_crtc_gamma(
     }
     let ramp = identity_gamma_ramp(size);
     device.set_gamma(crtc, &ramp, &ramp, &ramp)?;
-    flog(&format!("Reset hardware gamma to identity: crtc={crtc:?} entries={size}"));
+    flog(&format!(
+        "Reset hardware gamma to identity: crtc={crtc:?} entries={size}"
+    ));
     Ok(())
 }
 
 fn identity_gamma_ramp(size: usize) -> Vec<u16> {
     (0..size)
-        .map(|i| ((i as u64 * u16::MAX as u64 + (size as u64 - 1) / 2)
-            / (size as u64 - 1)) as u16)
+        .map(|i| ((i as u64 * u16::MAX as u64 + (size as u64 - 1) / 2) / (size as u64 - 1)) as u16)
         .collect()
 }
 
@@ -2027,7 +2040,9 @@ mod hdr_tests {
         DRM_SCANOUT_FORMAT_PREFERENCE, HDR_FRAME_TIMEOUT, HDR_SCANOUT_FORMATS, HDR_VERIFY_DURATION,
         HDR_VERIFY_VBLANKS, OUTPUT_MAX_REFRESH_HZ, PCI_VENDOR_NVIDIA,
     };
-    use focaldesk_settings_core::{DisplayColorProfile, ExclusiveHdrPhase, HdrAppearance, OutputRole};
+    use focaldesk_settings_core::{
+        DisplayColorProfile, ExclusiveHdrPhase, HdrAppearance, OutputRole,
+    };
     use std::time::{Duration, Instant};
 
     fn display_config(hdr_requested: bool, hdr_enabled: bool) -> DisplayConfig {
@@ -4630,7 +4645,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                             .core
                             .state
                             .take_screenshot_crop(surface.output_id)
-                            .and_then(|rect| data.core.state.outputs.get(&surface.output_id).map(|output| (rect, output.logical_size)));
+                            .and_then(|rect| {
+                                data.core
+                                    .state
+                                    .outputs
+                                    .get(&surface.output_id)
+                                    .map(|output| (rect, output.logical_size))
+                            });
                         let output_name = if crop.is_some() {
                             format!("selection-{}", surface.output_id.0)
                         } else {

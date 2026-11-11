@@ -928,7 +928,7 @@ impl AiService {
             }
         }
         let mut values = leases.values().cloned().collect::<Vec<_>>();
-        values.sort_by(|left, right| right.issued_at_unix.cmp(&left.issued_at_unix));
+        values.sort_by_key(|value| std::cmp::Reverse(value.issued_at_unix));
         Ok(values)
     }
 
@@ -1034,7 +1034,7 @@ impl AiService {
             .lock()
             .map_err(|_| anyhow!("workflow run store is unavailable"))?;
         let mut statuses = runs.values().cloned().collect::<Vec<_>>();
-        statuses.sort_by(|left, right| right.created_at_unix.cmp(&left.created_at_unix));
+        statuses.sort_by_key(|status| std::cmp::Reverse(status.created_at_unix));
         Ok(statuses)
     }
 
@@ -2236,9 +2236,11 @@ impl AiService {
 
     /// Preload the selected default provider. No-op for hosted providers.
     pub async fn warm_up_default_provider(&self) -> Result<()> {
-        self.providers.get(&self.default_provider)
+        self.providers
+            .get(&self.default_provider)
             .ok_or_else(|| anyhow!("default AI provider is unavailable"))?
-            .warm_up().await
+            .warm_up()
+            .await
     }
 
     pub fn default_provider(&self) -> &str {
@@ -2265,16 +2267,18 @@ impl AiService {
 
     #[tracing::instrument(name = "ai.chat", target = "focaldesk.telemetry", skip_all)]
     pub async fn chat(&self, mut request: ChatRequest) -> Result<ChatResponse> {
-        let mut operation = focaldesk_logging::metrics::Operation::start(focaldesk_logging::metrics::Stage::Request);
+        let mut operation = focaldesk_logging::metrics::Operation::start(
+            focaldesk_logging::metrics::Stage::Request,
+        );
         let result: anyhow::Result<_> = async {
             let now = chrono::Local::now();
             request = guard::guard_request(request, now)?;
             let prompt = latest_user_message(&request);
-            if let Some(window) = guard::current_month_calendar_window(&prompt, now) {
-                if let Some(response) = current_month_calendar_response(&window) {
-                    self.record_latest_chat(prompt, &response);
-                    return Ok(response);
-                }
+            if let Some(window) = guard::current_month_calendar_window(&prompt, now)
+                && let Some(response) = current_month_calendar_response(&window)
+            {
+                self.record_latest_chat(prompt, &response);
+                return Ok(response);
             }
             let provider_id = request
                 .provider
@@ -2343,16 +2347,26 @@ impl AiService {
                 );
             }
 
-            (response.content, response.citations) = retain_cited_sources(&response.content, citations);
-            response.content =
-                enforce_rust_vec_capacity_semantics(&prompt, &response.content, &response.citations);
+            (response.content, response.citations) =
+                retain_cited_sources(&response.content, citations);
+            response.content = enforce_rust_vec_capacity_semantics(
+                &prompt,
+                &response.content,
+                &response.citations,
+            );
             response.content = guard::guard_output(&prompt, &response.content, &response.citations);
             self.record_latest_chat(prompt, &response);
             Ok(response)
-        }.await;
+        }
+        .await;
         let outcome = match &result {
             Ok(_) => focaldesk_logging::metrics::Outcome::Ok,
-            Err(error) if crate::provider::provider_error(error).is_some_and(|e| e.kind == crate::provider::ProviderErrorKind::Timeout) => focaldesk_logging::metrics::Outcome::Timeout,
+            Err(error)
+                if crate::provider::provider_error(error)
+                    .is_some_and(|e| e.kind == crate::provider::ProviderErrorKind::Timeout) =>
+            {
+                focaldesk_logging::metrics::Outcome::Timeout
+            }
             Err(_) => focaldesk_logging::metrics::Outcome::Error,
         };
         operation.finish(outcome);
@@ -2366,7 +2380,9 @@ impl AiService {
         mut request: ChatRequest,
         events: mpsc::Sender<AiStreamEvent>,
     ) -> Result<()> {
-        let mut operation = focaldesk_logging::metrics::Operation::start(focaldesk_logging::metrics::Stage::Request);
+        let mut operation = focaldesk_logging::metrics::Operation::start(
+            focaldesk_logging::metrics::Stage::Request,
+        );
         let result: anyhow::Result<_> = async {
             let now = chrono::Local::now();
             request = guard::guard_request(request, now)?;
@@ -2374,8 +2390,8 @@ impl AiService {
             if request_id.is_empty() {
                 return Err(anyhow!("stream request id must not be empty"));
             }
-            if let Some(window) = guard::current_month_calendar_window(&prompt, now) {
-                if let Some(response) = current_month_calendar_response(&window) {
+            if let Some(window) = guard::current_month_calendar_window(&prompt, now)
+                && let Some(response) = current_month_calendar_response(&window) {
                     events
                         .send(AiStreamEvent::Started {
                             request_id: request_id.clone(),
@@ -2394,7 +2410,6 @@ impl AiService {
                         .map_err(|_| anyhow!("AI stream consumer disconnected"))?;
                     return Ok(());
                 }
-            }
             let provider_id = request
                 .provider
                 .clone()
@@ -2506,7 +2521,7 @@ impl AiService {
                             raw_partial.push_str(&content);
                             // A whole line keeps assignments, email addresses and
                             // phone tokens together even when transport chunks split them.
-                            if prefix_stable {if let Some(boundary)=raw_partial.rfind('\n') {
+                            if prefix_stable&& let Some(boundary)=raw_partial.rfind('\n') {
                                 let (prefix,prefix_citations)=retain_cited_sources(&raw_partial[..boundary+1],citations.clone());
                                 let prefix=enforce_rust_vec_capacity_semantics(&prompt,&prefix,&prefix_citations);
                                 let guarded=guard::guard_output(&prompt,&prefix,&prefix_citations);
@@ -2514,7 +2529,7 @@ impl AiService {
                                     let delta=guarded[published.len()..].to_string();published=guarded;
                                     if !delta.is_empty(){events.send(AiStreamEvent::Delta{request_id:request_id.clone(),content:delta}).await.map_err(|_|anyhow!("AI stream consumer disconnected"))?;}
                                 }else{prefix_stable=false;}
-                            }}
+                            }
                         }
                     }
                     result = &mut provider_future => {
@@ -2558,7 +2573,12 @@ impl AiService {
         }.await;
         let outcome = match &result {
             Ok(_) => focaldesk_logging::metrics::Outcome::Ok,
-            Err(error) if crate::provider::provider_error(error).is_some_and(|e| e.kind == crate::provider::ProviderErrorKind::Timeout) => focaldesk_logging::metrics::Outcome::Timeout,
+            Err(error)
+                if crate::provider::provider_error(error)
+                    .is_some_and(|e| e.kind == crate::provider::ProviderErrorKind::Timeout) =>
+            {
+                focaldesk_logging::metrics::Outcome::Timeout
+            }
             Err(_) => focaldesk_logging::metrics::Outcome::Error,
         };
         operation.finish(outcome);
@@ -4507,8 +4527,7 @@ fn prefer_exact_rust_api_source(query: &str, hits: Vec<SearchHit>) -> Vec<Search
     };
     let Some(type_name) = query[..marker]
         .split(|character: char| !character.is_alphanumeric() && character != '_')
-        .filter(|part| !part.is_empty())
-        .next_back()
+        .rfind(|part| !part.is_empty())
     else {
         return hits;
     };
@@ -5646,7 +5665,7 @@ fn current_month_calendar_response(window: &guard::CalendarWindow) -> Option<Cha
         }
         Ok(response) if response.status != "ok" => format!(
             "I can’t verify this month’s calendar because the local calendar service returned: {}",
-            response.message.unwrap_or_else(|| response.status)
+            response.message.unwrap_or(response.status)
         ),
         // The connector may deliberately have no account attached. Let the
         // guarded local document index answer from a schedule PDF in that case.

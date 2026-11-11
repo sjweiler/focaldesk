@@ -4,7 +4,9 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use focaldesk_remote_protocol::{read_message, receive_fd, write_message, Event, Request};
+use focaldesk_remote_protocol::{
+    read_message, receive_fd, write_message, CapturePurpose, Event, Request,
+};
 
 fn socket_path() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("FOCALDESK_REMOTE_SOCKET_PATH") {
@@ -22,7 +24,13 @@ fn main() -> Result<()> {
         .context("output id must be an integer")?;
     let destination = std::env::args().nth(2).map(PathBuf::from);
     let stream = UnixStream::connect(socket_path()?).context("connect to compositor")?;
-    write_message(&stream, &Request::StartCapture { output_id })?;
+    write_message(
+        &stream,
+        &Request::StartCapture {
+            output_id,
+            purpose: CapturePurpose::RemoteDesktop,
+        },
+    )?;
     let mut active_session = None;
 
     loop {

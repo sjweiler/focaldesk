@@ -335,7 +335,10 @@ struct VulkanDrmData {
     primary_node: DrmNode,
     session: LibSeatSession,
     outputs: Vec<VulkanOutput>,
-    retired_output_globals: Vec<(Instant, smithay::reexports::wayland_server::backend::GlobalId)>,
+    retired_output_globals: Vec<(
+        Instant,
+        smithay::reexports::wayland_server::backend::GlobalId,
+    )>,
     libinput: Libinput,
     session_active: bool,
     disable_explicit_kms_fences: bool,
@@ -1400,8 +1403,8 @@ fn initialize_vulkan_outputs(
             Some(config.origin),
         );
         output.set_preferred(wl_mode);
-        let global = output
-            .create_global::<crate::core::desktop::DesktopState>(&desktop.display.handle());
+        let global =
+            output.create_global::<crate::core::desktop::DesktopState>(&desktop.display.handle());
         desktop.state.register_output_entry(
             config.output_id,
             output,
@@ -1575,7 +1578,10 @@ fn rebuild_vulkan_outputs(data: &mut VulkanDrmData) -> Result<bool> {
         }
     };
     let snapshot = data.desktop.state.snapshot_output_topology();
-    flog_warn!("Raw Vulkan output rebuild: retiring {} outputs", data.outputs.len());
+    flog_warn!(
+        "Raw Vulkan output rebuild: retiring {} outputs",
+        data.outputs.len()
+    );
     crate::core::portal::invalidate_portal_output_state(&mut data.desktop.state);
     for output in &mut data.outputs {
         flog_warn!(
@@ -1592,7 +1598,9 @@ fn rebuild_vulkan_outputs(data: &mut VulkanDrmData) -> Result<bool> {
         // Withdraw the old wl_output before publishing its replacement. Retain
         // the disabled global briefly so an in-flight client bind cannot race
         // immediate removal and disconnect that client.
-        data.desktop.display.handle()
+        data.desktop
+            .display
+            .handle()
             .disable_global::<crate::core::desktop::DesktopState>(output.global.clone());
         data.retired_output_globals.push((
             Instant::now() + Duration::from_secs(5),
@@ -1874,10 +1882,20 @@ fn save_vulkan_screenshot(
             let scale_y = height as f64 / logical_size.h.max(1) as f64;
             let x = (crop.loc.x as f64 * scale_x).floor().max(0.0) as u32;
             let y = (crop.loc.y as f64 * scale_y).floor().max(0.0) as u32;
-            let right = ((crop.loc.x + crop.size.w) as f64 * scale_x).ceil().max(0.0) as u32;
-            let bottom = ((crop.loc.y + crop.size.h) as f64 * scale_y).ceil().max(0.0) as u32;
+            let right = ((crop.loc.x + crop.size.w) as f64 * scale_x)
+                .ceil()
+                .max(0.0) as u32;
+            let bottom = ((crop.loc.y + crop.size.h) as f64 * scale_y)
+                .ceil()
+                .max(0.0) as u32;
             match crate::core::screenshot::crop_rgba8(
-                rgba, width, height, x, y, right.saturating_sub(x), bottom.saturating_sub(y),
+                rgba,
+                width,
+                height,
+                x,
+                y,
+                right.saturating_sub(x),
+                bottom.saturating_sub(y),
             ) {
                 Ok(cropped) => (cropped.0, cropped.1, cropped.2),
                 Err(error) => {
@@ -2007,7 +2025,13 @@ fn finish_vulkan_capture(data: &mut VulkanDrmData, capture: AshDrmCapture) {
             .desktop
             .state
             .take_screenshot_crop(output_id)
-            .and_then(|rect| data.desktop.state.outputs.get(&output_id).map(|output| (rect, output.logical_size)));
+            .and_then(|rect| {
+                data.desktop
+                    .state
+                    .outputs
+                    .get(&output_id)
+                    .map(|output| (rect, output.logical_size))
+            });
         save_vulkan_screenshot(data, output_id, width, height, &rgba, crop);
         data.desktop.state.clear_screenshot_request(output_id);
     }
@@ -3049,7 +3073,9 @@ mod tests {
         assert_eq!((width, height), (3, 2));
         assert_eq!(
             rotated
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|pixel| pixel[0])
                 .collect::<Vec<_>>(),
             vec![2, 4, 6, 1, 3, 5]

@@ -47,7 +47,7 @@ async fn main() -> Result<()> {
             engine.lock().await.handle(request).await
            };
            let response=match tokio::time::timeout(Duration::from_secs(40),work).await{Ok(Ok(result))=>BrowserResponse{result:Some(result),error:None},Ok(Err(e))=>BrowserResponse{result:None,error:Some(format!("{e:#}"))},Err(_)=>BrowserResponse{result:None,error:Some("Browser operation timed out".into())}};
-           if let Ok(bytes)=transport::encode_message(&response){if bytes.len() as u64<=MAX_RESPONSE{let _=tokio::time::timeout(Duration::from_secs(5),stream.write_all(&bytes)).await;}}
+           if let Ok(bytes)=transport::encode_message(&response)&& bytes.len() as u64<=MAX_RESPONSE{let _=tokio::time::timeout(Duration::from_secs(5),stream.write_all(&bytes)).await;}
           });
          }
         }
