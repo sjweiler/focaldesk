@@ -5629,7 +5629,7 @@ fn set_shell_icon_at_size(image: &gtk::Image, icon_name: &str, icon_size: u32) {
     let tint = if icon_name == "focaldesk-ai-console" {
         "#D6E9FF"
     } else {
-        "#8CA4C4"
+        "#E2ECF7"
     };
     let styled = svg.replace("currentColor", tint);
     let mut fontdb = resvg::usvg::fontdb::Database::new();
