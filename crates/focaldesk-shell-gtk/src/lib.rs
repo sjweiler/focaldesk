@@ -3589,7 +3589,7 @@ fn start_companion_weather_updates() -> (
 
 fn fetch_companion_weather(latitude: f64, longitude: f64) -> Result<CompanionWeather, String> {
     let url = format!(
-        "https://api.open-meteo.com/v1/forecast?latitude={latitude:.4}&longitude={longitude:.4}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code&temperature_unit=fahrenheit&wind_speed_unit=mph"
+        "https://api.open-meteo.com/v1/forecast?latitude={latitude:.4}&longitude={longitude:.4}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code,is_day&temperature_unit=fahrenheit&wind_speed_unit=mph&timeformat=unixtime"
     );
     let output = Command::new("curl")
         .args([
@@ -3626,16 +3626,37 @@ fn fetch_companion_weather(latitude: f64, longitude: f64) -> Result<CompanionWea
         .get("weather_code")
         .and_then(serde_json::Value::as_i64)
         .ok_or_else(|| "forecast response did not include weather condition".to_string())?;
-    let (icon, condition) = companion_weather_condition(code, wind_speed);
+    let is_day = current
+        .get("is_day")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|value| matches!(value, 0 | 1))
+        .ok_or_else(|| "forecast response did not include day/night status".to_string())?
+        == 1;
+    let data_time = current
+        .get("time")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0))
+        .ok_or_else(|| "forecast response did not include a valid data time".to_string())?
+        .with_timezone(&chrono::Local)
+        .format("%-I:%M %p")
+        .to_string();
+    let (icon, condition) = companion_weather_condition(code, wind_speed, is_day);
     Ok(CompanionWeather {
         icon,
         condition: condition.into(),
         temperature: format!("{temperature:.0}°F"),
-        details: format!("Humidity {:.0}%   ·   Wind {:.0} mph", humidity, wind_speed),
+        details: format!(
+            "Humidity {:.0}%   ·   Wind {:.0} mph\nOpen-Meteo estimate · {data_time}",
+            humidity, wind_speed
+        ),
     })
 }
 
-fn companion_weather_condition(code: i64, wind_speed_mph: f64) -> (&'static str, &'static str) {
+fn companion_weather_condition(
+    code: i64,
+    wind_speed_mph: f64,
+    is_day: bool,
+) -> (&'static str, &'static str) {
     // WMO weather codes describe precipitation and cloud cover, not wind.
     // Give strong wind its own immediately recognizable condition when it is
     // the principal condition, while retaining rain/snow/storm warnings.
@@ -3643,8 +3664,10 @@ fn companion_weather_condition(code: i64, wind_speed_mph: f64) -> (&'static str,
         return ("≋", "Windy");
     }
     match code {
-        0 => ("☀", "Sunny"),
-        1 | 2 => ("⛅", "Partly cloudy"),
+        0 if is_day => ("☀", "Sunny"),
+        0 => ("☾", "Clear"),
+        1 | 2 if is_day => ("⛅", "Partly cloudy"),
+        1 | 2 => ("☾", "Partly cloudy"),
         3 => ("☁", "Cloudy"),
         45 | 48 => ("≋", "Foggy"),
         51 | 53 | 55 | 56 | 57 => ("♧", "Drizzle"),
@@ -4211,7 +4234,7 @@ fn rebuild_running_apps(
         } else {
             format!("{} windows — click to choose", windows.len())
         };
-        let (button, _) = if windows.len() > 1 {
+        let (button, image) = if windows.len() > 1 {
             let entries = windows
                 .iter()
                 .map(|window| ShelfOverflowEntry {
@@ -4237,6 +4260,7 @@ fn rebuild_running_apps(
                 send_action(DesktopAction::FocusWindow { window_id: id });
             })
         };
+        set_running_app_icon(&image, identity);
         button.add_css_class("running-app");
         set_button_active(&button, windows.iter().any(|window| window.focused));
         if let Some(window) = windows.iter().find(|window| window.x11) {
@@ -4324,6 +4348,7 @@ fn present_shelf_overflow(
         let image = shell_icon_image(icon_name);
         image.set_pixel_size(48);
         set_shell_icon_at_size(&image, icon_name, 48);
+        set_running_app_icon(&image, &entry.identity);
         image.set_halign(gtk::Align::Center);
         content.append(&image);
         let title = shelf_window_label(entry, index);
@@ -4477,6 +4502,39 @@ fn window_belongs_to_output(
     }
 
     output_count == 1 || (window.focused && output.focused)
+}
+
+// Desktop entries preserve application branding for both Wayland IDs and X11 classes.
+fn set_running_app_icon(image: &gtk::Image, identity: &str) {
+    thread_local! {
+        static APP_ICONS: Vec<(Vec<String>, gio::Icon)> = gio::AppInfo::all()
+            .into_iter()
+            .filter_map(|app| {
+                let icon = app.icon()?;
+                let mut identities = Vec::new();
+                if let Some(id) = app.id() {
+                    identities.push(id.trim_end_matches(".desktop").to_ascii_lowercase());
+                }
+                if let Some(desktop) = app.downcast_ref::<gio::DesktopAppInfo>() {
+                    if let Some(class) = desktop.startup_wm_class() {
+                        identities.push(class.to_ascii_lowercase());
+                    }
+                }
+                Some((identities, icon))
+            }).collect();
+    }
+    APP_ICONS.with(|apps| {
+        if let Some((_, icon)) = apps
+            .iter()
+            .find(|(ids, _)| ids.iter().any(|id| id == identity))
+        {
+            image.set_from_gicon(icon);
+        } else if gdk::Display::default()
+            .is_some_and(|display| gtk::IconTheme::for_display(&display).has_icon(identity))
+        {
+            image.set_icon_name(Some(identity));
+        }
+    });
 }
 
 fn app_icon_name(identity: Option<&str>) -> &'static str {
@@ -4816,7 +4874,7 @@ fn update_panel(
         } else if snapshot.shell.update_available_count > 0 {
             "software-update-available-symbolic"
         } else {
-            "software-update-available-symbolic"
+            "focaldesk-updates-current"
         },
     );
     set_button_active(
@@ -4892,6 +4950,7 @@ struct SystemRailWidgets {
     battery_image: gtk::Image,
     battery: gtk::Label,
     notifications_button: gtk::Button,
+    notifications_image: gtk::Image,
     updates_button: gtk::Button,
     updates_image: gtk::Image,
     clock: gtk::Label,
@@ -5160,7 +5219,7 @@ fn build_panel(
     clock_button.connect_clicked(move |_| open_shell_panel(&clock_connector, ShellPanel::Calendar));
     bottom.append(&clock_button);
     let notifications_connector = connector.clone();
-    let (notifications_button, _) = glass_icon_button(
+    let (notifications_button, notifications_image) = glass_icon_button(
         "notification-symbolic",
         "Notification center",
         "rail-button",
@@ -5201,6 +5260,7 @@ fn build_panel(
         battery_image,
         battery,
         notifications_button,
+        notifications_image,
         updates_button,
         updates_image,
         clock,
@@ -5393,6 +5453,14 @@ fn update_system_rail(widgets: &SystemRailWidgets, snapshot: &DesktopSnapshot, c
     widgets
         .battery_button
         .set_tooltip_text(Some(&power_tooltip));
+    set_shell_icon(
+        &widgets.notifications_image,
+        if snapshot.shell.notification_unread_count > 0 {
+            "notification-new-symbolic"
+        } else {
+            "notification-symbolic"
+        },
+    );
     set_button_active(
         &widgets.notifications_button,
         snapshot.shell.notification_unread_count > 0,
@@ -5408,8 +5476,10 @@ fn update_system_rail(widgets: &SystemRailWidgets, snapshot: &DesktopSnapshot, c
         &widgets.updates_image,
         if snapshot.shell.update_busy {
             "emblem-synchronizing-symbolic"
-        } else {
+        } else if snapshot.shell.update_available_count > 0 {
             "software-update-available-symbolic"
+        } else {
+            "focaldesk-updates-current"
         },
     );
     set_button_active(
@@ -5685,13 +5755,16 @@ fn focaldesk_icon_svg(icon_name: &str) -> Option<&'static [u8]> {
         "microphone-sensitivity-muted-symbolic" => {
             include_bytes!("../../../assets/svg/microphone-off.svg")
         }
-        "notification-symbolic" | "notification-new-symbolic" => {
-            include_bytes!("../../../assets/svg/notifications.svg")
+        "notification-symbolic" => include_bytes!("../../../assets/svg/notifications.svg"),
+        "notification-new-symbolic" => {
+            include_bytes!("../../../assets/svg/notifications-unread.svg")
         }
-        "software-update-available-symbolic" | "emblem-synchronizing-symbolic" => {
-            include_bytes!("../../../assets/svg/updates.svg")
+        "software-update-available-symbolic" => include_bytes!("../../../assets/svg/updates.svg"),
+        "emblem-synchronizing-symbolic" => include_bytes!("../../../assets/svg/updates-busy.svg"),
+        "focaldesk-updates-current" => include_bytes!("../../../assets/svg/updates-current.svg"),
+        "notifications-disabled-symbolic" => {
+            include_bytes!("../../../assets/svg/notifications-off.svg")
         }
-        "notifications-disabled-symbolic" => include_bytes!("../../../assets/svg/volume-off.svg"),
         "camera-web-symbolic" => include_bytes!("../../../assets/svg/video.svg"),
         "camera-disabled-symbolic" => include_bytes!("../../../assets/svg/video-off.svg"),
         "video-display-symbolic" => include_bytes!("../../../assets/svg/hdr-enabled.svg"),
@@ -6052,12 +6125,18 @@ mod tests {
 
     #[test]
     fn weather_conditions_use_clear_icons_and_preserve_precipitation_warnings() {
-        assert_eq!(companion_weather_condition(0, 5.0), ("☀", "Sunny"));
-        assert_eq!(companion_weather_condition(3, 5.0), ("☁", "Cloudy"));
-        assert_eq!(companion_weather_condition(63, 5.0), ("☂", "Rainy"));
-        assert_eq!(companion_weather_condition(73, 5.0), ("❄", "Snowy"));
-        assert_eq!(companion_weather_condition(0, 25.0), ("≋", "Windy"));
-        assert_eq!(companion_weather_condition(63, 25.0), ("☂", "Rainy"));
+        assert_eq!(companion_weather_condition(0, 5.0, true), ("☀", "Sunny"));
+        assert_eq!(companion_weather_condition(0, 5.0, false), ("☾", "Clear"));
+        assert_eq!(
+            companion_weather_condition(2, 5.0, false),
+            ("☾", "Partly cloudy")
+        );
+        assert_eq!(companion_weather_condition(63, 25.0, false), ("☂", "Rainy"));
+        assert_eq!(companion_weather_condition(3, 5.0, true), ("☁", "Cloudy"));
+        assert_eq!(companion_weather_condition(63, 5.0, true), ("☂", "Rainy"));
+        assert_eq!(companion_weather_condition(73, 5.0, true), ("❄", "Snowy"));
+        assert_eq!(companion_weather_condition(0, 25.0, true), ("≋", "Windy"));
+        assert_eq!(companion_weather_condition(63, 25.0, true), ("☂", "Rainy"));
     }
 
     #[test]

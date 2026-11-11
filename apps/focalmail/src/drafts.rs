@@ -23,6 +23,10 @@ pub struct Draft {
     pub cc: String,
     pub subject: String,
     pub body: String,
+    #[serde(default)]
+    pub html_body: Option<String>,
+    #[serde(default)]
+    pub signature_initialized: bool,
     pub thread_id: String,
     pub in_reply_to: String,
     pub references: String,

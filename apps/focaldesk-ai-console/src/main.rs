@@ -7616,6 +7616,7 @@ fn build_chat_request(
         temperature: None,
         max_tokens: None,
         use_memory: store.app_state.use_memory,
+        memory_sources: None,
     }
 }
 

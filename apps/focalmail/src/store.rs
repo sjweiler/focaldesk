@@ -43,7 +43,7 @@ impl Store {
         )?;
         if has_migrations {
             let ready: bool = conn.query_row(
-                "SELECT count(*)=9 FROM mail_migrations WHERE version IN (1,2,3,4,5,6,7,8,9)",
+                "SELECT count(*)=10 FROM mail_migrations WHERE version IN (1,2,3,4,5,6,7,8,9,10)",
                 [],
                 |r| r.get(0),
             )?;
@@ -91,6 +91,10 @@ impl Store {
             INSERT OR IGNORE INTO mail_migrations VALUES(7);
             COMMIT;")?;
         store.migrate_graph()?;
+        store.0.execute_batch("BEGIN IMMEDIATE;
+            CREATE TABLE IF NOT EXISTS mail_signatures (account TEXT PRIMARY KEY, data TEXT NOT NULL);
+            INSERT OR IGNORE INTO mail_migrations VALUES(10);
+            COMMIT;")?;
         Ok(store)
     }
     // Triggers also cover writes from an already-running older mail service.
@@ -271,10 +275,20 @@ impl Store {
                 "Attachments may total at most 20 MiB"
             );
         }
+        anyhow::ensure!(
+            draft.body.len() <= 1024 * 1024
+                && draft
+                    .html_body
+                    .as_ref()
+                    .is_none_or(|s| s.len() <= 1024 * 1024),
+            "Message text and HTML may each be at most 1 MiB"
+        );
+        let mut draft = draft.clone();
+        draft.html_body = draft.html_body.as_deref().map(crate::compose::sanitize);
         let tx = self
             .0
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute("INSERT INTO local_drafts VALUES(?1,?2,unixepoch()) ON CONFLICT(id) DO UPDATE SET data=excluded.data,updated=unixepoch()", params![draft.id,serde_json::to_string(draft)?])?;
+        tx.execute("INSERT INTO local_drafts VALUES(?1,?2,unixepoch()) ON CONFLICT(id) DO UPDATE SET data=excluded.data,updated=unixepoch()", params![draft.id,serde_json::to_string(&draft)?])?;
         if let Some(files) = files {
             tx.execute(
                 "DELETE FROM local_draft_files WHERE draft_id=?1",
@@ -424,6 +438,39 @@ impl Store {
     }
     pub fn set_sync_paused(&self, paused: bool) -> Result<()> {
         self.0.execute("INSERT INTO mail_preferences VALUES('sync_paused',?1) ON CONFLICT(name) DO UPDATE SET value=excluded.value",[paused])?;
+        Ok(())
+    }
+    pub fn signature(&self, account: &str) -> Result<crate::compose::Signature> {
+        use rusqlite::OptionalExtension;
+        let data: Option<String> = self
+            .0
+            .query_row(
+                "SELECT data FROM mail_signatures WHERE account=?1",
+                [account],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(data
+            .map(|s| serde_json::from_str(&s))
+            .transpose()?
+            .unwrap_or_default())
+    }
+    pub fn set_signature(
+        &self,
+        account: &str,
+        signature: &crate::compose::Signature,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.accounts()?.iter().any(|a| a == account),
+            "Choose a connected account"
+        );
+        anyhow::ensure!(
+            signature.html.len() <= 64 * 1024,
+            "Signature may be at most 64 KiB"
+        );
+        let mut signature = signature.clone();
+        signature.html = crate::compose::sanitize(&signature.html);
+        self.0.execute("INSERT INTO mail_signatures VALUES(?1,?2) ON CONFLICT(account) DO UPDATE SET data=excluded.data", params![account, serde_json::to_string(&signature)?])?;
         Ok(())
     }
     pub fn notifications_enabled(&self) -> Result<bool> {
@@ -1486,5 +1533,50 @@ mod provider_tests {
         assert!(store.notifications_enabled().unwrap());
         store.set_notifications(false).unwrap();
         assert!(!store.notifications_enabled().unwrap());
+    }
+    #[test]
+    fn signature_upgrade_preserves_existing_mail_and_drafts() {
+        let mut store = Store::init(Connection::open_in_memory().unwrap()).unwrap();
+        let message = crate::fixtures::messages().remove(0);
+        store
+            .snapshot(&message.account, &[message.clone()], "1")
+            .unwrap();
+        let draft = crate::drafts::Draft::new(message.account.clone());
+        store.save_local_draft(&draft, Some(&[])).unwrap();
+        // Model an existing version-nine cache, then reopen through normal migration.
+        store
+            .0
+            .execute_batch(
+                "DROP TABLE mail_signatures; DELETE FROM mail_migrations WHERE version=10;",
+            )
+            .unwrap();
+        let store = Store::init(store.0).unwrap();
+        assert_eq!(
+            store
+                .cached_message(&message.account, &message.id)
+                .unwrap()
+                .body,
+            message.body
+        );
+        assert_eq!(
+            store.load_local_draft(&draft.id).unwrap().0.from,
+            draft.from
+        );
+        assert!(store.signature(&message.account).unwrap().html.is_empty());
+        store
+            .set_signature(
+                &message.account,
+                &crate::compose::Signature {
+                    html: "<b>Saved signature</b>".into(),
+                    new_messages: true,
+                    replies_forwards: false,
+                },
+            )
+            .unwrap();
+        let store = Store::init(store.0).unwrap();
+        assert_eq!(
+            store.signature(&message.account).unwrap().html,
+            "<b>Saved signature</b>"
+        );
     }
 }

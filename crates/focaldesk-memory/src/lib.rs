@@ -41,6 +41,7 @@ impl MemoryService {
         self.store.remember(text, embedding, metadata).await
     }
 
+    #[tracing::instrument(name = "memory.recall", target = "focaldesk.telemetry", skip_all)]
     pub async fn recall_similar(&self, query: &str, top_k: usize) -> Result<Vec<SearchHit>> {
         let embedding = self.embedder.embed(query).await?;
         self.store

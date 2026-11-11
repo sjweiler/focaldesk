@@ -59,6 +59,34 @@ pub fn guard_request(mut request: ChatRequest, now: DateTime<Local>) -> Result<C
         bail!("request blocked by the local privacy guard: it asks to disclose sensitive data");
     }
 
+    if request
+        .memory_sources
+        .as_ref()
+        .is_some_and(|sources| sources.len() > 1000 || sources.iter().any(|s| s.len() > 8192))
+    {
+        bail!("project retrieval scope exceeds source limits");
+    }
+    let mut image_bytes = 0;
+    for message in &request.messages {
+        for image in &message.images {
+            let (header, data) = image
+                .split_once(',')
+                .ok_or_else(|| anyhow::anyhow!("image must be a data URL"))?;
+            if !matches!(
+                header,
+                "data:image/png;base64" | "data:image/jpeg;base64" | "data:image/webp;base64"
+            ) {
+                bail!("unsupported image media type");
+            }
+            use base64::Engine as _;
+            image_bytes += base64::engine::general_purpose::STANDARD
+                .decode(data)?
+                .len();
+            if image_bytes > 8 * 1024 * 1024 {
+                bail!("chat images exceed 8 MB");
+            }
+        }
+    }
     for message in &mut request.messages {
         message.content = redact_sensitive_text(&message.content);
     }
@@ -233,10 +261,10 @@ pub fn redact_sensitive_text(text: &str) -> String {
 }
 
 fn redact_secret_assignments(text: &str) -> String {
-    text.lines()
+    text.split_inclusive('\n')
         .map(|line| {
             let lower = line.to_ascii_lowercase();
-            let is_secret_key = [
+            let secret = [
                 "password",
                 "passwd",
                 "secret",
@@ -249,62 +277,89 @@ fn redact_secret_assignments(text: &str) -> String {
             ]
             .iter()
             .any(|key| lower.contains(key));
-            if is_secret_key && (line.contains('=') || line.contains(':')) {
+            if secret && (line.contains('=') || line.contains(':')) {
                 let separator = if line.contains('=') { '=' } else { ':' };
                 let key = line
                     .split_once(separator)
                     .map(|(key, _)| key)
                     .unwrap_or(line);
-                format!("{key}{separator}{REDACTED}")
+                format!(
+                    "{key}{separator}{REDACTED}{}",
+                    if line.ends_with("\r\n") {
+                        "\r\n"
+                    } else if line.ends_with('\n') {
+                        "\n"
+                    } else {
+                        ""
+                    }
+                )
             } else {
                 line.to_string()
             }
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect()
 }
-
+fn map_tokens(text: &str, transform: impl Fn(&str) -> String) -> String {
+    let mut output = String::new();
+    let mut start = 0;
+    for (index, character) in text.char_indices() {
+        if character.is_whitespace() {
+            if start < index {
+                output.push_str(&transform(&text[start..index]));
+            }
+            output.push(character);
+            start = index + character.len_utf8();
+        }
+    }
+    if start < text.len() {
+        output.push_str(&transform(&text[start..]));
+    }
+    output
+}
 fn redact_email_addresses(text: &str) -> String {
-    text.split_whitespace()
-        .map(|token| {
-            let trimmed =
-                token.trim_matches(|character: char| "<>()[]{}.,;:!?\"'".contains(character));
-            if trimmed.contains('@')
-                && trimmed.split_once('@').is_some_and(|(local, domain)| {
-                    !local.is_empty() && domain.contains('.') && !domain.starts_with('.')
-                })
-            {
-                token.replacen(trimmed, REDACTED, 1)
-            } else {
-                token.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    map_tokens(text, |token| {
+        let trimmed = token.trim_matches(|c: char| "<>()[]{}.,;:!?\"'".contains(c));
+        if trimmed.contains('@')
+            && trimmed.split_once('@').is_some_and(|(local, domain)| {
+                !local.is_empty() && domain.contains('.') && !domain.starts_with('.')
+            })
+        {
+            token.replacen(trimmed, REDACTED, 1)
+        } else {
+            token.to_string()
+        }
+    })
 }
-
 fn redact_phone_numbers(text: &str) -> String {
-    text.split_whitespace()
-        .map(|token| {
-            let digits = token.chars().filter(char::is_ascii_digit).count();
-            if (10..=16).contains(&digits)
-                && token
-                    .chars()
-                    .all(|character| character.is_ascii_digit() || "+-(). ".contains(character))
-            {
-                REDACTED.to_string()
-            } else {
-                token.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    map_tokens(text, |token| {
+        let digits = token.chars().filter(char::is_ascii_digit).count();
+        if (10..=16).contains(&digits)
+            && token
+                .chars()
+                .all(|c| c.is_ascii_digit() || "+-(). ".contains(c))
+        {
+            REDACTED.to_string()
+        } else {
+            token.to_string()
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::{LocalResult, TimeZone};
+
+    #[test]
+    fn output_redaction_preserves_markdown_and_complete_secret_lines() {
+        let output = redact_sensitive_text(
+            "## Heading\n\n```rust\nlet count = 3;\n```\npassword: synthetic-value\nContact test@example.com\n",
+        );
+        assert!(output.contains("## Heading\n\n```rust\nlet count = 3;\n```"));
+        assert!(!output.contains("synthetic-value"));
+        assert!(!output.contains("test@example.com"));
+        assert!(output.contains("password:[REDACTED]\n"));
+    }
 
     fn local_time(year: i32, month: u32, day: u32, hour: u32) -> DateTime<Local> {
         match Local.with_ymd_and_hms(year, month, day, hour, 0, 0) {

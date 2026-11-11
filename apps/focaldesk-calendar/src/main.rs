@@ -25,9 +25,11 @@ struct Ui {
     state: Rc<RefCell<State>>,
     heading: gtk::Label,
     grid: gtk::Grid,
+    headers: gtk::Grid,
     sources: gtk::Box,
     status: gtk::Label,
     search: gtk::SearchEntry,
+    create: gtk::Button,
 }
 
 fn main() -> gtk::glib::ExitCode {
@@ -114,7 +116,10 @@ fn build_window(app: &gtk::Application) {
         .default_height(900)
         .build();
     window.add_css_class("focal-calendar");
+    let titlebar = gtk::HeaderBar::new();
+    window.set_titlebar(Some(&titlebar));
     let root = row(0);
+    root.add_css_class("calendar-content");
     let sidebar = column(22);
     sidebar.add_css_class("sidebar");
     sidebar.set_width_request(260);
@@ -162,6 +167,7 @@ fn build_window(app: &gtk::Application) {
     toolbar.append(&refresh);
     let create = gtk::Button::with_label("＋ Create event");
     create.add_css_class("suggested-action");
+    create.set_sensitive(false);
     toolbar.append(&create);
     main.append(&toolbar);
     let status = label("Connecting to calendar service…", "muted");
@@ -169,7 +175,9 @@ fn build_window(app: &gtk::Application) {
     status.set_margin_start(24);
     status.set_margin_bottom(12);
     main.append(&status);
-    let grid = gtk::Grid::builder().column_homogeneous(false).build();
+    let headers = gtk::Grid::new();
+    main.append(&headers);
+    let grid = gtk::Grid::new();
     let scroll = gtk::ScrolledWindow::builder()
         .hexpand(true)
         .vexpand(true)
@@ -191,9 +199,11 @@ fn build_window(app: &gtk::Application) {
         })),
         heading,
         grid,
+        headers,
         sources,
         status,
         search,
+        create: create.clone(),
     };
     for (button, days) in [(previous, -7), (next, 7)] {
         let ui = ui.clone();
@@ -289,6 +299,16 @@ impl Ui {
                                 ""
                             }
                         ));
+                        if ui.state.borrow().accounts.is_empty() {
+                            ui.status.set_text("Connect Google Calendar or Microsoft 365 using Manage connected accounts to load your schedule.");
+                        }
+                        ui.create.set_sensitive(
+                            ui.state
+                                .borrow()
+                                .accounts
+                                .iter()
+                                .any(|a| a.enabled && a.connected && !a.calendar_ids.is_empty()),
+                        );
                         ui.render_sources();
                         ui.render();
                     }
@@ -378,6 +398,9 @@ impl Ui {
     }
 
     fn render(&self) {
+        while let Some(child) = self.headers.first_child() {
+            self.headers.remove(&child);
+        }
         while let Some(child) = self.grid.first_child() {
             self.grid.remove(&child);
         }
@@ -390,17 +413,22 @@ impl Ui {
         ));
         let corner = label(&Local::now().format("%Z").to_string(), "muted");
         margins(&corner, 12);
-        self.grid.attach(&corner, 0, 0, 1, 1);
+        corner.set_width_request(72);
+        self.headers.attach(&corner, 0, 0, 1, 1);
         let times = gtk::Fixed::new();
         times.set_size_request(72, 24 * 64);
         for hour in 0..24 {
             let time = label(&format!("{:02}:00", hour), "time-label");
             times.put(&time, 12.0, f64::from(hour * 64));
         }
-        self.grid.attach(&times, 0, 2, 1, 1);
+        self.grid.attach(&times, 0, 0, 1, 1);
+        let time_width = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
+        time_width.add_widget(&corner);
+        time_width.add_widget(&times);
         let all_day_label = label("All day", "time-label");
         margins(&all_day_label, 8);
-        self.grid.attach(&all_day_label, 0, 1, 1, 1);
+        self.headers.attach(&all_day_label, 0, 1, 1, 1);
+        time_width.add_widget(&all_day_label);
         let query = self.search.text().to_lowercase();
         for day in 0..7 {
             let date = week + Duration::days(day);
@@ -409,7 +437,8 @@ impl Ui {
             if date == Local::now().date_naive() {
                 header.add_css_class("today");
             }
-            self.grid.attach(&header, day as i32 + 1, 0, 1, 1);
+            header.set_hexpand(true);
+            self.headers.attach(&header, day as i32 + 1, 0, 1, 1);
             let all_day_events = column(4);
             margins(&all_day_events, 4);
             for event in state.events.iter().filter(|event| {
@@ -429,7 +458,8 @@ impl Ui {
                 button.connect_clicked(move |_| ui.editor(Some(event.clone())));
                 all_day_events.append(&button);
             }
-            self.grid.attach(&all_day_events, day as i32 + 1, 1, 1, 1);
+            self.headers
+                .attach(&all_day_events, day as i32 + 1, 1, 1, 1);
             let canvas = gtk::Fixed::new();
             canvas.set_size_request(156, 24 * 64);
             canvas.set_hexpand(true);
@@ -509,7 +539,11 @@ impl Ui {
                     start as f64 / 60.0 * 64.0 + 2.0,
                 );
             }
-            self.grid.attach(&canvas, day as i32 + 1, 2, 1, 1);
+            let width_group = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
+            width_group.add_widget(&header);
+            width_group.add_widget(&all_day_events);
+            width_group.add_widget(&canvas);
+            self.grid.attach(&canvas, day as i32 + 1, 0, 1, 1);
         }
     }
 
@@ -527,6 +561,7 @@ impl Ui {
             .build();
         dialog.add_css_class("focal-calendar");
         let content = column(12);
+        content.add_css_class("calendar-content");
         margins(&content, 24);
         content.append(&label(
             if existing.is_some() {

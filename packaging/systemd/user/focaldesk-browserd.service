@@ -1,0 +1,18 @@
+[Unit]
+Description=FocalDesk Chromium browser automation service
+PartOf=focaldesk-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/focaldesk-browserd
+Restart=on-failure
+RestartSec=2
+Environment=FOCALDESK_BROWSER_SOCKET=%t/focaldesk/browser.sock
+EnvironmentFile=-%h/.config/focaldesk/browser.env
+KillSignal=SIGINT
+TimeoutStopSec=10
+UMask=0077
+LimitCORE=0
+
+[Install]
+WantedBy=focaldesk-session.target

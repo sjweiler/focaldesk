@@ -1,0 +1,25 @@
+groups:
+  - name: focaldesk-service-health
+    interval: 5s
+    rules:
+      - record: focaldesk_service_expected
+        expr: vector(1)
+        labels:
+          service_name: focaldesk-server
+      - record: focaldesk_service_expected
+        expr: vector(1)
+        labels:
+          service_name: focal-vector
+      - record: focaldesk_service_expected
+        expr: vector(1)
+        labels:
+          service_name: focaldesk-ai-console
+      - record: focaldesk_service_telemetry_fresh
+        expr: >-
+          (
+            (
+              ((time() - max by (service_name) (focaldesk_service_heartbeat_seconds)) >= bool 0)
+              * ((time() - max by (service_name) (focaldesk_service_heartbeat_seconds)) < bool 20)
+            ) and on (service_name) focaldesk_service_expected
+            or on (service_name) (focaldesk_service_expected * 0)
+          ) * on () group_left () (max(up{job="focaldesk"}) or vector(0))

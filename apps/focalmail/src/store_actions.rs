@@ -83,6 +83,7 @@ impl Store {
             "full_sync_state",
             "mail_sync_progress",
             "mail_pending_moves",
+            "mail_signatures",
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE account=?1"), [account])?;
         }

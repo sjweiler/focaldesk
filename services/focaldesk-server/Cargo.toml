@@ -10,6 +10,7 @@ name = "focaldesk-server"
 path = "src/main.rs"
 
 [dependencies]
+focaldesk-browserd = { path = "../focaldesk-browserd", default-features = false }
 focaldesk-ai = { path = "../../crates/focaldesk-ai" }
 focaldesk-memory = { path = "../../crates/focaldesk-memory" }
 focaldesk-ipc = { path = "../../crates/focaldesk-ipc" }

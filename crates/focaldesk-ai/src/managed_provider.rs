@@ -81,6 +81,8 @@ impl AiProvider for ManagedProvider {
         self.inner.info()
     }
 
+    async fn warm_up(&self) -> Result<()> { self.inner.warm_up().await }
+
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
         let info = self.info();
         let mut telemetry = TelemetryRequest::new(info.id, 0, self.telemetry.clone());
@@ -133,59 +135,13 @@ impl AiProvider for ManagedProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let info = self.info();
-        let mut telemetry =
-            TelemetryRequest::new(info.id, request_size(&request), self.telemetry.clone());
-        let deadline = tokio::time::Instant::now() + self.policy.overall_timeout;
-
-        for attempt in 1..=self.policy.max_attempts {
-            let result = timeout_at(deadline, self.inner.chat(request.clone())).await;
-            match result {
-                Ok(Ok(response)) => {
-                    telemetry.success(response.content.len(), response.usage);
-                    return Ok(response);
-                }
-                Ok(Err(error)) => {
-                    let classification = provider_error(&error);
-                    let retryable = classification.is_some_and(|error| error.kind.is_retryable());
-                    if retryable && attempt < self.policy.max_attempts {
-                        telemetry.retry();
-                        let retry_after = classification.and_then(|error| error.retry_after);
-                        if timeout_at(deadline, self.retry_delay(attempt, retry_after))
-                            .await
-                            .is_err()
-                        {
-                            telemetry.timeout();
-                            return Err(ProviderError::new(
-                                ProviderErrorKind::Timeout,
-                                format!(
-                                    "AI provider timed out after {} seconds",
-                                    self.policy.overall_timeout.as_secs()
-                                ),
-                            )
-                            .into());
-                        }
-                        continue;
-                    }
-                    telemetry.failure(&error);
-                    return Err(error);
-                }
-                Err(_) => {
-                    telemetry.timeout();
-                    return Err(ProviderError::new(
-                        ProviderErrorKind::Timeout,
-                        format!(
-                            "AI provider timed out after {} seconds",
-                            self.policy.overall_timeout.as_secs()
-                        ),
-                    )
-                    .into());
-                }
-            }
-        }
-        unreachable!("retry loop always returns")
+        self.chat_with_mode(request, false).await
+    }
+    async fn chat_json(&self, request: ChatRequest) -> Result<ChatResponse> {
+        self.chat_with_mode(request, true).await
     }
 
+    #[tracing::instrument(name = "ai.inference.stream", target = "focaldesk.telemetry", skip_all, fields(otel.status_code, outcome, ollama.model_load_seconds, ollama.prompt_eval_seconds, ollama.generation_seconds, ollama.output_tokens))]
     async fn chat_stream(
         &self,
         request: ChatRequest,
@@ -194,6 +150,7 @@ impl AiProvider for ManagedProvider {
         let info = self.info();
         let mut telemetry =
             TelemetryRequest::new(info.id, request_size(&request), self.telemetry.clone());
+        telemetry.stream = Some(focaldesk_logging::metrics::Stream::start());
         let deadline = tokio::time::Instant::now() + self.policy.overall_timeout;
         let mut emitted_delta = false;
 
@@ -207,6 +164,7 @@ impl AiProvider for ManagedProvider {
                     result = &mut future => break result,
                     delta = attempt_rx.recv() => {
                         if let Some(delta) = delta {
+                            if let Some(stream) = &mut telemetry.stream { stream.content(!delta.is_empty()); }
                             emitted_delta = true;
                             deltas.send(delta).await
                                 .map_err(|_| anyhow!("AI stream consumer disconnected"))?;
@@ -223,6 +181,7 @@ impl AiProvider for ManagedProvider {
             };
 
             while let Ok(delta) = attempt_rx.try_recv() {
+                if let Some(stream) = &mut telemetry.stream { stream.content(!delta.is_empty()); }
                 emitted_delta = true;
                 deltas
                     .send(delta)
@@ -268,6 +227,8 @@ impl AiProvider for ManagedProvider {
 }
 
 struct TelemetryRequest {
+    stream: Option<focaldesk_logging::metrics::Stream>,
+    operation: focaldesk_logging::metrics::Operation,
     provider: String,
     telemetry: Arc<Mutex<BTreeMap<String, ProviderTelemetry>>>,
     started: Instant,
@@ -285,6 +246,8 @@ impl TelemetryRequest {
             entry.input_bytes = entry.input_bytes.saturating_add(input_bytes as u64);
         });
         Self {
+            stream: None,
+            operation: focaldesk_logging::metrics::Operation::start(focaldesk_logging::metrics::Stage::Inference),
             provider,
             telemetry,
             started: Instant::now(),
@@ -299,6 +262,10 @@ impl TelemetryRequest {
     }
 
     fn success(&mut self, output_bytes: usize, usage: Option<crate::types::TokenUsage>) {
+        if let Some(stream) = &mut self.stream { stream.finish(usage.map(|u| u.output_tokens)); }
+        self.operation.finish(focaldesk_logging::metrics::Outcome::Ok);
+        tracing::Span::current().record("outcome", "ok");
+        tracing::Span::current().record("otel.status_code", "OK");
         self.finish(|entry, latency_ms| {
             entry.successes = entry.successes.saturating_add(1);
             entry.output_bytes = entry.output_bytes.saturating_add(output_bytes as u64);
@@ -313,6 +280,9 @@ impl TelemetryRequest {
     }
 
     fn failure(&mut self, error: &anyhow::Error) {
+        self.operation.finish(focaldesk_logging::metrics::Outcome::Error);
+        tracing::Span::current().record("outcome", "error");
+        tracing::Span::current().record("otel.status_code", "ERROR");
         let message = provider_error(error)
             .map(|error| format!("{:?} provider failure", error.kind))
             .unwrap_or_else(|| "provider request failed".to_string());
@@ -325,6 +295,9 @@ impl TelemetryRequest {
     }
 
     fn timeout(&mut self) {
+        self.operation.finish(focaldesk_logging::metrics::Outcome::Timeout);
+        tracing::Span::current().record("outcome", "timeout");
+        tracing::Span::current().record("otel.status_code", "ERROR");
         self.finish(|entry, latency_ms| {
             entry.failures = entry.failures.saturating_add(1);
             entry.timeouts = entry.timeouts.saturating_add(1);
@@ -615,5 +588,69 @@ mod tests {
         assert_eq!(snapshot.failures, 1);
         assert_eq!(snapshot.timeouts, 1);
         assert_eq!(snapshot.cancellations, 0);
+    }
+}
+
+impl ManagedProvider {
+    #[tracing::instrument(name = "ai.inference", target = "focaldesk.telemetry", skip_all, fields(otel.status_code, outcome, ollama.model_load_seconds, ollama.prompt_eval_seconds, ollama.generation_seconds, ollama.output_tokens))]
+    async fn chat_with_mode(&self, request: ChatRequest, json_mode: bool) -> Result<ChatResponse> {
+        let info = self.info();
+        let mut telemetry =
+            TelemetryRequest::new(info.id, request_size(&request), self.telemetry.clone());
+        let deadline = tokio::time::Instant::now() + self.policy.overall_timeout;
+
+        for attempt in 1..=self.policy.max_attempts {
+            let operation = async {
+                if json_mode {
+                    self.inner.chat_json(request.clone()).await
+                } else {
+                    self.inner.chat(request.clone()).await
+                }
+            };
+            let result = timeout_at(deadline, operation).await;
+            match result {
+                Ok(Ok(response)) => {
+                    telemetry.success(response.content.len(), response.usage);
+                    return Ok(response);
+                }
+                Ok(Err(error)) => {
+                    let classification = provider_error(&error);
+                    let retryable = classification.is_some_and(|error| error.kind.is_retryable());
+                    if retryable && attempt < self.policy.max_attempts {
+                        telemetry.retry();
+                        let retry_after = classification.and_then(|error| error.retry_after);
+                        if timeout_at(deadline, self.retry_delay(attempt, retry_after))
+                            .await
+                            .is_err()
+                        {
+                            telemetry.timeout();
+                            return Err(ProviderError::new(
+                                ProviderErrorKind::Timeout,
+                                format!(
+                                    "AI provider timed out after {} seconds",
+                                    self.policy.overall_timeout.as_secs()
+                                ),
+                            )
+                            .into());
+                        }
+                        continue;
+                    }
+                    telemetry.failure(&error);
+                    return Err(error);
+                }
+                Err(_) => {
+                    telemetry.timeout();
+                    return Err(ProviderError::new(
+                        ProviderErrorKind::Timeout,
+                        format!(
+                            "AI provider timed out after {} seconds",
+                            self.policy.overall_timeout.as_secs()
+                        ),
+                    )
+                    .into());
+                }
+            }
+        }
+        unreachable!("retry loop always returns")
     }
 }

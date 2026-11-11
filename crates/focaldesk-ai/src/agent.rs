@@ -265,7 +265,7 @@ impl Agent {
             bail!("no agent tools are available");
         }
         let planning = provider
-            .chat(ChatRequest {
+            .chat_json(ChatRequest {
                 provider: request.provider.clone(),
                 model: request.model.clone(),
                 messages: vec![
@@ -279,6 +279,7 @@ impl Agent {
                 temperature: Some(0.0),
                 max_tokens: Some(definition.max_output_tokens),
                 use_memory: false,
+                memory_sources: None,
             })
             .await
             .context("agent dry-run planning request failed")?;
@@ -321,7 +322,7 @@ impl Agent {
         }
 
         let planning = provider
-            .chat(ChatRequest {
+            .chat_json(ChatRequest {
                 provider: request.provider.clone(),
                 model: request.model.clone(),
                 messages: vec![
@@ -335,6 +336,7 @@ impl Agent {
                 temperature: Some(0.0),
                 max_tokens: Some(max_output_tokens),
                 use_memory: false,
+                memory_sources: None,
             })
             .await
             .context("agent planning request failed")?;
@@ -398,6 +400,7 @@ impl Agent {
                 temperature: Some(0.0),
                 max_tokens: Some(max_output_tokens),
                 use_memory: false,
+                memory_sources: None,
             })
             .await
             .context("agent synthesis request failed")?;
@@ -484,7 +487,7 @@ impl Agent {
         for iteration in context.results.len() + 1..=max_steps {
             emit(events, AgentRunEventKind::Planning { iteration });
             let planning = provider
-                .chat(ChatRequest {
+                .chat_json(ChatRequest {
                     provider: request.provider.clone(),
                     model: request.model.clone(),
                     messages: vec![
@@ -500,6 +503,7 @@ impl Agent {
                     temperature: Some(0.0),
                     max_tokens: Some(max_output_tokens),
                     use_memory: false,
+                    memory_sources: None,
                 })
                 .await
                 .context("agent planning request failed")?;
@@ -594,6 +598,7 @@ impl Agent {
                 temperature: Some(0.0),
                 max_tokens: Some(max_output_tokens),
                 use_memory: false,
+                memory_sources: None,
             })
             .await
             .context("agent synthesis request failed")?;

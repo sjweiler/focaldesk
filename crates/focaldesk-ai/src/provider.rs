@@ -96,9 +96,18 @@ pub fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 pub trait AiProvider: Send + Sync {
     fn info(&self) -> ProviderInfo;
 
+    /// Optionally preload a local model without producing a chat answer.
+    async fn warm_up(&self) -> Result<()> { Ok(()) }
+
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>>;
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse>;
+
+    /// Structured planning output. Providers may constrain generation to JSON;
+    /// the planner still validates tool names, arguments and mutation policy.
+    async fn chat_json(&self, request: ChatRequest) -> Result<ChatResponse> {
+        self.chat(request).await
+    }
 
     /// Stream response text when supported. Providers without a native
     /// streaming transport retain compatibility by emitting one complete

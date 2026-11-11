@@ -100,6 +100,23 @@ headers and flags; opening a message fetches its body and attachments, which the
 remain available offline. Gmail and Microsoft cache message content during sync
 and retrieve additional attachment content when needed.
 
+## Formatted messages and signatures
+
+The composer supports bold, italic, lists, HTTP/HTTPS links, and undo/redo.
+Pasted HTML is reduced to basic formatting; scripts, remote images, embedded
+content, and custom styles are removed. Sending includes both plain text and
+HTML using the same MIME path for Gmail, Microsoft 365, and SMTP, including
+attachments and reply headers. Existing plain-text drafts remain readable;
+editing and saving a draft preserves its HTML locally.
+
+Under **Settings → Connected accounts → Signature**, edit each account's
+formatted signature and choose whether to insert it into new messages and/or
+replies and forwards. Signatures start disabled. Inserted signatures are editable
+in the composer. Switching the From account replaces the automatic signature
+while preserving the message. Reopening a saved draft does not insert another
+signature. Removing an account clears its signature settings while retaining
+its local drafts.
+
 ## Connect Gmail
 
 1. In your Google Cloud project, enable the **Gmail API**.
@@ -123,7 +140,7 @@ with **Reconnect**. This opens browser sign-in using the account’s existing
 keyring configuration; importing the JSON again is unnecessary. Signing in as a
 different Google account is rejected before replacing the selected credentials.
 
-- **Google / Gmail:** Gmail REST API with OAuth 2.0; mailbox synchronization, message actions, and plain-text sending.
+- **Google / Gmail:** Gmail REST API with OAuth 2.0; mailbox synchronization, message actions, and MIME sending.
 - **Microsoft 365 / Outlook:** Microsoft Graph REST API with device-code OAuth, mailbox sync, read/star/archive/Trash actions, MIME sending, replies and attachments. Refresh authorization stays in Secret Service.
 - **Other mail server:** IMAP incoming and SMTP outgoing with password/app-password authentication. Both connections require verified SSL/TLS or STARTTLS. POP3 and generic IMAP OAuth remain configuration-only.
 

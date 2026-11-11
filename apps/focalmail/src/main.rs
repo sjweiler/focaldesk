@@ -1,6 +1,7 @@
 #![cfg_attr(not(feature = "desktop"), allow(dead_code))]
 mod attachments;
 mod bulk;
+mod compose;
 mod drafts;
 #[path = "gmail.rs"]
 mod gmail_backend;

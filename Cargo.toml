@@ -28,6 +28,7 @@ members = [
     
 
     # apps
+    "apps/focaldesk-ai-console3/src-tauri",
     "apps/focaldesk-calendar",
     "apps/focalmail",
     "apps/focaldesk-automation-studio",
@@ -46,6 +47,7 @@ members = [
     "services/focaldesk-remoted",
     "services/focaldesk-recorder",
     "services/focaldesk-server",
+    "services/focaldesk-browserd",
     "services/focaldesk-ai-registry",
     "services/focaldesk-powerd",
     "services/focaldesk-notificationsd",

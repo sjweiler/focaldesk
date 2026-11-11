@@ -142,3 +142,10 @@ dialog { background: var(--fd-surface); color: var(--fd-text); border: 1px solid
 #account-signin-code { font: 700 28px monospace; letter-spacing: .18em; text-align: center; padding: 18px; }
 #account-signin .actions { margin-top: 18px; }
 #account-signin-status { line-height: 1.6; overflow-wrap: anywhere; }
+
+.rich-editor { background: #0f1620; color: var(--fd-text); border: 1px solid #344459; border-radius: 6px; padding: 12px; min-height: 160px; max-height: 38vh; overflow: auto; overflow-wrap: anywhere; line-height: 1.65; margin: 12px 0; white-space: pre-wrap; }
+#body.rich-editor { min-height: 260px; }
+.rich-editor a { color: var(--fd-accent-bright); }
+.format-toolbar { display: flex; flex-wrap: wrap; gap: 5px; }
+.format-toolbar button { padding: 5px 9px; font-size: 12px; }
+.rich-editor:focus-visible { outline: 2px solid var(--fd-accent-bright); }

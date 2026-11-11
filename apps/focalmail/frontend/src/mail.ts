@@ -1,8 +1,10 @@
+import {cleanHtml,textHtml,plainText,setupEditor} from './compose';
 import {icon,type IconName} from './icons';
 import {createMailFrame} from './frame';
 import {dateLabels} from './dates';
-import type {Message,Draft,DraftFile,DraftRecord,Snapshot,Action,AccountStatus,SyncHistory,DeviceAuthorization,MailTarget,BulkOutcome} from './types';
+import type {Signature,Message,Draft,DraftFile,DraftRecord,Snapshot,Action,AccountStatus,SyncHistory,DeviceAuthorization,MailTarget,BulkOutcome} from './types';
 interface Responses {
+ signature:Signature;set_signature:null;
  bulk_modify:BulkOutcome;remove_account:string;set_sync_history:string;account_authorization:DeviceAuthorization|null;
  sync_status:AccountStatus[];pause_sync:string;remote_images:{index:number;data_url:string|null;error:string|null}[];
  snapshot:Snapshot;mailbox:{messages:Message[];total:number;page_size:number};cached_message:Message;content:Message;
@@ -31,6 +33,7 @@ const messageKey=(m:Message)=>JSON.stringify([m.account,m.id]);
 let disposed=false,interval:number|undefined,unlisten:(()=>void)|undefined;
 let progressListenersReady:Promise<void>|null=null,signInActive=false,signInExpired=false,signInCancelling=false;
 let signInExpiresAt=0,signInTimer:number|undefined,signInBrowserUrl='';
+let signatureAccount='';
 let draft:Draft|null=null,draftFiles:DraftFile[]=[],pendingLink='',busy=false,dirty=false;
 let offset=0, total=0, pageSize=100, viewRevision=0, renderedViewRevision=-1;
 let saveTimer:number|undefined,saving:Promise<unknown>=Promise.resolve(),loading=false;
@@ -426,9 +429,11 @@ async function removeAccount(){
 
 function readDraft() {
   if(!draft)return;
-  for (const key of ['from','to','cc','subject','body'] as const) draft[key]=$<HTMLInputElement>(key).value;
+  for (const key of ['from','to','cc','subject'] as const) draft[key]=$<HTMLInputElement>(key).value;
+  draft.body=plainText($('body'));draft.html_body=cleanHtml($('body').innerHTML);
 }
 async function flush() {
+  await senderChange;
   clearTimeout(saveTimer);
   if(draft && dirty) {
     readDraft(); const record=structuredClone(draft);dirty=false;
@@ -440,7 +445,8 @@ async function openDraft(record:DraftRecord) {
   draft=record.draft;draftFiles=record.files;dirty=false;
   $('from').replaceChildren(...snapshot.accounts.map(a=>{const o=el('option',a);o.value=a;return o;}));
   if(!snapshot.accounts.includes(draft.from)){const placeholder=el('option','Choose a connected sender');placeholder.value='';$('from').prepend(placeholder);}
-  for(const key of ['from','to','cc','subject','body'] as const)$<HTMLInputElement>(key).value=key==='from'&&!snapshot.accounts.includes(draft.from)?'':draft[key];
+  for(const key of ['from','to','cc','subject'] as const)$<HTMLInputElement>(key).value=key==='from'&&!snapshot.accounts.includes(draft.from)?'':draft[key];
+  $('body').innerHTML=cleanHtml(draft.html_body??textHtml(draft.body));
   $('save-status').textContent='Saved locally';renderDraftFiles();
   if(!$<HTMLDialogElement>('composer').open)$<HTMLDialogElement>('composer').showModal();
 }
@@ -460,7 +466,11 @@ function renderDraftFiles() {
 }
 async function compose(kind='new') {
   await flush();
-  await operation(async()=>openDraft(await api('new_draft',{kind,account:selected?.account||'',id:selected?.id||''})));
+  await operation(async()=>{
+    const record=await api('new_draft',{kind,account:selected?.account||'',id:selected?.id||''});
+    await openDraft(record);
+    if(!draft!.signature_initialized){await applySignature(false);draft!.signature_initialized=true;draftChanged();await flush();}
+  });
 }
 function previewLink(url:string) {pendingLink=url;$('link-url').textContent=url;$<HTMLDialogElement>('link-preview').showModal();}
 function providerFields() {
@@ -478,6 +488,7 @@ function renderAccounts() {
       for(const key of ['provider','email','client_id','tenant','username','host','port','security','smtp_host','smtp_port','smtp_security','microsoft_sign_in'])$<HTMLInputElement>(mapping[key as keyof typeof mapping]||key).value=String(profile[key]);
       $<HTMLInputElement>('copy-sent').checked=Boolean(profile.smtp_copy_to_sent);providerFields();
     })));
+    row.append(button('Signature',()=>editSignature(a)));
     row.append(button('Remove',()=>confirmRemoval(a),'danger-text'));
     const accountStatus=snapshot.status?.find(s=>s.email===a);
     const historyLabel=el('label','Keep mail available offline');
@@ -536,14 +547,55 @@ $('mark-read').onclick=()=>safely(()=>selected && modify({Read:selected.unread})
 $('close-settings').onclick=()=>$<HTMLDialogElement>('preferences').close();
 $('provider').onchange=providerFields;
 $('notifications').onchange=()=>safely(()=>api('notifications',{enabled:$<HTMLInputElement>('notifications').checked}));
-for(const key of ['from','to','cc','subject','body'])$(key).addEventListener('input',()=>{
+function draftChanged(){
   dirty=true;$('save-status').textContent='Saving…';clearTimeout(saveTimer);saveTimer=setTimeout(()=>safely(flush),500);
+}
+for(const key of ['to','cc','subject'])$(key).addEventListener('input',draftChanged);
+setupEditor($('body'),$('compose-toolbar'),draftChanged);
+setupEditor($('signature-editor'),$('signature-toolbar'),()=>{$('signature-status').textContent='';});
+let senderChange:Promise<void>=Promise.resolve();
+$('from').addEventListener('change',()=>{
+  const account=$<HTMLSelectElement>('from').value;
+  senderChange=senderChange.catch(()=>{}).then(async()=>{
+    await applySignature(true,account);draftChanged();
+  });
+  safely(()=>senderChange);
+});
+async function applySignature(replace:boolean,account=$<HTMLSelectElement>('from').value){
+  if(!draft||!account)return;
+  const currentDraft=draft;
+  const signature=await api('signature',{account});
+  if(draft!==currentDraft)return;
+  const editor=$('body');
+  if(replace)editor.querySelectorAll('[data-focal-signature]').forEach(node=>node.remove());
+  const reply=!!draft.reply_account||!!draft.forward;
+  if(signature && (reply?signature.replies_forwards:signature.new_messages) && signature.html){
+    const block=el('div');block.dataset.focalSignature='true';block.innerHTML=cleanHtml(signature.html);
+    block.prepend(el('br'));block.append(el('br'));
+    if(reply)editor.prepend(block);else editor.append(block);
+  }
+  draft.signature_initialized=true;
+}
+async function editSignature(account:string){
+ const signature=await api('signature',{account});signatureAccount=account;
+ $('signature-account').textContent=account;
+ $('signature-editor').innerHTML=cleanHtml(signature.html);
+ $<HTMLInputElement>('signature-new').checked=signature.new_messages;
+ $<HTMLInputElement>('signature-replies').checked=signature.replies_forwards;
+ $('signature-status').textContent='';$<HTMLDialogElement>('signature-settings').showModal();
+}
+$('close-signature').onclick=()=>$<HTMLDialogElement>('signature-settings').close();
+$('save-signature').onclick=()=>safely(async()=>{
+ try{
+  await api('set_signature',{account:signatureAccount,signature:{html:cleanHtml($('signature-editor').innerHTML),new_messages:$<HTMLInputElement>('signature-new').checked,replies_forwards:$<HTMLInputElement>('signature-replies').checked}});
+  $<HTMLDialogElement>('signature-settings').close();
+ }catch(error){$('signature-status').textContent=String(error);}
 });
 async function closeComposer(){await flush();$<HTMLDialogElement>('composer').close();await reload();}
 $('close-compose').onclick=()=>safely(closeComposer);
 $('composer').addEventListener('cancel',e=>{e.preventDefault();if(!busy)safely(closeComposer);});
 $('draft-form').onsubmit=e=>{e.preventDefault();safely(async()=>{
-  await flush(); await operation(async()=>{const result=await api('send',{id:draft!.id});draft=null;dirty=false;$<HTMLDialogElement>('composer').close();return result;});
+  await senderChange;await flush(); await operation(async()=>{const result=await api('send',{id:draft!.id});draft=null;dirty=false;$<HTMLDialogElement>('composer').close();return result;});
 });};
 $('discard').onclick=()=>safely(async()=>{await flush();await api('delete_draft',{id:draft!.id});draft=null;dirty=false;$<HTMLDialogElement>('composer').close();await reload();});
 $('attachment').onchange=()=>safely(async()=>{

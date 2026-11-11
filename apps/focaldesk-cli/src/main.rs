@@ -20,6 +20,8 @@ use std::path::PathBuf;
 use zeroize::Zeroizing;
 
 fn main() -> anyhow::Result<()> {
+    let _telemetry = focaldesk_logging::telemetry::init("focaldesk-cli")
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let mut args = std::env::args().skip(1);
     let Some(command) = args.next() else {
         print_usage();

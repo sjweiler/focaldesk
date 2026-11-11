@@ -4,17 +4,17 @@ window.focal-calendar { background: #1d1f21; color: #eceef2; }
 .focal-calendar .eyebrow { font-size: 10px; font-weight: 700; letter-spacing: 1px; color: #8f949b; }
 .focal-calendar .month-title { font-size: 23px; font-weight: 700; }
 .focal-calendar .muted { font-size: 12px; color: #a0a6af; }
-.focal-calendar button { background: #2b2e32; color: #f1f2f4; border: 1px solid #3b3e43; border-radius: 8px; padding: 7px 10px; box-shadow: none; }
-.focal-calendar button:hover { background: #373b41; }
-.focal-calendar button.suggested-action { background: #ff7a29; color: #fff; border-color: #ff914b; font-weight: 700; }
+.calendar-content button { background: #2b2e32; color: #f1f2f4; border: 1px solid #3b3e43; border-radius: 8px; padding: 7px 10px; box-shadow: none; }
+.calendar-content button:hover { background: #373b41; }
+.calendar-content button.suggested-action { background: #ff7a29; color: #fff; border-color: #ff914b; font-weight: 700; }
 .focal-calendar .day-heading { font-size: 14px; color: #bec3ca; }
 .focal-calendar .today { color: #ff8b45; font-weight: 800; }
 .focal-calendar .day-column { border-left: 1px solid #303337; }
 .focal-calendar separator { background: #303337; min-height: 1px; }
 .focal-calendar .time-label { font-size: 11px; color: #89909a; }
-.focal-calendar button.event { padding: 0; border-radius: 8px; }
-.focal-calendar button.google-event { background: #23385d; border-color: #3d64a2; }
-.focal-calendar button.microsoft-event { background: #194d52; border-color: #32838b; }
+.calendar-content button.event { padding: 0; border-radius: 8px; }
+.calendar-content button.google-event { background: #23385d; border-color: #3d64a2; }
+.calendar-content button.microsoft-event { background: #194d52; border-color: #32838b; }
 .focal-calendar .event-time { font-size: 10px; font-weight: 600; }
 .focal-calendar .event-title { font-size: 12px; font-weight: 700; }
 .focal-calendar entry, .focal-calendar textview text, .focal-calendar textview { background: #282b2f; color: #f0f1f3; }

@@ -477,11 +477,23 @@ fn mutate(client: &Client, token: &str, id: &str, action: Action, api: &str) -> 
     Ok(())
 }
 
+#[cfg(test)]
 fn raw_message(
     from: &str,
     to: &str,
     subject: &str,
     body: &str,
+    attachments: &[DraftAttachment],
+) -> Result<String> {
+    raw_message_html(from, to, subject, body, None, attachments)
+}
+
+fn raw_message_html(
+    from: &str,
+    to: &str,
+    subject: &str,
+    body: &str,
+    html: Option<&str>,
     attachments: &[DraftAttachment],
 ) -> Result<String> {
     for value in [from, to, subject] {
@@ -514,11 +526,30 @@ fn raw_message(
     let headers = format!(
         "From: {from}\r\nTo: {to}\r\nSubject: =?UTF-8?B?{subject}?=\r\nMIME-Version: 1.0\r\n"
     );
+    let plain = format!("Content-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n{wrapped}\r\n");
+    let content = if let Some(html) = html {
+        anyhow::ensure!(
+            html.len() <= 1024 * 1024,
+            "Message HTML may be at most 1 MiB"
+        );
+        let html = crate::compose::sanitize(html);
+        let encoded = STANDARD.encode(html.as_bytes());
+        let encoded = encoded
+            .as_bytes()
+            .chunks(76)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        let boundary = format!("focalmail-alt-{}", random());
+        format!("Content-Type: multipart/alternative; boundary=\"{boundary}\"\r\n\r\n--{boundary}\r\n{plain}--{boundary}\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n{encoded}\r\n--{boundary}--\r\n")
+    } else {
+        plain
+    };
     if attachments.is_empty() {
-        return Ok(URL_SAFE_NO_PAD.encode(format!("{headers}Content-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n{wrapped}\r\n")));
+        return Ok(URL_SAFE_NO_PAD.encode(format!("{headers}{content}")));
     }
     let boundary = format!("focalmail-{}", random());
-    let mut mime = format!("{headers}Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n--{boundary}\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n{wrapped}\r\n");
+    let mut mime = format!("{headers}Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n--{boundary}\r\n{content}");
     for attachment in attachments {
         // RFC 2231 percent encoding prevents filename/header injection and preserves Unicode.
         let name = crate::attachments::filename(&attachment.name)
@@ -584,7 +615,14 @@ pub(crate) fn draft_message(
             "Enter valid Cc addresses"
         );
     }
-    let raw = raw_message(&draft.from, &draft.to, &draft.subject, &draft.body, files)?;
+    let raw = raw_message_html(
+        &draft.from,
+        &draft.to,
+        &draft.subject,
+        &draft.body,
+        draft.html_body.as_deref(),
+        files,
+    )?;
     let mut headers = String::new();
     if !draft.cc.is_empty() {
         headers.push_str(&format!("Cc: {}\r\n", draft.cc));

@@ -19,6 +19,13 @@ struct State {
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Request {
     Snapshot,
+    Signature {
+        account: String,
+    },
+    SetSignature {
+        account: String,
+        signature: crate::compose::Signature,
+    },
     SyncStatus,
     AccountAuthorization,
     PauseSync,
@@ -227,6 +234,13 @@ fn execute(request: Request, state: &State, app: &tauri::AppHandle) -> Result<Va
             store::Store::open()?.save_local_draft(&draft, Some(&[]))?;
             draft_value(&draft.id)?
         }
+        Request::Signature { account } => {
+            serde_json::to_value(store::Store::open()?.signature(&account)?)?
+        }
+        Request::SetSignature { account, signature } => {
+            store::Store::open()?.set_signature(&account, &signature)?;
+            Value::Null
+        }
         Request::LoadDraft { id } => draft_value(&id)?,
         Request::SaveDraft { draft } => {
             anyhow::ensure!(
@@ -300,6 +314,8 @@ async fn mail_request(
                 | Request::Mailbox { .. }
                 | Request::CachedMessage { .. }
                 | Request::AccountProfile { .. }
+                | Request::Signature { .. }
+                | Request::SetSignature { .. }
                 | Request::LoadDraft { .. }
         ) {
             return execute(request, &state, &app).map_err(|e| format!("{e:#}"));

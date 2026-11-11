@@ -312,6 +312,43 @@ fn apply_launch_environment(context: &impl IsA<gio::AppLaunchContext>, force_x11
     }
 }
 
+fn launch_desktop_file(path: &std::path::Path, force_x11: bool) -> Result<(), glib::Error> {
+    let mut command = Command::new("gio");
+    command.arg("launch").arg(path);
+    if force_x11 {
+        command.env_remove("WAYLAND_DISPLAY");
+    }
+    let output = command
+        .output()
+        .map_err(|err| glib::Error::new(gio::IOErrorEnum::Failed, &err.to_string()))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let message = String::from_utf8_lossy(&output.stderr);
+        Err(glib::Error::new(
+            gio::IOErrorEnum::Failed,
+            &format!("gio launch failed ({}): {}", output.status, message.trim()),
+        ))
+    }
+}
+
+fn launch_file(
+    file: &gio::File,
+    context: &impl IsA<gio::AppLaunchContext>,
+) -> Result<(), glib::Error> {
+    if let Some(path) = file.path() {
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "desktop")
+        {
+            let force_x11 = gio::DesktopAppInfo::from_filename(&path)
+                .is_some_and(|info| app_targets_exe(info.upcast_ref()));
+            return launch_desktop_file(&path, force_x11);
+        }
+    }
+    gio::AppInfo::launch_default_for_uri(&file.uri(), Some(context))
+}
+
 fn app_targets_exe(info: &gio::AppInfo) -> bool {
     let desktop = info.clone().downcast::<gio::DesktopAppInfo>().ok();
     desktop
@@ -367,7 +404,14 @@ fn app_button(
         let context =
             gtk::prelude::WidgetExt::display(&window_for_launch).app_launch_context();
         apply_launch_environment(&context, app_targets_exe(&info));
-        if let Err(err) = info.launch(&[], Some(&context)) {
+        let result = info
+            .clone()
+            .downcast::<gio::DesktopAppInfo>()
+            .ok()
+            .and_then(|desktop| desktop.filename())
+            .map(|path| launch_desktop_file(&path, app_targets_exe(&info)))
+            .unwrap_or_else(|| info.launch(&[], Some(&context)));
+        if let Err(err) = result {
             warn!(app = %info.display_name(), %err, "focaldesk-launcher: failed to launch desktop app");
             toasts_for_launch.show(
                 StateKind::Error,
@@ -518,12 +562,12 @@ fn favorite_file_button(
                 let context =
                     gtk::prelude::WidgetExt::display(&window_for_launch).app_launch_context();
                 apply_launch_environment(&context, false);
-                gio::AppInfo::launch_default_for_uri(&file.uri(), Some(&context))
+                launch_file(&file, &context)
             }
         } else {
             let context = gtk::prelude::WidgetExt::display(&window_for_launch).app_launch_context();
             apply_launch_environment(&context, file_requires_x11(&file));
-            gio::AppInfo::launch_default_for_uri(&file.uri(), Some(&context))
+            launch_file(&file, &context)
         };
 
         match result {
@@ -690,14 +734,12 @@ fn search_file_button(
             } else {
                 let context = gtk::prelude::WidgetExt::display(&window).app_launch_context();
                 apply_launch_environment(&context, false);
-                gio::AppInfo::launch_default_for_uri(&file.file.uri(), Some(&context))
-                    .map_err(|error| error.to_string())
+                launch_file(&file.file, &context).map_err(|error| error.to_string())
             }
         } else {
             let context = gtk::prelude::WidgetExt::display(&window).app_launch_context();
             apply_launch_environment(&context, file_requires_x11(&file.file));
-            gio::AppInfo::launch_default_for_uri(&file.file.uri(), Some(&context))
-                .map_err(|error| error.to_string())
+            launch_file(&file.file, &context).map_err(|error| error.to_string())
         };
         match result {
             Ok(()) => {

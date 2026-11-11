@@ -34,7 +34,7 @@ test('mailbox, safe rendering, drafts and send failures in the browser', async t
   await cdp('Emulation.setTimezoneOverride',{timezoneId:'America/New_York'});
   await cdp('Emulation.setLocaleOverride',{locale:'en-US'});
   await cdp('Page.addScriptToEvaluateOnNewDocument',{source:`
-    window.accounts=['me@example.com','work@example.com'];window.bulkPartial=false;window.calls=[];window.failSend=false;window.saved=[];window.mailboxSize=1;window.resolveSync=null;window.previewMessages=null;
+    window.signatures={};window.accounts=['me@example.com','work@example.com'];window.bulkPartial=false;window.calls=[];window.failSend=false;window.saved=[];window.mailboxSize=1;window.resolveSync=null;window.previewMessages=null;
     window.mail={id:'one',account:'me@example.com',sender:'<img src=x onerror=alert(1)>',email:'sender@example.com',subject:'<script>evil()</script>',body:'Offline body',date:'Today',folder:'Inbox',labels:['INBOX','SENT'],unread:true,flagged:false,timestamp:1,html_loaded:true,attachments_loaded:true,attachments:[],html:{blocks:[{spans:[{text:'<img src="https://tracker.invalid">',bold:true},{text:'Read more',link:'https://example.com/path'}]}],blocked_images:1,limited:false}};
     window.statuses=[{email:'me@example.com',provider:'gmail',state:'connected',detail:'',cached_count:1},{email:'work@example.com',provider:'outlook',state:'connected',detail:'',cached_count:0}];
     window.localDraft={id:'draft-one',from:'me@example.com',to:'you@example.com',cc:'',subject:'Hello',body:'Saved body'};
@@ -44,6 +44,10 @@ test('mailbox, safe rendering, drafts and send failures in the browser', async t
       if(command!=='mail_request')return;
       const r=args.request;calls.push(structuredClone(r));
       switch(r.op){
+        case 'signature':return structuredClone(signatures[r.account]||{html:'',new_messages:false,replies_forwards:false});
+        case 'set_signature':signatures[r.account]=structuredClone(r.signature);return null;
+        case 'load_draft':return {draft:structuredClone(saved.at(-1)||localDraft),files:[]};
+        case 'attach':return {draft:structuredClone(saved.at(-1)||localDraft),files:[{name:r.name,size:r.data.length}]};
         case 'account_authorization':return activeAuthPrompt;
         case 'connect_profile':
           window.authListenersReady=!!eventHandlers['mail-device-authorization']&&!!eventHandlers['mail-progress'];
@@ -59,7 +63,7 @@ test('mailbox, safe rendering, drafts and send failures in the browser', async t
         case 'remote_images':return [{index:0,data_url:'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7',error:null}];
         case 'sync':return new Promise(resolve=>{resolveSync=resolve;});
         case 'cached_message':return structuredClone(previewMessages?.find(m=>m.id===r.id)||{...mail,id:r.id});
-        case 'new_draft':return {draft:structuredClone(localDraft),files:[]};
+        case 'new_draft':return {draft:{...structuredClone(localDraft),reply_account:r.kind==='new'?'':'me@example.com'},files:[]};
         case 'save_draft':saved.push(structuredClone(r.draft));return null;
         case 'send':if(failSend)throw 'Send outcome unknown; check Sent before retrying';return 'Message sent';
         case 'bulk_modify':return {updated:bulkPartial?r.targets.slice(0,1):r.targets,failed:bulkPartial?r.targets.slice(1).map(target=>({target,detail:'Simulated failure'})):[],not_attempted:[],warnings:[],cancelled:false};
@@ -125,15 +129,47 @@ test('mailbox, safe rendering, drafts and send failures in the browser', async t
 
   await evaluate(`document.querySelector('#reply-all').click();new Promise(r=>setTimeout(r,60))`);
   assert.equal(await evaluate(`calls.find(c=>c.op==='new_draft').kind`),'reply_all');
-  await evaluate(`document.querySelector('#body').value='Changed offline draft';document.querySelector('#body').dispatchEvent(new Event('input'));new Promise(r=>setTimeout(r,650))`);
+  await evaluate(`document.querySelector('#body').textContent='Changed offline draft';document.querySelector('#body').dispatchEvent(new Event('input'));new Promise(r=>setTimeout(r,650))`);
   assert.equal(await evaluate(`saved.at(-1).body`),'Changed offline draft');
   await evaluate(`failSend=true;document.querySelector('#draft-form').dispatchEvent(new Event('submit',{cancelable:true}));new Promise(r=>setTimeout(r,100))`);
   assert.equal(await evaluate(`document.querySelector('#composer').open`),true,'Failed send retains composer');
-  assert.equal(await evaluate(`document.querySelector('#body').value`),'Changed offline draft');
+  assert.equal(await evaluate(`document.querySelector('#body').innerText`),'Changed offline draft');
   assert.equal(await evaluate(`calls.filter(c=>c.op==='send').length`),1,'No automatic send retries');
   assert.match(await evaluate(`document.querySelector('#status').textContent`),/check Sent/);
   await evaluate(`failSend=false;document.querySelector('#draft-form').dispatchEvent(new Event('submit',{cancelable:true}));new Promise(r=>setTimeout(r,100))`);
   assert.equal(await evaluate(`document.querySelector('#composer').open`),false,'Successful send closes composer');
+
+  // Set formatted signatures independently of provider authentication.
+  await evaluate(`document.querySelector('#settings').click();[...document.querySelectorAll('#account-settings button')].find(b=>b.textContent==='Signature').click();new Promise(r=>setTimeout(r,40))`);
+  await evaluate(`document.querySelector('#signature-editor').innerHTML='<p><b>Personal Team</b></p><img src="https://tracker.invalid/pixel" onerror="window.badPaste=true">';document.querySelector('#signature-new').checked=true;document.querySelector('#signature-replies').checked=false;document.querySelector('#save-signature').click();new Promise(r=>setTimeout(r,40))`);
+  assert.equal(await evaluate(`signatures['me@example.com'].html`),'<p><b>Personal Team</b></p>');
+  await evaluate(`document.querySelector('#close-settings').click();signatures['work@example.com']={html:'<p><i>Work Team</i></p>',new_messages:true,replies_forwards:true};document.querySelector('#compose').click();new Promise(r=>setTimeout(r,60))`);
+  assert.equal(await evaluate(`document.querySelectorAll('#body [data-focal-signature]').length`),1);
+  assert.match(await evaluate(`saved.at(-1).html_body`),/<b>Personal Team<\/b>/);
+  // Preserve edited message text while replacing only the inserted signature.
+  await evaluate(`document.querySelector('#body').prepend(document.createTextNode('Keep my message'));document.querySelector('#from').value='work@example.com';document.querySelector('#from').dispatchEvent(new Event('change'));new Promise(r=>setTimeout(r,650))`);
+  assert.equal(await evaluate(`document.querySelectorAll('#body [data-focal-signature]').length`),1);
+  assert.match(await evaluate(`saved.at(-1).body`),/Keep my message/);
+  assert.match(await evaluate(`saved.at(-1).html_body`),/<i>Work Team<\/i>/);
+  assert.doesNotMatch(await evaluate(`saved.at(-1).html_body`),/Personal Team/);
+  // Pasted HTML must retain formatting while dropping executable or remote content.
+  await evaluate(`const editor=document.querySelector('#body');editor.focus();const selection=window.getSelection();selection.selectAllChildren(editor);selection.collapseToStart();const paste=new DataTransfer();paste.setData('text/html','<p><b>Pasted</b><a href="javascript:alert(1)">Unsafe</a><img src="https://tracker.invalid/pixel"><script>window.badPaste=true</script></p>');editor.dispatchEvent(new ClipboardEvent('paste',{clipboardData:paste,bubbles:true,cancelable:true}));new Promise(r=>setTimeout(r,650))`);
+  assert.equal(await evaluate(`document.querySelectorAll('#body img,#body script,#body [onclick],#body a[href^="javascript:"]').length`),0);
+  assert.match(await evaluate(`saved.at(-1).html_body`),/<b>Pasted<\/b>/);
+  assert.equal(await evaluate(`!!window.badPaste`),false);
+  // Link insertion restores the editor selection after entering the URL.
+  await evaluate(`const bold=document.querySelector('#body b');const linkSelection=window.getSelection();linkSelection.selectAllChildren(bold);document.querySelector('#compose-toolbar input').dispatchEvent(new MouseEvent('mousedown',{bubbles:true}));document.querySelector('#compose-toolbar input').focus();document.querySelector('#compose-toolbar input').value='https://example.com/meeting';[...document.querySelectorAll('#compose-toolbar button')].find(b=>b.textContent==='Add link').click();new Promise(r=>setTimeout(r,650))`);
+  assert.equal(await evaluate(`document.querySelector('#body a[href="https://example.com/meeting"]').textContent`),'Pasted');
+  assert.match(await evaluate(`saved.at(-1).html_body`),/https:\/\/example.com\/meeting/);
+  // Reload via attachment operations must preserve formatting without inserting another signature.
+  await evaluate(`const files=new DataTransfer();files.items.add(new File(['attachment'],'note.txt',{type:'text/plain'}));document.querySelector('#attachment').files=files.files;document.querySelector('#attachment').dispatchEvent(new Event('change'));new Promise(r=>setTimeout(r,80))`);
+  assert.equal(await evaluate(`document.querySelectorAll('#body [data-focal-signature]').length`),1);
+  assert.ok(await evaluate(`document.querySelector('#body b').textContent.includes('Pasted')`));
+  await evaluate(`document.querySelector('#close-compose').click();new Promise(r=>setTimeout(r,60))`);
+  // The personal account's reply setting disables its signature in replies.
+  await evaluate(`document.querySelector('#reply-all').click();new Promise(r=>setTimeout(r,60))`);
+  assert.equal(await evaluate(`document.querySelectorAll('#body [data-focal-signature]').length`),0);
+  await evaluate(`document.querySelector('#close-compose').click();new Promise(r=>setTimeout(r,60))`);
 
   await evaluate(`[...document.querySelectorAll('#accounts .account')].find(b=>b.title==='work@example.com').click()`);
   assert.ok(await evaluate(`[...document.querySelectorAll('#accounts .account-folder')].some(b=>b.textContent==='Empty folder')`),'Empty server folders are visible');

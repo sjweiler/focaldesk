@@ -28,7 +28,7 @@ pub const AI_PROTOCOL_VERSION: u16 = 2;
 pub const AI_LEGACY_PROTOCOL_VERSION: u16 = 1;
 // Signed .fai bundles are bounded to 2 MiB before transport. Leave envelope
 // headroom while retaining a strict daemon-side request ceiling.
-pub const AI_MAX_REQUEST_BYTES: u64 = 3 * 1024 * 1024;
+pub const AI_MAX_REQUEST_BYTES: u64 = 12 * 1024 * 1024;
 // Source listings for large repositories can contain thousands of paths and
 // hashes. Keep responses bounded, but leave enough room for the documented
 // 10,000-file directory-ingestion ceiling.
@@ -50,6 +50,8 @@ struct AiRequestEnvelope<T> {
     ai_protocol_version: u16,
     request_id: String,
     payload: T,
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    trace_context: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -105,6 +107,16 @@ pub enum AiIpcRequest {
     },
     IngestWebsite {
         url: String,
+    },
+    StartIngestion {
+        source: crate::IngestionSource,
+    },
+    ListIngestionJobs,
+    GetIngestionJob {
+        job_id: String,
+    },
+    CancelIngestionJob {
+        job_id: String,
     },
     ListIndexedDocuments,
     RemoveIndexedDocument {
@@ -369,6 +381,12 @@ pub enum AiIpcResponse {
     WebsiteIngested {
         result: crate::types::WebsiteIngestResult,
     },
+    IngestionJob {
+        job: crate::IngestionJob,
+    },
+    IngestionJobs {
+        jobs: Vec<crate::IngestionJob>,
+    },
     IndexedDocuments {
         documents: Vec<focaldesk_memory::IndexedDocument>,
     },
@@ -617,14 +635,26 @@ async fn handle_connection(service: Arc<AiService>, mut stream: UnixStream) -> R
         AiWireMode::Versioned { request_id } => request_id.clone(),
     };
     let span = tracing::info_span!(
-        target: "focaldesk.ai",
+        target: "focaldesk.telemetry",
         "ai_ipc_request",
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
         request_id = %request_id,
         ai_protocol_version = match &wire_mode {
             AiWireMode::Legacy => AI_LEGACY_PROTOCOL_VERSION,
             AiWireMode::Versioned { .. } => AI_PROTOCOL_VERSION,
         }
     );
+
+    if let Ok(envelope) = transport::decode_message::<serde_json::Value>(&input) {
+        if let Some(context) = envelope.get("trace_context") {
+            if let Ok(context) = serde_json::from_value(context.clone()) {
+                focaldesk_logging::telemetry::set_parent(&span, &context);
+            }
+        }
+    }
+
+    focaldesk_logging::telemetry::record_correlation(&span);
 
     let decoded = match decoded {
         Ok(AiIpcRequest::ChatStream { request }) => {
@@ -762,6 +792,12 @@ async fn handle_connection(service: Arc<AiService>, mut stream: UnixStream) -> R
                     AiIpcResponse::Error { message: err.to_string() }
                 }
             },
+            Ok(AiIpcRequest::StartIngestion { source }) => match service.start_ingestion(source) {
+                Ok(job)=>AiIpcResponse::IngestionJob{job},Err(e)=>AiIpcResponse::Error{message:e.to_string()},
+            },
+            Ok(AiIpcRequest::ListIngestionJobs) => match service.ingestion_jobs(){Ok(jobs)=>AiIpcResponse::IngestionJobs{jobs},Err(e)=>AiIpcResponse::Error{message:e.to_string()}},
+            Ok(AiIpcRequest::GetIngestionJob {job_id})=>match service.ingestion_job(&job_id){Ok(job)=>AiIpcResponse::IngestionJob{job},Err(e)=>AiIpcResponse::Error{message:e.to_string()}},
+            Ok(AiIpcRequest::CancelIngestionJob {job_id})=>match service.cancel_ingestion(&job_id){Ok(job)=>AiIpcResponse::IngestionJob{job},Err(e)=>AiIpcResponse::Error{message:e.to_string()}},
             Ok(AiIpcRequest::ListIndexedDocuments) => match service.indexed_documents().await {
                 Ok(documents) => AiIpcResponse::IndexedDocuments {
                     documents: indexed_document_summaries(documents),
@@ -1432,10 +1468,27 @@ pub fn stream_ai_chat(
 pub fn stream_ai_chat_at(
     path: impl AsRef<Path>,
     request: ChatRequest,
+    on_event: impl FnMut(AiStreamEvent) -> Result<()>,
+) -> Result<String> {
+    stream_ai_chat_at_with_id(path, request, next_request_id(), on_event)
+}
+
+/// A caller-owned ID makes cancellation possible before the first model delta.
+pub fn stream_ai_chat_with_id(
+    request: ChatRequest,
+    request_id: String,
+    on_event: impl FnMut(AiStreamEvent) -> Result<()>,
+) -> Result<String> {
+    stream_ai_chat_at_with_id(ai_socket_path()?, request, request_id, on_event)
+}
+#[tracing::instrument(name = "ai.request", target = "focaldesk.telemetry", skip_all)]
+fn stream_ai_chat_at_with_id(
+    path: impl AsRef<Path>,
+    request: ChatRequest,
+    request_id: String,
     mut on_event: impl FnMut(AiStreamEvent) -> Result<()>,
 ) -> Result<String> {
     let path = path.as_ref();
-    let request_id = next_request_id();
     let mut stream = StdUnixStream::connect(path)
         .with_context(|| format!("could not connect to AI IPC socket {}", path.display()))?;
     configure_ai_stream(&stream, AI_RESPONSE_TIMEOUT)?;
@@ -1551,6 +1604,7 @@ fn encode_ai_request(request: &AiIpcRequest, request_id: &str) -> Result<Vec<u8>
     let output = transport::encode_message(&AiRequestEnvelope {
         ai_protocol_version: AI_PROTOCOL_VERSION,
         request_id: request_id.to_string(),
+        trace_context: focaldesk_logging::telemetry::inject_context(),
         payload: request,
     })?;
     if output.len() as u64 > AI_MAX_REQUEST_BYTES {
@@ -1695,6 +1749,7 @@ fn indexed_document_summaries(
     documents
 }
 
+#[tracing::instrument(name = "ai.request", target = "focaldesk.telemetry", skip_all)]
 pub fn send_ai_request_at(path: impl AsRef<Path>, request: &AiIpcRequest) -> Result<AiIpcResponse> {
     let path = path.as_ref();
     let request_id = next_request_id();

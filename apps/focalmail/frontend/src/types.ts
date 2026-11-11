@@ -5,7 +5,8 @@ export interface Message {
  pending_move?:boolean;timestamp:number;unread:boolean;flagged:boolean;html?:{inline_attempted?:boolean;layout?:string|null;images?:{index:number;alt:string;source:string|null;inline_data:string|null}[];blocks:{spans:Span[]}[];blocked_images:number;limited:boolean}|null;
  html_loaded?:boolean;attachments_loaded?:boolean;attachments:Attachment[];to_header?:string;cc_header?:string;
 }
-export interface Draft {id:string;from:string;to:string;cc:string;subject:string;body:string;forward?:{attachments:Attachment[]}|null;[key:string]:unknown}
+export interface Signature {html:string;new_messages:boolean;replies_forwards:boolean}
+export interface Draft {html_body?:string|null;signature_initialized?:boolean;id:string;from:string;to:string;cc:string;subject:string;body:string;forward?:{attachments:Attachment[]}|null;[key:string]:unknown}
 export interface DraftFile {name:string;size:number}
 export interface DraftRecord {draft:Draft;files:DraftFile[]}
 export type SyncHistory = 'one_month'|'three_months'|'six_months'|'one_year'|'all';

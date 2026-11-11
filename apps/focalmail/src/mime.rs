@@ -192,4 +192,42 @@ mod tests {
         };
         assert!(crate::providers::mime(&bad, &[]).is_err());
     }
+    #[test]
+    fn html_delivery_has_plain_alternative_and_nested_attachments() {
+        let draft = crate::drafts::Draft {
+            from: "me@example.com".into(), to: "you@example.com".into(),
+            body: "Hello ✓\nTeam".into(),
+            html_body: Some("<p>Hello <b>✓</b></p><div>Team</div><img src='https://tracker'><script>bad()</script>".into()),
+            ..Default::default()
+        };
+        for files in [
+            vec![],
+            vec![crate::attachments::DraftAttachment {
+                name: "résumé.bin".into(),
+                data: vec![0, 1, 255],
+            }],
+        ] {
+            let raw = crate::providers::mime(&draft, &files).unwrap();
+            let parsed = mailparse::parse_mail(&raw).unwrap();
+            let alternative = if files.is_empty() {
+                &parsed
+            } else {
+                assert_eq!(parsed.ctype.mimetype, "multipart/mixed");
+                assert_eq!(parsed.subparts[1].get_body_raw().unwrap(), vec![0, 1, 255]);
+                &parsed.subparts[0]
+            };
+            assert_eq!(alternative.ctype.mimetype, "multipart/alternative");
+            assert_eq!(alternative.subparts.len(), 2);
+            assert_eq!(alternative.subparts[0].ctype.mimetype, "text/plain");
+            assert_eq!(
+                alternative.subparts[0].get_body().unwrap(),
+                "Hello ✓\r\nTeam"
+            );
+            assert_eq!(alternative.subparts[1].ctype.mimetype, "text/html");
+            assert_eq!(
+                alternative.subparts[1].get_body().unwrap(),
+                "<p>Hello <b>✓</b></p><div>Team</div>"
+            );
+        }
+    }
 }

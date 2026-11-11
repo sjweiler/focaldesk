@@ -11,6 +11,7 @@ name = "focaldesk_memory"
 path = "src/lib.rs"
 
 [dependencies]
+focaldesk-logging = { path = "../focaldesk-logging" }
 anyhow = "1"
 async-trait = "0.1"
 dirs = "6"
