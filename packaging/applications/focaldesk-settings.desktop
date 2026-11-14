@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=FocalDesk Settings
+Comment=Configure your FocalDesk desktop
+Exec=focaldesk-settings
+Icon=preferences-system
+Terminal=false
+Categories=Settings;DesktopSettings;
+StartupNotify=true

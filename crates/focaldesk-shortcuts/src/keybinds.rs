@@ -725,12 +725,11 @@ fn numbered_action(name: &str, prefix: &str) -> Option<usize> {
     (1..=9).contains(&number).then_some(number - 1)
 }
 
-fn parse_shortcut(shortcut: &str) -> Result<KeyCombo, String> {
-    let parts: Vec<&str> = shortcut
-        .split('+')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect();
+pub fn parse_shortcut(shortcut: &str) -> Result<KeyCombo, String> {
+    let parts: Vec<&str> = shortcut.split('+').map(str::trim).collect();
+    if parts.iter().any(|part| part.is_empty()) {
+        return Err("shortcut contains an empty component".into());
+    }
     let (key_name, modifiers) = parts
         .split_last()
         .ok_or_else(|| "shortcut is empty".to_string())?;

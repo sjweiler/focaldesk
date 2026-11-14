@@ -457,3 +457,18 @@ barge-in. Neither endpoint can resolve an AI mutation confirmation.
 ## Summary
 
 The IPC layer is intended to make FocalDesk modular, recoverable, and extensible. The compositor should remain focused on core desktop behavior while services handle launching, settings, automation, and future AI workflows through explicit message contracts.
+
+### Select an application for forced termination
+
+Run `focaldesk-kill` (or `focaldesk-cli kill`), then left-click the application
+with the crosshair pointer. Escape or right-click cancels. `just install-kill`
+installs the command and the **Force Quit Application** launcher entry.
+The compositor must be rebuilt with this feature before using the command.
+
+The IPC desktop action is `{"action":"begin_kill_selection"}`. Selection is
+unavailable while locked and ends when the session locks. Native Wayland
+applications are disconnected; all windows sharing that client connection close.
+XWayland applications receive SIGKILL using the local PID verified by XRes;
+the compositor and XWayland server are excluded. This can discard unsaved work.
+Desktop layer surfaces and empty space are ignored. A failed termination is
+recorded in the compositor log.

@@ -214,8 +214,14 @@ fn config_from_settings_json(text: &str) -> Option<FocalDeskConfig> {
     serde_json::from_value(value.get("desktop_config")?.clone()).ok()
 }
 
+/// Read configuration without migrating or writing any user files.
+/// Useful for draft/preview clients that must remain read-only until Apply.
+pub fn load_config_read_only() -> FocalDeskConfig {
+    load_config_from_paths(&config_path(), &legacy_config_path())
+}
+
 pub fn load_config() -> FocalDeskConfig {
-    let mut config = load_config_from_paths(&config_path(), &legacy_config_path());
+    let mut config = load_config_read_only();
     if migrate_legacy_theme_selection(&mut config) {
         // The migration is deliberately best-effort: an unwritable home
         // directory must not prevent a desktop session from loading Default.

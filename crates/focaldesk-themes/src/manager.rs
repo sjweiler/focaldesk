@@ -1,6 +1,7 @@
 use crate::builtins::builtin_theme;
 use crate::{FlowTheme, FlowThemeId, ThemeDocument};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub fn load_custom_theme(path: &Path) -> anyhow::Result<FlowTheme> {
     let text = std::fs::read_to_string(path)?;
@@ -23,6 +24,8 @@ pub struct ThemeManager {
     editor_applied: Option<FlowTheme>,
     editor_preview: Option<FlowTheme>,
     editor_revision: u64,
+    editor_preview_deadline: Option<Instant>,
+    editor_preview_owner: Option<u64>,
 }
 
 impl ThemeManager {
@@ -33,6 +36,8 @@ impl ThemeManager {
             editor_applied: None,
             editor_preview: None,
             editor_revision: 0,
+            editor_preview_deadline: None,
+            editor_preview_owner: None,
         }
     }
 
@@ -84,6 +89,8 @@ impl ThemeManager {
             self.editor_applied.as_ref().unwrap_or(&self.resolved),
             document,
         )?);
+        self.editor_preview_owner = None;
+        self.editor_preview_deadline = None;
         Ok(())
     }
 
@@ -97,6 +104,55 @@ impl ThemeManager {
 
     pub fn revert_editor_preview(&mut self) {
         self.editor_preview = None;
+        self.editor_preview_deadline = None;
+        self.editor_preview_owner = None;
+    }
+
+    pub fn expire_editor_preview(&mut self, now: Instant) -> bool {
+        if self.editor_preview.is_some()
+            && self
+                .editor_preview_deadline
+                .is_some_and(|deadline| now >= deadline)
+        {
+            self.revert_editor_preview();
+            return true;
+        }
+        false
+    }
+
+    pub fn preview_owned(&mut self, document: &ThemeDocument, token: u64) -> anyhow::Result<()> {
+        self.expire_editor_preview(Instant::now());
+        if self.editor_preview.is_some() && self.editor_preview_owner != Some(token) {
+            anyhow::bail!("Another theme editor has an active preview.");
+        }
+        self.preview_editor_document(document)?;
+        self.editor_preview_owner = Some(token);
+        self.editor_preview_deadline = Some(Instant::now() + Duration::from_secs(30));
+        Ok(())
+    }
+
+    pub fn revert_owned(&mut self, token: u64) -> anyhow::Result<()> {
+        if self.editor_preview.is_some() && self.editor_preview_owner != Some(token) {
+            anyhow::bail!("This preview belongs to another theme editor.");
+        }
+        self.revert_editor_preview();
+        Ok(())
+    }
+
+    pub fn apply_owned(
+        &mut self,
+        document: &ThemeDocument,
+        token: u64,
+        expected_revision: u64,
+    ) -> anyhow::Result<u64> {
+        self.expire_editor_preview(Instant::now());
+        if self.editor_revision != expected_revision {
+            anyhow::bail!("The session theme changed in another editor. Refresh before applying.");
+        }
+        if self.editor_preview.is_some() && self.editor_preview_owner != Some(token) {
+            anyhow::bail!("Another theme editor has an active preview.");
+        }
+        self.apply_editor_document(document)
     }
 
     pub fn editor_preview_active(&self) -> bool {
@@ -216,6 +272,22 @@ mod tests {
         );
         document.semantic.surfaces.active_button.normal = color;
         document
+    }
+
+    #[test]
+    fn owned_previews_expire_and_cannot_be_reverted_or_applied_by_another_editor() {
+        let mut manager = ThemeManager::new(FlowThemeId::BuiltIn(BuiltInThemeId::Eagle));
+        let document = document(ThemeColor::srgb(0.2, 0.3, 0.4, 1.0));
+        let original = manager.active_theme().chrome.accent_color;
+        manager.preview_owned(&document, 10).unwrap();
+        assert!(manager.preview_owned(&document, 11).is_err());
+        assert!(manager.revert_owned(11).is_err());
+        assert!(manager.apply_owned(&document, 11, 0).is_err());
+        assert!(manager.expire_editor_preview(Instant::now() + Duration::from_secs(31)));
+        assert!(!manager.editor_preview_active());
+        assert_eq!(manager.active_theme().chrome.accent_color, original);
+        assert_eq!(manager.apply_owned(&document, 10, 0).unwrap(), 1);
+        assert!(manager.apply_owned(&document, 10, 0).is_err());
     }
 
     #[test]

@@ -1,3 +1,7 @@
+//! Shared, validated session audio controls for FocalDesk clients.
+pub mod controls;
+pub mod meter;
+
 use std::process::Command;
 
 /// Return whether the current audio server exposes a real input source.

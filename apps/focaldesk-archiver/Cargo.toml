@@ -1,0 +1,17 @@
+[package]
+name = "focaldesk-archiver"
+version = "0.1.0"
+edition = "2024"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+rfd = "0.15"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+tar = "0.4"
+flate2 = "1"
+walkdir = "2"
+tempfile = "3"

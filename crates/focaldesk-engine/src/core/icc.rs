@@ -93,7 +93,22 @@ pub fn parse_icc_profile(data: &[u8]) -> Result<ParsedIccProfile, IccError> {
 }
 
 pub fn load_display_profile_from_path(path: &Path) -> Result<ParsedIccProfile, IccError> {
-    let bytes = std::fs::read(path)?;
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(IccError::Invalid("ICC profile must be a regular file"));
+    }
+    if metadata.len() == 0 || metadata.len() > MAX_ICC_BYTES as u64 {
+        return Err(IccError::Invalid("bad size"));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_ICC_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
     parse_icc_profile(&bytes)
 }
 

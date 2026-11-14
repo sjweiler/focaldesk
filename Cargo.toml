@@ -82,7 +82,7 @@ members = [
     "apps/focal-panel",
     "apps/focal-dock",
     "apps/focaldesk-companion",
-    "apps/focaldesk-browser-bridge",
+    "apps/focaldesk-browser-bridge", "apps/focaldesk-archiver",
 ]
 resolver = "2"
 

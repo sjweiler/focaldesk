@@ -34,7 +34,11 @@ enum Request<'a> {
 }
 
 pub fn delete(key: &str) -> Result<()> {
-    let mut stream = UnixStream::connect(socket_path()?).context("connect to credential broker")?;
+    let path = socket_path()?;
+    let mut stream = match UnixStream::connect(&path) {
+        Ok(stream) => stream,
+        Err(error) => return secret_service_delete(key).context("connect to Focaldesk broker or desktop Secret Service") .map_err(|e| anyhow!("{} (broker socket {}: {})", e, path.display(), error)),
+    };
     let request = Zeroizing::new(serde_json::to_vec(&Request::Delete { key })?);
     write_frame(&mut stream, &request)?;
     let response = Zeroizing::new(read_frame(&mut stream)?);
@@ -70,17 +74,27 @@ pub fn socket_path() -> Result<PathBuf> {
 
 /// Retrieve a UTF-8 credential. The returned buffer is zeroized on drop.
 pub fn get(key: &str) -> Result<Zeroizing<String>> {
-    get_from(&socket_path()?, key)
+    let path = socket_path()?;
+    match UnixStream::connect(&path) {
+        Ok(mut stream) => get_on_stream(&mut stream, key),
+        Err(error) => secret_service_get(key)
+            .context("connect to Focaldesk broker or desktop Secret Service")
+            .map_err(|e| anyhow!("{} (broker socket {}: {})", e, path.display(), error)),
+    }
 }
 
 /// Retrieve a UTF-8 credential from an explicit socket path.
 pub fn get_from(socket: &Path, key: &str) -> Result<Zeroizing<String>> {
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("connect to credential broker at {}", socket.display()))?;
-    let request = Zeroizing::new(serde_json::to_vec(&Request::Get { key })?);
-    write_frame(&mut stream, &request)?;
+    get_on_stream(&mut stream, key)
+}
 
-    let response = Zeroizing::new(read_frame(&mut stream)?);
+fn get_on_stream(stream: &mut UnixStream, key: &str) -> Result<Zeroizing<String>> {
+    let request = Zeroizing::new(serde_json::to_vec(&Request::Get { key })?);
+    write_frame(stream, &request)?;
+
+    let response = Zeroizing::new(read_frame(stream)?);
     let decoded: Response = serde_json::from_slice(&response).context("decode broker response")?;
 
     if !decoded.ok {
@@ -108,13 +122,23 @@ pub fn get_from(socket: &Path, key: &str) -> Result<Zeroizing<String>> {
 /// Store a UTF-8 credential through the broker's ACL-protected native API.
 /// The encoded request buffer and base64 intermediary are zeroized on drop.
 pub fn set(key: &str, value: &str, label: &str) -> Result<()> {
-    set_at(&socket_path()?, key, value, label)
+    let path = socket_path()?;
+    match UnixStream::connect(&path) {
+        Ok(stream) => set_on_stream(stream, key, value, label),
+        Err(error) => secret_service_set(key, value, label)
+            .context("connect to Focaldesk broker or desktop Secret Service")
+            .map_err(|e| anyhow!("{} (broker socket {}: {})", e, path.display(), error)),
+    }
 }
 
 /// Store a UTF-8 credential through an explicit broker socket.
 pub fn set_at(socket: &Path, key: &str, value: &str, label: &str) -> Result<()> {
-    let mut stream = UnixStream::connect(socket)
+    let stream = UnixStream::connect(socket)
         .with_context(|| format!("connect to credential broker at {}", socket.display()))?;
+    set_on_stream(stream, key, value, label)
+}
+
+fn set_on_stream(mut stream: UnixStream, key: &str, value: &str, label: &str) -> Result<()> {
     let encoded = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(value));
     let request = Zeroizing::new(serde_json::to_vec(&Request::Set {
         key,
@@ -131,6 +155,49 @@ pub fn set_at(socket: &Path, key: &str, value: &str, label: &str) -> Result<()> 
             "credential broker rejected write to {key:?}: {}",
             decoded.error.as_deref().unwrap_or("unknown error")
         );
+    }
+    Ok(())
+}
+
+// KDE Wallet and GNOME Keyring expose the same Secret Service interface. Use
+// secret-tool only when the Focaldesk broker socket is absent; this keeps the
+// native broker's service-unit ACLs authoritative where it is installed.
+fn secret_service_get(key: &str) -> Result<Zeroizing<String>> {
+    let output = std::process::Command::new("secret-tool")
+        .args(["lookup", "focaldesk-key", key])
+        .output()
+        .context("launch secret-tool (install libsecret-tools and enable KDE Wallet Secret Service)")?;
+    if !output.status.success() {
+        bail!("Secret Service lookup failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    let value = String::from_utf8(output.stdout).context("Secret Service returned non-UTF-8 data")?;
+    Ok(Zeroizing::new(value.trim_end_matches(['\r', '\n']).to_owned()))
+}
+
+fn secret_service_set(key: &str, value: &str, label: &str) -> Result<()> {
+    let mut child = std::process::Command::new("secret-tool")
+        .args(["store", "--label", label, "focaldesk-key", key])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("launch secret-tool (install libsecret-tools and enable KDE Wallet Secret Service)")?;
+    use std::io::Write as _;
+    child.stdin.take().context("open secret-tool input")?.write_all(value.as_bytes())?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        bail!("Secret Service store failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(())
+}
+
+fn secret_service_delete(key: &str) -> Result<()> {
+    let output = std::process::Command::new("secret-tool")
+        .args(["clear", "focaldesk-key", key])
+        .output()
+        .context("launch secret-tool (install libsecret-tools and enable KDE Wallet Secret Service)")?;
+    if !output.status.success() {
+        bail!("Secret Service delete failed: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
     Ok(())
 }

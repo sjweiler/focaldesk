@@ -142,6 +142,7 @@ impl XwmHandler for DesktopState {
         }
         if self.focused_window == Some(id) {
             self.focused_window = None;
+            self.focus_top_window_on_focused_output(self.focused_workspace());
         }
     }
 
@@ -169,6 +170,7 @@ impl XwmHandler for DesktopState {
         self.set_xwayland_window_mapped(id, false);
         if self.focused_window == Some(id) {
             self.focused_window = None;
+            self.focus_top_window_on_focused_output(self.focused_workspace());
         }
     }
 

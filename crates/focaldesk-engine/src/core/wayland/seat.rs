@@ -25,6 +25,12 @@ impl SeatHandler for DesktopState {
     }
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        if self.kill_selection {
+            self.cursor_manager.set_visible(true);
+            self.cursor_manager.set_icon(CursorIcon::Crosshair);
+            self.drm_submit_hw_cursor = true;
+            return;
+        }
         self.drm_submit_hw_cursor = true;
         match image {
             // GTK/XWayland often hides the seat cursor while using a subsurface cursor; keep the

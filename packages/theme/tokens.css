@@ -1,0 +1,28 @@
+/* Framework-neutral application tokens. Values may be overridden per window. */
+:root {
+  --fd-font: Inter, "Segoe UI", system-ui, sans-serif;
+  --fd-bg: #f6f7fb;
+  --fd-surface: #ffffff;
+  --fd-surface-muted: #eef0f6;
+  --fd-text: #20263b;
+  --fd-text-muted: #687087;
+  --fd-accent: #635bdf;
+  --fd-accent-soft: #eeedff;
+  --fd-border: #e4e7f0;
+  --fd-success: #247d63;
+  --fd-danger: #b5364b;
+  --fd-radius-sm: 8px;
+  --fd-radius: 14px;
+  --fd-radius-lg: 22px;
+  --fd-space-1: 4px;
+  --fd-space-2: 8px;
+  --fd-space-3: 12px;
+  --fd-space-4: 16px;
+  --fd-space-6: 24px;
+  --fd-space-8: 32px;
+  --fd-shadow: 0 8px 28px rgb(32 38 59 / 4%);
+  --fd-focus: 0 0 0 3px rgb(99 91 223 / 28%);
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}

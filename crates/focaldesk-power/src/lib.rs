@@ -229,9 +229,18 @@ impl PowerManager {
     }
 
     pub fn snapshot(&self) -> PowerSnapshot {
+        let batteries = self.batteries();
+        // Some desktops do not expose an AC/UPS power-supply entry at all.
+        // If there is no system battery either, the machine is on external
+        // power by definition; do not report its source as unknown/offline.
+        let line_power_online = if batteries.is_empty() {
+            Some(true)
+        } else {
+            self.line_power_online()
+        };
         PowerSnapshot {
-            batteries: self.batteries(),
-            line_power_online: self.line_power_online(),
+            batteries,
+            line_power_online,
             performance_profile: current_performance_profile(),
             captured_at_unix_ms: current_unix_time_ms(),
         }

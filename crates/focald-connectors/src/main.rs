@@ -31,6 +31,7 @@ use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 const SUPERVISOR_TICK: Duration = Duration::from_secs(1);
+static CALENDAR_PREFERENCE_LOCK: Mutex<()> = Mutex::new(());
 const REGISTRY_REFRESH_SECONDS: u64 = 5;
 const BUILTIN_POLL_SECONDS: u64 = 15;
 const MAX_CONNECTOR_OUTPUT_BYTES: usize = 64 * 1024;
@@ -433,6 +434,18 @@ fn update_calendar_preferences(
     calendar_ids: Vec<String>,
     reminder_minutes: u32,
 ) -> Result<()> {
+    update_calendar_preferences_checked(account_id, calendar_ids, reminder_minutes, None)
+}
+
+fn update_calendar_preferences_checked(
+    account_id: &str,
+    calendar_ids: Vec<String>,
+    reminder_minutes: u32,
+    expected: Option<(Vec<String>, u32)>,
+) -> Result<()> {
+    let _guard = CALENDAR_PREFERENCE_LOCK
+        .lock()
+        .map_err(|_| anyhow!("calendar preferences unavailable"))?;
     let mut document = load_calendar_accounts()?;
     let account = document
         .accounts
@@ -442,6 +455,9 @@ fn update_calendar_preferences(
     let previous = selected_calendar_ids(account)
         .into_iter()
         .collect::<BTreeSet<_>>();
+    if let Some((ids, minutes)) = expected {
+        check_calendar_preferences(&previous, account.reminder_minutes, &ids, minutes)?;
+    }
     account.calendar_ids = calendar_ids;
     account.reminder_minutes = reminder_minutes;
     validate_account(account)?;
@@ -452,6 +468,19 @@ fn update_calendar_preferences(
     let store = CALENDAR_STORE.get().context("calendar store unavailable")?;
     for removed in previous.difference(&next) {
         store.clear_calendar(account_id, removed)?;
+    }
+    Ok(())
+}
+
+fn check_calendar_preferences(
+    current: &BTreeSet<String>,
+    minutes: u32,
+    expected: &[String],
+    expected_minutes: u32,
+) -> Result<()> {
+    if current != &expected.iter().cloned().collect::<BTreeSet<_>>() || minutes != expected_minutes
+    {
+        bail!("Calendar preferences changed in another client. Reload calendars before applying.");
     }
     Ok(())
 }
@@ -1005,8 +1034,6 @@ fn complete_google_oauth(
     let request = std::str::from_utf8(&bytes[..count])?;
     let code = authorization_code_from_loopback_callback(request, redirect_uri, csrf)
         .context("Google OAuth callback validation failed")?;
-    let html = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<h1>FocalDesk connected</h1><p>You can close this tab.</p>";
-    stream.write_all(html.as_bytes())?;
     let client = reqwest::blocking::Client::new();
     let mut form = vec![
         ("client_id", account.client_id.as_str()),
@@ -1018,12 +1045,36 @@ fn complete_google_oauth(
     if let Some(secret) = client_secret {
         form.push(("client_secret", secret));
     }
-    let token: TokenResponse = client
+    let response = client
         .post("https://oauth2.googleapis.com/token")
         .form(&form)
-        .send()?
-        .error_for_status()?
-        .json()?;
+        .send()
+        .context("Google token request failed")?;
+    let token_result = if response.status().is_success() {
+        response
+            .json::<TokenResponse>()
+            .context("Google returned an invalid token response")
+    } else {
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        let detail = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                let code = value.get("error")?.as_str()?;
+                let description = value.get("error_description")?.as_str()?;
+                Some(format!("{code}: {description}"))
+            })
+            .unwrap_or_else(|| "Google did not provide an error description".into());
+        Err(anyhow!("Google token request failed ({status}): {detail}"))
+    };
+    let token = match token_result {
+        Ok(token) => token,
+        Err(error) => {
+            let html = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<h1>FocalDesk sign-in failed</h1><p>Return to Focaldesk Settings for details.</p>";
+            let _ = stream.write_all(html.as_bytes());
+            return Err(error);
+        }
+    };
     let refresh = token
         .refresh_token
         .context("Google returned no refresh token")?;
@@ -1039,7 +1090,10 @@ fn complete_google_oauth(
             "Google OAuth client secret",
         )?;
     }
-    save_calendar_account(account.clone())
+    save_calendar_account(account.clone())?;
+    let html = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<h1>FocalDesk connected</h1><p>You can close this tab.</p>";
+    stream.write_all(html.as_bytes())?;
+    Ok(())
 }
 
 fn complete_microsoft_oauth(
@@ -1068,14 +1122,12 @@ fn complete_microsoft_oauth(
     let request = std::str::from_utf8(&bytes[..count])?;
     let code = authorization_code_from_loopback_callback(request, redirect_uri, csrf)
         .context("Microsoft OAuth callback validation failed")?;
-    let html = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<h1>FocalDesk connected</h1><p>You can close this tab.</p>";
-    stream.write_all(html.as_bytes())?;
     let client = reqwest::blocking::Client::new();
     let endpoint = format!(
         "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
         account.tenant
     );
-    let token: TokenResponse = client
+    let response = client
         .post(endpoint)
         .form(&[
             ("client_id", account.client_id.as_str()),
@@ -1085,9 +1137,33 @@ fn complete_microsoft_oauth(
             ("grant_type", "authorization_code"),
             ("scope", "offline_access Calendars.ReadWrite"),
         ])
-        .send()?
-        .error_for_status()?
-        .json()?;
+        .send()
+        .context("Microsoft token request failed")?;
+    let token_result = if response.status().is_success() {
+        response
+            .json::<TokenResponse>()
+            .context("Microsoft returned an invalid token response")
+    } else {
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        let detail = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                let code = value.get("error")?.as_str()?;
+                let description = value.get("error_description")?.as_str()?;
+                Some(format!("{code}: {description}"))
+            })
+            .unwrap_or_else(|| "Microsoft did not provide an error description".into());
+        Err(anyhow!("Microsoft token request failed ({status}): {detail}"))
+    };
+    let token = match token_result {
+        Ok(token) => token,
+        Err(error) => {
+            let html = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<h1>FocalDesk sign-in failed</h1><p>Return to Focaldesk Settings for details.</p>";
+            let _ = stream.write_all(html.as_bytes());
+            return Err(error);
+        }
+    };
     let refresh = token
         .refresh_token
         .context("Microsoft returned no refresh token")?;
@@ -1096,7 +1172,10 @@ fn complete_microsoft_oauth(
         &refresh,
         "Microsoft Calendar refresh token",
     )?;
-    save_calendar_account(account.clone())
+    save_calendar_account(account.clone())?;
+    let html = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<h1>FocalDesk connected</h1><p>You can close this tab.</p>";
+    stream.write_all(html.as_bytes())?;
+    Ok(())
 }
 
 fn load_calendar_accounts() -> Result<CalendarAccountsDocument> {
@@ -1857,6 +1936,25 @@ fn apply_control_request(
     host_state: &Arc<Mutex<HostState>>,
     request: ConnectorHostIpcRequest,
 ) -> ConnectorHostIpcResponse {
+    if let ConnectorHostIpcRequest::CalendarUpdatePreferencesChecked {
+        account_id,
+        expected_calendar_ids,
+        expected_reminder_minutes,
+        calendar_ids,
+        reminder_minutes,
+    } = request
+    {
+        let result = update_calendar_preferences_checked(
+            &account_id,
+            calendar_ids,
+            reminder_minutes,
+            Some((expected_calendar_ids, expected_reminder_minutes)),
+        );
+        let mut response = error_control_response("");
+        response.status = if result.is_ok() { "ok" } else { "error" }.into();
+        response.message = result.err().map(|error| error.to_string());
+        return response;
+    }
     if let ConnectorHostIpcRequest::CalendarSaveEvent { ref event }
     | ConnectorHostIpcRequest::CalendarDeleteEvent { ref event } = request
     {
@@ -2110,6 +2208,7 @@ fn apply_control_request(
         | ConnectorHostIpcRequest::CalendarAccounts
         | ConnectorHostIpcRequest::CalendarDiscover { .. }
         | ConnectorHostIpcRequest::CalendarUpdatePreferences { .. }
+        | ConnectorHostIpcRequest::CalendarUpdatePreferencesChecked { .. }
         | ConnectorHostIpcRequest::CalendarSyncNow { .. }
         | ConnectorHostIpcRequest::CalendarDisconnect { .. } => unreachable!(),
     }
@@ -2152,6 +2251,19 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn calendar_preference_cas_compares_selection_as_a_set_and_preserves_newer_edits() {
+        let current = BTreeSet::from(["primary".into(), "work".into()]);
+        assert!(
+            check_calendar_preferences(&current, 10, &["work".into(), "primary".into()], 10)
+                .is_ok()
+        );
+        assert!(
+            check_calendar_preferences(&current, 15, &["primary".into(), "work".into()], 10)
+                .is_err()
+        );
+        assert!(check_calendar_preferences(&current, 10, &["primary".into()], 10).is_err());
+    }
 
     fn write_fixture() -> CalendarEventSnapshot {
         CalendarEventSnapshot {

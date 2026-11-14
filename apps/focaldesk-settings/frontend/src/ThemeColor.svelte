@@ -1,0 +1,15 @@
+<script lang="ts">
+  import { invoke } from '@tauri-apps/api/core';
+  import { onDestroy } from 'svelte';
+  import { colorHex,hexColor } from './theme-editor';
+  import type { ThemeColor,ColorSpace } from './theme-editor';
+  let { value=$bindable(), label }: {value:ThemeColor;label:string}=$props();
+  let hex=$state('#000000'),busy=$state(false),error=$state(''),clipped=$state(false);
+  let sequence=0,alive=true;
+  onDestroy(()=>{alive=false;sequence++;});
+  $effect(()=>{const color=JSON.parse(JSON.stringify(value)) as ThemeColor;const token=++sequence;void invoke<ThemeColor>('convert_theme_color',{color,space:'srgb'}).then(next=>{if(token===sequence){hex=colorHex(next);clipped=[next.r,next.g,next.b].some(channel=>channel<0||channel>1);}}).catch(()=>{});});
+  async function convert(space:ColorSpace){const previous=value,signature=JSON.stringify(value);busy=true;error='';try{const next=await invoke<ThemeColor>('convert_theme_color',{color:JSON.parse(signature),space});if(alive&&value===previous&&JSON.stringify(value)===signature)value=next;}catch(cause){if(alive)error=String(cause);}finally{if(alive)busy=false;}}
+  async function pick(hex:string){const previous=value,signature=JSON.stringify(value);busy=true;error='';try{const next=await invoke<ThemeColor>('convert_theme_color',{color:hexColor(hex,value.a),space:value.space});if(alive&&value===previous&&JSON.stringify(value)===signature)value=next;}catch(cause){if(alive)error=String(cause);}finally{if(alive)busy=false;}}
+</script>
+<fieldset class="color-editor" disabled={busy}><legend>{label}</legend><div class="color-tools"><label>sRGB picker <input type="color" value={hex} onchange={event=>pick(event.currentTarget.value)} /></label><label>Gamut <select value={value.space} onchange={event=>convert(event.currentTarget.value as ColorSpace)}><option value="srgb">sRGB</option><option value="display_p3">Display P3</option><option value="rec2020">Rec.2020</option></select></label>{#each ['r','g','b','a'] as channel}<label>{channel.toUpperCase()}<input aria-label={`${label} ${channel.toUpperCase()}`} type="number" step="0.01" min={channel==='a'?0:undefined} max={channel==='a'?1:undefined} bind:value={value[channel as 'r'|'g'|'b'|'a']} /></label>{/each}</div><p>RGB channels use linear light. {clipped?'The sRGB picker clips this color for display; its stored wide-gamut values are preserved.':'Gamut changes preserve the color through Rust conversion.'}</p>{#if error}<p role="alert">{error}</p>{/if}</fieldset>
+<style>.color-editor{border:1px solid var(--fd-border);border-radius:9px;padding:14px;margin:12px 0;background:var(--fd-surface)}legend{font-size:12px;font-weight:600;color:var(--fd-text)}.color-tools{display:flex;gap:12px;flex-wrap:wrap;align-items:end}label{display:flex;flex-direction:column;gap:6px;font-size:10px;color:var(--fd-text-muted)}input[type=number]{width:73px}input,select{padding:7px;border:1px solid var(--fd-border);border-radius:6px;background:var(--fd-surface);color:var(--fd-text);font:inherit;font-size:11px}input[type=color]{width:58px;height:33px;padding:3px}p{font-size:10px;line-height:1.7;color:var(--fd-text-muted);margin-top:10px}</style>

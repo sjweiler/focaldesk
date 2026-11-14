@@ -70,6 +70,7 @@ jobs:
             libgbm-dev \
             libgtk-4-dev \
             libwebkit2gtk-4.1-dev \
+            webkit2gtk-driver \
             libappindicator3-dev \
             librsvg2-dev \
             libadwaita-1-dev \
@@ -127,6 +128,8 @@ jobs:
             apps/focaldesk-ai-console3/package-lock.json
             apps/focaldesk-automation-studio/frontend/package-lock.json
             apps/focalmail/frontend/package-lock.json
+            apps/focaldesk-settings/frontend/package-lock.json
+            packages/theme/package.json
 
       - name: Install desktop frontend dependencies
         run: |
@@ -138,6 +141,45 @@ jobs:
         run: |
           npm ci
           npm run build
+
+      - name: Build and test Settings preview
+        working-directory: apps/focaldesk-settings/frontend
+        run: |
+          npm ci
+          npm run build
+          npm test
+
+      - name: Check Settings Tauri integration
+        run: |
+          cargo clippy -p focaldesk-settings --no-default-features --features tauri-ui --all-targets -- -D warnings
+          cargo test -p focaldesk-settings --no-default-features --features tauri-ui --lib
+          cargo build -p focaldesk-settings --no-default-features --features tauri-ui --bin focaldesk-settings-next
+
+      - name: Settings native WebKit integration
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: |
+          timeout 600 bash scripts/test-settings-ui.sh
+          FOCALDESK_SETTINGS_TEST_SCOPE=exclusive timeout 120 bash scripts/test-settings-ui.sh
+          FOCALDESK_SETTINGS_TEST_SCOPE=connection timeout 120 bash scripts/test-settings-ui.sh
+          FOCALDESK_SETTINGS_TEST_SCOPE=wallpapers timeout 120 bash scripts/test-settings-ui.sh
+          FOCALDESK_SETTINGS_TEST_SCOPE=power timeout 120 bash scripts/test-settings-ui.sh
+
+      - name: Upload Settings UI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: settings-native-ui
+          path: |
+            /tmp/focaldesk-settings-ui-*/
+            /tmp/focaldesk-settings-session.*/
+          if-no-files-found: ignore
+
+      - name: Audio control and microphone lifecycle tests
+        run: |
+          cargo test -p focaldesk-audio
+          cargo build -p focaldesk-audio --example audio_probe
+          python3 apps/focaldesk-settings/tests/audio_runtime.py
 
       - name: Rustfmt
         run: cargo fmt --all -- --check
@@ -163,6 +205,20 @@ jobs:
         env:
           LIBGL_ALWAYS_SOFTWARE: "1"
         run: timeout 240 bash scripts/nested-smoke.sh
+
+      - name: Display and theme preview crash recovery
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+          FOCALDESK_DISPLAY_TEST_ARTIFACTS: target/display-trial
+        run: timeout 180 bash scripts/test-display-trial.sh
+
+      - name: Upload display trial artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: display-trial
+          path: target/display-trial
+          if-no-files-found: warn
 
       - name: Upload nested compatibility artifacts
         if: always()

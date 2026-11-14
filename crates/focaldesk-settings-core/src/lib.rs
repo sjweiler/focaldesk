@@ -1,4 +1,7 @@
 // crates/focaldesk-settings-core/src/lib.rs
+mod input_persistence;
+pub use input_persistence::save_input_settings;
+
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
@@ -35,7 +38,7 @@ impl Default for Settings {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ChromeSettings {
     #[serde(default)]
     pub sidebar: ChromeRegionSettings,
@@ -43,7 +46,7 @@ pub struct ChromeSettings {
     pub topbar: ChromeRegionSettings,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ChromeRegionSettings {
     /// Stable numeric element IDs in preferred order. Unlisted built-ins are
     /// appended, so older settings remain forward-compatible.
@@ -55,7 +58,7 @@ pub struct ChromeRegionSettings {
     pub custom: Vec<ChromeLaunchItemSettings>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChromeLaunchItemSettings {
     pub id: u32,
     pub icon: String,
@@ -234,7 +237,7 @@ pub struct DisplaySettings {
     pub outputs: Vec<OutputConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OutputConfig {
     pub connector: String,
     pub enabled: bool,
@@ -528,7 +531,7 @@ pub fn rearm_exclusive_hdr_for_next_session() {
     let _ = save_exclusive_hdr_state(&state);
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InputSettings {
     pub pointer_speed: f32,
     pub natural_scroll: bool,
@@ -617,7 +620,7 @@ impl Default for KeyboardAccessibilitySettings {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct InputDeviceSettings {
     pub enabled: Option<bool>,
@@ -670,7 +673,7 @@ fn default_keyboard_repeat_rate() -> u32 {
     25
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppSettings {
     pub terminal: String,
     pub browser: String,
@@ -874,7 +877,7 @@ pub enum DebugLogLevel {
     Trace,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct DebugSettings {
     #[serde(default)]
     pub log_level: DebugLogLevel,
@@ -1149,6 +1152,74 @@ fn merged_settings_json(settings: &Settings, existing: Option<&str>) -> std::io:
     let mut json = serde_json::to_string_pretty(&value).map_err(std::io::Error::other)?;
     json.push('\n');
     Ok(json)
+}
+
+/// Persist only confirmed display preferences, preserving every unrelated key.
+/// The compositor uses this after a timed trial; trials never call this writer.
+pub fn save_display_outputs(outputs: &[OutputConfig]) -> std::io::Result<()> {
+    save_display_outputs_at(&settings_path(), outputs)
+}
+
+fn save_display_outputs_at(
+    path: &std::path::Path,
+    outputs: &[OutputConfig],
+) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let mut root: serde_json::Value = match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(error) => return Err(error),
+    };
+    let object = root
+        .as_object_mut()
+        .ok_or_else(|| std::io::Error::other("settings.json must be an object"))?;
+    let displays = object
+        .entry("displays")
+        .or_insert_with(|| serde_json::json!({}));
+    let displays = displays
+        .as_object_mut()
+        .ok_or_else(|| std::io::Error::other("displays must be an object"))?;
+    let mut merged: Vec<OutputConfig> = displays
+        .get("outputs")
+        .map(|value| serde_json::from_value(value.clone()).map_err(std::io::Error::other))
+        .transpose()?
+        .unwrap_or_default();
+    merged.retain(|existing| {
+        !outputs
+            .iter()
+            .any(|output| output.connector == existing.connector)
+    });
+    merged.extend_from_slice(outputs);
+    displays.insert(
+        "outputs".into(),
+        serde_json::to_value(merged).map_err(std::io::Error::other)?,
+    );
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("missing settings directory"))?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(
+        ".display-confirm-{}-{}.tmp",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(&serde_json::to_vec_pretty(&root).map_err(std::io::Error::other)?)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -1673,5 +1744,51 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod display_confirmation_tests {
+    use super::*;
+    #[test]
+    fn confirmation_preserves_other_preferences_and_disconnected_displays() {
+        let root = std::env::temp_dir().join(format!(
+            "focaldesk-display-save-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        let config: OutputConfig = serde_json::from_value(serde_json::json!({
+            "connector":"DP-1", "enabled":true, "x":0, "y":0, "width":1920, "height":1080,
+            "refresh_mhz":60000, "scale":1.25, "primary":true
+        }))
+        .unwrap();
+        let mut disconnected = config.clone();
+        disconnected.connector = "HDMI-A-1".into();
+        disconnected.primary = false;
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "desktop_config":{"appearance":{"theme":"Custom"}}, "input":{"unchanged":true},
+                "displays":{"outputs":[disconnected], "future_option":42}, "unknown":"preserved"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        save_display_outputs_at(&path, std::slice::from_ref(&config)).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["desktop_config"]["appearance"]["theme"], "Custom");
+        assert_eq!(saved["input"]["unchanged"], true);
+        assert_eq!(saved["unknown"], "preserved");
+        assert_eq!(saved["displays"]["future_option"], 42);
+        assert_eq!(saved["displays"]["outputs"].as_array().unwrap().len(), 2);
+        save_display_outputs_at(&path, &[config]).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["displays"]["outputs"].as_array().unwrap().len(), 2);
+        fs::write(&path, "broken settings").unwrap();
+        assert!(save_display_outputs_at(&path, &[]).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "broken settings");
+        fs::remove_dir_all(root).unwrap();
     }
 }

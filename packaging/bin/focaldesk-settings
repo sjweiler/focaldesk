@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+script_dir=${0%/*}
+exec "$script_dir/focaldesk-settings-next" "$@"

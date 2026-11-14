@@ -42,6 +42,7 @@ pub const DESKTOP_POLICY: PeerPolicy<'static> = PeerPolicy {
         "focaldesk-companion-dashboard",
         "focaldesk-launcher",
         "focaldesk-settings",
+        "focaldesk-settings-next",
         "focaldesk-portal",
         "focaldesk-cli",
         "focaldesk-ai-console",
@@ -64,7 +65,7 @@ pub const DESKTOP_POLICY: PeerPolicy<'static> = PeerPolicy {
 
 pub const SETTINGS_POLICY: PeerPolicy<'static> = PeerPolicy {
     endpoint: "settings",
-    allowed_executables: &["focaldesk-settings"],
+    allowed_executables: &["focaldesk-settings", "focaldesk-settings-next"],
     allowed_units: &[],
 };
 
@@ -89,6 +90,8 @@ pub const DIALOG_POLICY: PeerPolicy<'static> = PeerPolicy {
 pub const NOTIFICATIONS_POLICY: PeerPolicy<'static> = PeerPolicy {
     endpoint: "notifications",
     allowed_executables: &[
+        "focaldesk-settings",
+        "focaldesk-settings-next",
         "focaldesk-system-rail",
         "focaldesk-desktop",
         "focaldesk-automation",
@@ -112,6 +115,7 @@ pub const POWER_POLICY: PeerPolicy<'static> = PeerPolicy {
         "focaldesk-system-rail",
         "focaldesk-desktop",
         "focaldesk-settings",
+        "focaldesk-settings-next",
         "focaldesk-companion-dashboard",
     ],
     allowed_units: &[
@@ -156,6 +160,7 @@ pub const CONNECTOR_HOST_POLICY: PeerPolicy<'static> = PeerPolicy {
         "focaldesk-cli",
         "focaldesk-ai-console",
         "focaldesk-settings",
+        "focaldesk-settings-next",
         "focaldesk-calendar",
     ],
     allowed_units: &[],
@@ -512,6 +517,23 @@ mod tests {
             ..identity
         };
         assert!(!policy_allows(&untrusted, AI_POLICY));
+    }
+
+    #[test]
+    fn power_policy_accepts_installed_settings_preview_but_rejects_user_owned_copies() {
+        let trusted = PeerIdentity {
+            uid: 0,
+            pid: 1,
+            executable: PathBuf::from("/usr/local/bin/focaldesk-settings-next"),
+            unit: None,
+            executable_trusted: true,
+        };
+        assert!(policy_allows(&trusted, POWER_POLICY));
+        let user_owned = PeerIdentity {
+            executable_trusted: false,
+            ..trusted
+        };
+        assert!(!policy_allows(&user_owned, POWER_POLICY));
     }
 
     #[test]

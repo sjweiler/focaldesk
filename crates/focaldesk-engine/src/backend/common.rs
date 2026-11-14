@@ -77,6 +77,7 @@ pub(crate) fn physical_size_mm_from_pixels(size: Size<i32, Physical>) -> (i32, i
 /// Advance compositor services that are independent of the presentation API.
 /// Every backend must call this once before dispatching its input/event sources.
 pub(crate) fn pump_desktop_services(state: &mut DesktopState) {
+    state.process_display_trial_timer();
     state.process_settings_ipc_requests();
     state.process_clipboard_captures();
     state.process_chrome_timers();

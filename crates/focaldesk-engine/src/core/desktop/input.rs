@@ -456,6 +456,26 @@ impl DesktopState {
             unreachable!("pointer-button handler received another event");
         };
         let (button, state, position) = (*button, *state, *position);
+        if self.kill_selection_button == Some(button) && matches!(state, KeyState::Released) {
+            self.kill_selection_button = None;
+            return;
+        }
+        if self.kill_selection {
+            if matches!(state, KeyState::Pressed)
+                && matches!(button, MouseButton::Left | MouseButton::Right)
+            {
+                self.kill_selection_button = Some(button);
+                self.kill_selection = false;
+                if !self.lock_screen.active && matches!(button, MouseButton::Left) {
+                    if let Err(error) = self.kill_application_at(position.into()) {
+                        flog_warn!("Application selection failed: {}", error);
+                    }
+                }
+                self.update_pointer_cursor(self.pointer_pos);
+                self.mark_all_outputs_full_damage(DamageSource::Cursor);
+            }
+            return;
+        }
 
         if matches!(state, KeyState::Pressed) && self.ui.focused.is_some() {
             self.ui.clear_focus();
@@ -992,6 +1012,15 @@ impl DesktopState {
             .input
             .control_panel_touch_slot
             .and_then(|_| self.sole_control_panel_output());
+        if self.kill_selection {
+            let position = self.confine_pointer_to_outputs(self.pointer_pos, position.into());
+            self.input.pointer_pos = position.into();
+            self.pointer_pos = position;
+            self.cursor_manager.move_to(position.x, position.y);
+            self.update_pointer_cursor(position);
+            self.mark_all_outputs_full_damage(DamageSource::Cursor);
+            return;
+        }
         let previous_pos = self.pointer_pos;
         let pointer_locked =
             control_panel_output.is_none() && self.pointer_lock_active_at(previous_pos);
@@ -1115,6 +1144,9 @@ impl DesktopState {
     }
 
     fn handle_pointer_scroll(&mut self, event: InputEvent) {
+        if self.kill_selection {
+            return;
+        }
         let InputEvent::PointerScroll { position, delta } = &event else {
             unreachable!("scroll handler received a non-scroll event");
         };

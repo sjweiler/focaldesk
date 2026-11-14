@@ -44,6 +44,13 @@ pub enum ConnectorHostIpcRequest {
         calendar_ids: Vec<String>,
         reminder_minutes: u32,
     },
+    CalendarUpdatePreferencesChecked {
+        account_id: String,
+        expected_calendar_ids: Vec<String>,
+        expected_reminder_minutes: u32,
+        calendar_ids: Vec<String>,
+        reminder_minutes: u32,
+    },
     CalendarSyncNow {
         account_id: String,
     },
@@ -174,6 +181,7 @@ pub fn send_connector_host_request(
         request,
         ConnectorHostIpcRequest::CalendarSaveEvent { .. }
             | ConnectorHostIpcRequest::CalendarDeleteEvent { .. }
+            | ConnectorHostIpcRequest::CalendarDiscover { .. }
     ) {
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(90)))
@@ -188,8 +196,12 @@ pub fn send_connector_host_request(
         .map_err(|error| error.to_string())?;
     let mut response = Vec::new();
     stream
+        .take(8 * 1024 * 1024 + 1)
         .read_to_end(&mut response)
         .map_err(|error| error.to_string())?;
+    if response.len() > 8 * 1024 * 1024 {
+        return Err("Connector response exceeds 8 MiB.".into());
+    }
     transport::decode_message(&response)
 }
 
@@ -250,6 +262,13 @@ mod tests {
             ConnectorHostIpcRequest::CalendarUpdatePreferences {
                 account_id: "school".into(),
                 calendar_ids: vec!["primary".into()],
+                reminder_minutes: 15,
+            },
+            ConnectorHostIpcRequest::CalendarUpdatePreferencesChecked {
+                account_id: "school".into(),
+                expected_calendar_ids: vec!["primary".into()],
+                expected_reminder_minutes: 10,
+                calendar_ids: vec!["work".into()],
                 reminder_minutes: 15,
             },
             ConnectorHostIpcRequest::CalendarSyncNow {

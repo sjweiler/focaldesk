@@ -82,7 +82,8 @@ document and its wallpaper from `assets/themes/default.toml` and
 `assets/wallpaper/focaldesk_wallpaper_hdr1400.exr`. If the document cannot be loaded or
 validated, FocalDesk falls back to its compatibility theme.
 
-**Settings → Appearance** exposes only the system Default theme. The former
+**Settings → Appearance** exposes the system Default theme; the Tauri preview
+also offers the complete portable collection. The former
 Eagle, Moonbase, and Classic built-ins are preserved as optional portable
 packages in `assets/themes/optional/` for source builds. Import one through
 **Settings → Theme Editor → Import**. Installed packages then appear in
@@ -92,3 +93,9 @@ removable through Theme Editor. On the first load after this change, an
 existing Eagle, Moonbase, or Classic selection is migrated to its matching
 installed package. If that package cannot be read, FocalDesk safely selects
 Default instead.
+
+
+Every optional collection package now includes its wallpaper (Classic, Eagle,
+Moonbase, Lunar Transport, Venus Aerie, Mars Colony and Deep Space). Source
+validation installs and fully decodes every asset, including the Default wallpaper.
+Update existing system importable copies with `just install-theme-assets`.

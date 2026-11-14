@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=FocalDesk Settings Preview
+Comment=Configure FocalDesk with the opt-in Settings preview
+Exec=focaldesk-settings-next
+Icon=preferences-system
+Terminal=false
+Categories=Settings;DesktopSettings;
+StartupNotify=true

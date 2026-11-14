@@ -5,6 +5,38 @@ focal_vector_rev := "15f48794a3193bafb090448853d32e37463630ea"
 build:
     cargo build
 
+# Install the Tauri Settings app as the default and retain GTK as a fallback.
+settings-preview:
+    npm ci --prefix apps/focaldesk-settings/frontend
+    npm run build --prefix apps/focaldesk-settings/frontend
+    cargo build -p focaldesk-settings --bin focaldesk-settings
+    cargo run -p focaldesk-settings --no-default-features --features tauri-ui --bin focaldesk-settings-next
+
+# Release compositors require a root-owned Settings executable.
+install-settings-preview:
+    just install-settings
+
+# Install every portable collection package and both referenced default wallpapers.
+install-theme-assets:
+    sudo install -Dm644 assets/themes/default.toml /usr/share/focaldesk/default.toml
+    sudo install -Dm644 assets/wallpaper/Prismara-HDR1400.exr /usr/share/focaldesk/wallpaper/Prismara-HDR1400.exr
+    sudo install -Dm644 assets/wallpaper/focaldesk_wallpaper_hdr1400.exr /usr/share/focaldesk/wallpaper/focaldesk_wallpaper_hdr1400.exr
+    sudo install -Dm644 assets/themes/optional/classic.fdtheme /usr/share/focaldesk/optional-themes/classic.fdtheme
+    sudo install -Dm644 assets/themes/optional/eagle.fdtheme /usr/share/focaldesk/optional-themes/eagle.fdtheme
+    sudo install -Dm644 assets/themes/optional/moonbase.fdtheme /usr/share/focaldesk/optional-themes/moonbase.fdtheme
+    sudo install -Dm644 assets/themes/optional/lunar_transport.fdtheme /usr/share/focaldesk/optional-themes/lunar_transport.fdtheme
+    sudo install -Dm644 assets/themes/optional/venus_aerie.fdtheme /usr/share/focaldesk/optional-themes/venus-aerie.fdtheme
+    sudo install -Dm644 assets/themes/optional/mars-colony.fdtheme /usr/share/focaldesk/optional-themes/mars-colony.fdtheme
+    sudo install -Dm644 assets/themes/optional/deepspace.fdtheme /usr/share/focaldesk/optional-themes/deep-space.fdtheme
+
+# Independent of the active desktop; needs Weston or KWin and WebKitWebDriver.
+settings-test-ui:
+    bash scripts/test-settings-ui.sh
+
+# Builds both settings applications into an explicit staging root.
+settings-stage destination:
+    bash scripts/stage-settings-preview.sh "{{destination}}"
+
 nested-smoke:
     bash scripts/nested-smoke.sh
 
@@ -245,7 +277,8 @@ install-power-service:
     # One-time migration: focaldesk-powerd.service moved from default.target to graphical-session.target.
     rm -f "$HOME/.config/systemd/user/default.target.wants/focaldesk-powerd.service"
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
-    systemctl --user enable --now focaldesk-powerd.service || echo "Skipping systemd user enable: no user bus available"
+    systemctl --user enable focaldesk-powerd.service || echo "Skipping systemd user enable: no user bus available"
+    systemctl --user restart focaldesk-powerd.service || echo "Skipping power service restart: no user bus available"
 
 install-notifications-service:
     cargo build --release -p focaldesk-notificationsd
@@ -338,8 +371,14 @@ install-files:
     sudo install -Dm755 target/release/focaldesk-files /usr/local/bin/focaldesk-files
 
 install-settings:
-    cargo build --release -p focaldesk-settings
-    sudo install -Dm755 target/release/focaldesk-settings /usr/local/bin/focaldesk-settings
+    npm ci --prefix apps/focaldesk-settings/frontend
+    npm run build --prefix apps/focaldesk-settings/frontend
+    cargo build --release -p focaldesk-settings --bin focaldesk-settings
+    cargo build --release -p focaldesk-settings --no-default-features --features tauri-ui --bin focaldesk-settings-next
+    sudo install -Dm755 -o root -g root target/release/focaldesk-settings /usr/local/bin/focaldesk-settings-gtk
+    sudo install -Dm755 -o root -g root target/release/focaldesk-settings-next /usr/local/bin/focaldesk-settings-next
+    sudo install -Dm755 -o root -g root packaging/bin/focaldesk-settings /usr/local/bin/focaldesk-settings
+    sudo install -Dm644 -o root -g root packaging/applications/focaldesk-settings.desktop /usr/local/share/applications/focaldesk-settings.desktop
 
 install-ai-console:
     cargo build --release -p focaldesk-ai-console
@@ -470,9 +509,14 @@ install-desktop: install-polkit install-settings
     cargo build --release -p focaldesk-desktop
     sudo install -Dm644 assets/themes/default.toml /usr/share/focaldesk/default.toml
     sudo install -Dm644 assets/wallpaper/focaldesk_wallpaper_hdr1400.exr /usr/share/focaldesk/wallpaper/focaldesk_wallpaper_hdr1400.exr
+    sudo install -Dm644 assets/wallpaper/Prismara-HDR1400.exr /usr/share/focaldesk/wallpaper/Prismara-HDR1400.exr
     sudo install -Dm644 assets/themes/optional/lunar_transport.fdtheme /usr/share/focaldesk/optional-themes/lunar_transport.fdtheme
     sudo install -Dm644 assets/themes/optional/moonbase.fdtheme /usr/share/focaldesk/optional-themes/moonbase.fdtheme
     sudo install -Dm644 assets/themes/optional/classic.fdtheme /usr/share/focaldesk/optional-themes/classic.fdtheme
+    sudo install -Dm644 assets/themes/optional/eagle.fdtheme /usr/share/focaldesk/optional-themes/eagle.fdtheme
+    sudo install -Dm644 assets/themes/optional/mars-colony.fdtheme /usr/share/focaldesk/optional-themes/mars-colony.fdtheme
+    sudo install -Dm644 assets/themes/optional/venus_aerie.fdtheme /usr/share/focaldesk/optional-themes/venus-aerie.fdtheme
+    sudo install -Dm644 assets/themes/optional/deepspace.fdtheme /usr/share/focaldesk/optional-themes/deep-space.fdtheme
     @echo "Build artifact:"
     @md5sum target/release/focaldesk-desktop
     # mv over the running binary: direct install/cp to the live path gets "Text file busy".
@@ -610,7 +654,8 @@ install-power-service-fedora:
     # One-time migration: focaldesk-powerd.service moved from default.target to graphical-session.target.
     rm -f "$HOME/.config/systemd/user/default.target.wants/focaldesk-powerd.service"
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
-    systemctl --user enable --now focaldesk-powerd.service || echo "Skipping systemd user enable: no user bus available"
+    systemctl --user enable focaldesk-powerd.service || echo "Skipping systemd user enable: no user bus available"
+    systemctl --user restart focaldesk-powerd.service || echo "Skipping power service restart: no user bus available"
 
 install-updatesd-service-fedora:
     cargo build --release -p focaldesk-updatesd
@@ -751,3 +796,9 @@ install-automation-studio:
     install -Dm755 target/release/focaldesk-automation-studio "$HOME/.local/bin/focaldesk-automation-studio"
     install -Dm644 packaging/applications/focaldesk-automation-studio.desktop "$HOME/.local/share/applications/focaldesk-automation-studio.desktop"
     install -Dm644 apps/focaldesk-automation-studio/icons/automation-studio.svg "$HOME/.local/share/icons/hicolor/scalable/apps/focaldesk-automation-studio.svg"
+
+# Install the compositor-native click-to-kill utility and launcher entry.
+install-kill:
+    cargo build --release -p focaldesk-cli --bin focaldesk-kill
+    sudo install -Dm755 target/release/focaldesk-kill /usr/local/bin/focaldesk-kill
+    sudo install -Dm644 packaging/applications/focaldesk-kill.desktop /usr/local/share/applications/focaldesk-kill.desktop

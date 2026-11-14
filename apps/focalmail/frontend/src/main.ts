@@ -1,3 +1,4 @@
+import '@focaldesk/theme/tokens.css';
 import { mount } from 'svelte';
 import App from './App.svelte';
 import './style.css';

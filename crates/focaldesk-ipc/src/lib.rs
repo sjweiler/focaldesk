@@ -13,8 +13,8 @@ pub mod updates;
 use focaldesk_config::FocalDeskConfig;
 use focaldesk_power::PowerSnapshot;
 use focaldesk_settings_core::{
-    DisplayTransform, ExclusiveHdrPhase, HdrAppearance, HdrCalibrationPattern, OutputConfig,
-    Settings,
+    DisplayTransform, ExclusiveHdrPhase, HdrAppearance, HdrCalibrationPattern, InputSettings,
+    OutputConfig, Settings,
 };
 use focaldesk_themes::ThemeDocument;
 use serde::{Deserialize, Serialize};
@@ -61,6 +61,23 @@ pub enum IpcRequest {
     SetDisplays {
         outputs: Vec<OutputConfig>,
     },
+    /// Live output capabilities and any compositor-owned, timed display trial.
+    GetDisplayConfiguration,
+    PreviewDisplays {
+        expected: Vec<OutputConfig>,
+        outputs: Vec<OutputConfig>,
+    },
+    ConfirmDisplays {
+        preview_id: u64,
+    },
+    RevertDisplays {
+        preview_id: u64,
+    },
+    SetDisplayTrialCalibrationPattern {
+        preview_id: u64,
+        connector: String,
+        pattern: HdrCalibrationPattern,
+    },
     /// Update only the final HDR shader parameters for one connector. This
     /// request deliberately cannot change modes, topology, or KMS HDR state.
     SetHdrAppearance {
@@ -77,6 +94,12 @@ pub enum IpcRequest {
     GetDesktopSnapshot,
     /// Returns bounded capability and current-state metadata for pointer devices.
     GetInputDevices,
+    GetInputConfiguration,
+    SetInputConfiguration {
+        expected: Box<InputSettings>,
+        expected_saved: Box<InputSettings>,
+        input: Box<InputSettings>,
+    },
     GetThemeEditorStatus {
         protocol_version: u16,
     },
@@ -121,8 +144,24 @@ const fn shell_ready_default() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum ThemeEditorCommand {
-    Preview { document: ThemeDocument },
-    Apply { document: ThemeDocument },
+    PreviewOwned {
+        document: ThemeDocument,
+        token: u64,
+    },
+    ApplyOwned {
+        document: ThemeDocument,
+        token: u64,
+        expected_revision: u64,
+    },
+    RevertOwned {
+        token: u64,
+    },
+    Preview {
+        document: ThemeDocument,
+    },
+    Apply {
+        document: ThemeDocument,
+    },
     Revert,
 }
 
@@ -207,6 +246,8 @@ pub enum DesktopAction {
         direction: DesktopDirection,
     },
     CloseFocused,
+    /// Select an application with the pointer and force termination.
+    BeginKillSelection,
     /// Ask the compositor to terminate the X11 client that owns this window.
     /// The compositor rejects Wayland windows and unknown window IDs.
     TerminateX11Application {
@@ -304,11 +345,17 @@ pub enum IpcResponse {
     Settings {
         settings: Box<Settings>,
     },
+    DisplayConfiguration {
+        configuration: DisplayConfiguration,
+    },
     DisplayRuntimeStatus {
         outputs: Vec<DisplayRuntimeOutputStatus>,
     },
     DesktopSnapshot {
         snapshot: DesktopSnapshot,
+    },
+    InputConfiguration {
+        configuration: Box<InputConfiguration>,
     },
     InputDevices {
         devices: Vec<InputDeviceSnapshot>,
@@ -634,6 +681,70 @@ pub use updates::{
     UPDATES_SOCKET_ENV, UPDATES_SOCKET_NAME, UpdateIpcRequest, UpdateIpcResponse,
     send_update_request, serve_update_ipc, updates_socket_path,
 };
+
+/// An advertised monitor mode; refresh rate is in millihertz.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayMode {
+    pub width: i32,
+    pub height: i32,
+    pub refresh_mhz: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisplayOutput {
+    pub config: OutputConfig,
+    pub make: String,
+    pub model: String,
+    pub modes: Vec<DisplayMode>,
+    pub hdr_supported: bool,
+    pub hdr_active: bool,
+    pub wide_gamut_active: bool,
+    pub icc_lut_fallback_active: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayPreviewPhase {
+    Applying,
+    Confirming,
+    Reverting,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisplayPreviewStatus {
+    pub id: u64,
+    pub phase: DisplayPreviewPhase,
+    pub remaining_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisplayConfiguration {
+    pub outputs: Vec<DisplayOutput>,
+    pub preview: Option<DisplayPreviewStatus>,
+    pub hardware_modes: bool,
+}
+
+/// Input preferences, active device capabilities, and the shortcut editor catalog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputConfiguration {
+    pub input: InputSettings,
+    pub saved_input: InputSettings,
+    pub devices: Vec<InputDeviceSnapshot>,
+    pub shortcuts: Vec<InputShortcut>,
+    pub layouts: Vec<InputLayout>,
+    pub hardware_devices: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputShortcut {
+    pub action: String,
+    pub label: String,
+    pub default: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputLayout {
+    pub id: String,
+    pub label: String,
+}
 
 #[cfg(test)]
 mod theme_editor_tests {

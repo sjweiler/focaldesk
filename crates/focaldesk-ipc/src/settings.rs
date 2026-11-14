@@ -32,7 +32,9 @@ fn handle_settings_client(stream: &mut UnixStream, settings: &Arc<Mutex<Settings
 
     let response = match transport::decode_message::<IpcRequest>(&buf) {
         Ok(IpcRequest::GetAll) => {
-            let settings = settings.lock().unwrap().clone();
+            let mut current = settings.lock().unwrap();
+            *current = load_settings();
+            let settings = current.clone();
             IpcResponse::Settings {
                 settings: Box::new(settings),
             }
@@ -44,6 +46,7 @@ fn handle_settings_client(stream: &mut UnixStream, settings: &Arc<Mutex<Settings
 
         Ok(IpcRequest::SetDisplays { outputs }) => {
             let mut s = settings.lock().unwrap();
+            *s = load_settings();
             s.displays.outputs = outputs;
 
             match save_settings(&s) {
@@ -56,6 +59,7 @@ fn handle_settings_client(stream: &mut UnixStream, settings: &Arc<Mutex<Settings
 
         Ok(IpcRequest::SetValue { path, value }) => {
             let mut s = settings.lock().unwrap();
+            *s = load_settings();
 
             match apply_setting_value(&mut s, &path, value) {
                 Ok(_) => match save_settings(&s) {
@@ -88,10 +92,17 @@ fn handle_settings_client(stream: &mut UnixStream, settings: &Arc<Mutex<Settings
             | IpcRequest::Watch { .. }
             | IpcRequest::GetConfig
             | IpcRequest::SetConfig { .. }
+            | IpcRequest::SetDisplayTrialCalibrationPattern { .. }
             | IpcRequest::SetHdrAppearance { .. }
             | IpcRequest::SetHdrCalibrationPattern { .. }
+            | IpcRequest::GetDisplayConfiguration
+            | IpcRequest::PreviewDisplays { .. }
+            | IpcRequest::ConfirmDisplays { .. }
+            | IpcRequest::RevertDisplays { .. }
             | IpcRequest::GetDisplayRuntimeStatus
             | IpcRequest::GetDesktopSnapshot
+            | IpcRequest::GetInputConfiguration
+            | IpcRequest::SetInputConfiguration { .. }
             | IpcRequest::GetInputDevices
             | IpcRequest::GetThemeEditorStatus { .. }
             | IpcRequest::ThemeEditor { .. }

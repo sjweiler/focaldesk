@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Force Quit Application
+Comment=Click an application to terminate it; Escape or right-click cancels
+Exec=focaldesk-kill
+Icon=process-stop
+Terminal=false
+Categories=System;Utility;
+OnlyShowIn=FocalDesk;

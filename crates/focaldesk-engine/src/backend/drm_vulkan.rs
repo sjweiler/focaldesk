@@ -54,9 +54,10 @@ use super::common::{
 use super::common::{finish_xwayland_startup, start_xwayland};
 use super::drm::{
     connector_edid, disable_explicit_kms_fences, drm_card_vendor_id, hdr_appearance_from_support,
-    hdr_detection, load_display_config, merge_disconnected_display_configs, parse_edid_identity,
-    saved_monitor_config, select_connector_mode, translate_backend_input_event,
-    write_display_config, DisplayConfig, DisplayModeConfig, HdrSupport,
+    hdr_detection, load_display_config_with_override, merge_disconnected_display_configs,
+    parse_edid_identity, saved_monitor_config, select_connector_mode,
+    translate_backend_input_event, write_display_config, DisplayConfig, DisplayModeConfig,
+    HdrSupport,
 };
 use super::vui_shell::{QuickSettingsState, VuiShell};
 use super::wgpu_nested::{VulkanCompositorScene, VulkanSceneBuilder};
@@ -354,7 +355,49 @@ struct VulkanDrmData {
     last_cpu_capture: HashMap<OutputId, Instant>,
     screenshot_all_captures: HashMap<OutputId, (u32, u32, Vec<u8>)>,
     fatal_error: Option<anyhow::Error>,
+    allocation_backoff: HashMap<OutputId, AllocationBackoff>,
+    allocation_reclaim_pending: bool,
+    allocation_poll_backoff: AllocationBackoff,
     surface_blocker_loop: EventLoop<'static, crate::core::desktop::DesktopState>,
+}
+
+/// Limit failed allocations without tearing down scanout or starving input.
+/// After three quick attempts, probe at most once every five seconds until a
+/// successful frame resets the incident. No replacement device is allocated.
+#[derive(Default)]
+struct AllocationBackoff {
+    failures: u32,
+    retry_at: Option<Instant>,
+}
+impl AllocationBackoff {
+    fn ready(&self, now: Instant) -> bool {
+        self.retry_at.is_none_or(|deadline| now >= deadline)
+    }
+    fn failed(&mut self, now: Instant) -> Duration {
+        self.failures = self.failures.saturating_add(1);
+        let delay = match self.failures {
+            1 => Duration::from_millis(100),
+            2 => Duration::from_millis(500),
+            _ => Duration::from_secs(5),
+        };
+        self.retry_at = Some(now + delay);
+        delay
+    }
+}
+impl Drop for VulkanDrmData {
+    fn drop(&mut self) {
+        // The embedded VUI renderer borrows this device. Dispose of it before
+        // the owning renderer field is dropped, after a bounded queue drain.
+        let idle =
+            self.renderer.is_usable() && self.renderer.quiesce(Duration::from_secs(5)).is_ok();
+        if !idle {
+            self.renderer.abandon_device();
+            if let Some(shell) = self.vui_shell.as_mut() {
+                shell.abandon_ash_renderer();
+            }
+        }
+        self.vui_shell = None;
+    }
 }
 
 fn configure_vui_shell(data: &mut VulkanDrmData) {
@@ -694,9 +737,12 @@ fn resume_vulkan_session(data: &mut VulkanDrmData, reason: &str) -> Result<()> {
     Ok(())
 }
 
-fn select_outputs(drm: &DrmDevice) -> Result<Vec<OutputConfig>> {
+fn select_outputs(
+    drm: &DrmDevice,
+    overrides: Option<&[focaldesk_settings_core::OutputConfig]>,
+) -> Result<Vec<OutputConfig>> {
     let resources = drm.resource_handles().context("query DRM resources")?;
-    let configured = load_display_config();
+    let configured = load_display_config_with_override(overrides);
     // `displays.json` is renderer inventory and can lag a settings edit by a
     // session. Role and primary-output choices are user intent, so always take
     // them from canonical settings. In particular, falling back to the first
@@ -706,6 +752,7 @@ fn select_outputs(drm: &DrmDevice) -> Result<Vec<OutputConfig>> {
         .displays
         .outputs
         .into_iter()
+        .chain(overrides.unwrap_or_default().iter().cloned())
         .map(|output| (output.connector.clone(), output))
         .collect::<HashMap<_, _>>();
     let mut used_crtcs = HashSet::new();
@@ -723,8 +770,16 @@ fn select_outputs(drm: &DrmDevice) -> Result<Vec<OutputConfig>> {
         let edid = connector_edid(drm, *handle);
         let hdr_support = hdr_detection::connector_hdr_support(drm, *handle, edid.as_deref());
         let identity = edid.as_deref().and_then(parse_edid_identity);
-        let saved_monitor = saved_monitor_config(&configured, &name, identity.as_ref());
-        if saved_monitor.is_some_and(|display| !display.enabled) {
+        let saved_monitor = if overrides
+            .is_some_and(|outputs| outputs.iter().any(|output| output.connector == name))
+        {
+            saved
+        } else {
+            saved_monitor_config(&configured, &name, identity.as_ref())
+        };
+        if saved.is_some_and(|display| !display.enabled)
+            || saved_monitor.is_some_and(|display| !display.enabled)
+        {
             flog(format!(
                 "Raw Vulkan DRM leaving configured-disabled output {name} off"
             ));
@@ -903,8 +958,10 @@ fn select_outputs(drm: &DrmDevice) -> Result<Vec<OutputConfig>> {
             })
             .collect::<Vec<_>>();
         let snapshots = merge_disconnected_display_configs(snapshots, &configured);
-        if let Err(error) = write_display_config(&snapshots) {
-            flog_warn!("Raw Vulkan could not refresh display inventory: {error:#}");
+        if overrides.is_none() {
+            if let Err(error) = write_display_config(&snapshots) {
+                flog_warn!("Raw Vulkan could not refresh display inventory: {error:#}");
+            }
         }
         Ok(outputs)
     }
@@ -1536,7 +1593,26 @@ fn vulkan_connector_set_changed(data: &VulkanDrmData) -> Result<bool> {
         .drm
         .resource_handles()
         .context("query DRM resources after connector event")?;
-    let configured = load_display_config();
+    let inventory = super::drm::connected_output_inventory(&data.drm)?;
+    let names = |outputs: &[focaldesk_ipc::DisplayOutput]| {
+        outputs
+            .iter()
+            .map(|output| output.config.connector.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    if names(&inventory)
+        != names(
+            data.desktop
+                .state
+                .connected_drm_outputs
+                .get("vulkan")
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        )
+    {
+        return Ok(true);
+    }
+    let configured = load_display_config_with_override(data.desktop.state.trial_display_outputs());
     let mut connected = HashSet::new();
     for handle in resources.connectors() {
         // Read cached kernel state: forcing a probe here can itself retrain a
@@ -1548,7 +1624,10 @@ fn vulkan_connector_set_changed(data: &VulkanDrmData) -> Result<bool> {
         let name = format!("{}-{}", info.interface().as_str(), info.interface_id());
         let edid = connector_edid(&data.drm, *handle);
         let identity = edid.as_deref().and_then(parse_edid_identity);
-        if saved_monitor_config(&configured, &name, identity.as_ref())
+        if configured
+            .iter()
+            .find(|display| display.name == name)
+            .or_else(|| saved_monitor_config(&configured, &name, identity.as_ref()))
             .is_some_and(|display| !display.enabled)
         {
             continue;
@@ -1570,7 +1649,12 @@ fn rebuild_vulkan_outputs(data: &mut VulkanDrmData) -> Result<bool> {
     log_nvidia_display_heads("before-output-rebuild", "all");
     // Probe first so a transient connector read failure never destroys the
     // currently working topology.
-    let output_configs = match select_outputs(&data.drm) {
+    data.desktop.state.connected_drm_outputs.insert(
+        "vulkan".into(),
+        super::drm::connected_output_inventory(&data.drm)?,
+    );
+    let output_configs = match select_outputs(&data.drm, data.desktop.state.trial_display_outputs())
+    {
         Ok(configs) => configs,
         Err(error) => {
             flog_warn!("raw Vulkan DRM topology rebuild deferred: {error:#}");
@@ -1639,6 +1723,7 @@ fn rebuild_vulkan_outputs(data: &mut VulkanDrmData) -> Result<bool> {
         output_configs,
     )?;
     data.desktop.state.restore_output_topology(snapshot);
+    data.desktop.state.display_trial_reconfigured(true);
     configure_vui_shell(data);
     data.desktop.state.mark_redraw();
     Ok(true)
@@ -2057,31 +2142,42 @@ fn finish_vulkan_capture(data: &mut VulkanDrmData, capture: AshDrmCapture) {
 }
 
 fn recover_vulkan_renderer(data: &mut VulkanDrmData, reason: &anyhow::Error) -> Result<()> {
-    flog_warn!("recreating raw Vulkan device and scanout: {reason:#}");
-    // The replacement renderer starts with an empty texture cache. Make egui
-    // resend its retained font/image atlases instead of referring to cache keys
-    // that only existed on the abandoned Vulkan device.
-    data.desktop.state.invalidate_gpu_state();
-    // VUI owns child resources on this logical device. Drop it before the
-    // device is abandoned, then output rebuild will create it on the replacement.
-    if let Some(shell) = data.vui_shell.as_mut() {
-        shell.abandon_ash_renderer();
+    if AshDrmRenderer::is_allocation_pressure(reason) && data.renderer.is_usable() {
+        data.allocation_reclaim_pending = true;
+        data.desktop.state.mark_redraw();
+        flog_warn!("Vulkan allocation pressure; retaining scanout and scheduling cache reclamation: {reason:#}; renderer={:?}", data.renderer);
+        return Ok(());
+    }
+    flog_warn!(
+        "recreating raw Vulkan device and scanout: {reason:#}; renderer={:?}; outputs={}",
+        data.renderer,
+        data.outputs.len()
+    );
+    // Lost/hung devices cannot safely be replaced repeatedly inside this process.
+    // A finite drain gates destruction of both the embedded and owning renderer.
+    if let Err(error) = data.renderer.quiesce(Duration::from_secs(5)) {
+        data.renderer.abandon_device();
+        if let Some(shell) = data.vui_shell.as_mut() {
+            shell.abandon_ash_renderer();
+        }
+        flog_warn!("Vulkan recovery cannot quiesce; compositor must exit: {error:#}");
+        return Err(error).context(format!("Vulkan device could not quiesce; terminating compositor rather than retaining another device; original failure: {reason:#}"));
     }
     data.vui_shell = None;
-    data.renderer.abandon_device();
-    let replacement = AshDrmRenderer::new(data.primary_node.major(), data.primary_node.minor())
-        .context("recreate raw Vulkan device")?;
-    let abandoned = std::mem::replace(&mut data.renderer, replacement);
-    drop(abandoned);
-    match rebuild_vulkan_outputs(data)? {
+    data.desktop.state.invalidate_gpu_state();
+    data.renderer.recreate_quiesced(data.primary_node.major(), data.primary_node.minor())
+        .inspect_err(|error| flog_warn!("Raw Vulkan replacement failed after old-device cleanup: {error:#}; original failure: {reason:#}"))?;
+    data.allocation_backoff.clear();
+    data.allocation_poll_backoff = AllocationBackoff::default();
+    data.allocation_reclaim_pending = false;
+    match rebuild_vulkan_outputs(data)
+        .inspect_err(|error| flog_warn!("Raw Vulkan recovery failed while rebuilding scanout: {error:#}; original failure: {reason:#}"))? {
         true => {
             data.desktop.state.mark_redraw();
-            flog("raw Vulkan device and KMS scanout recovered in-process");
+            flog("raw Vulkan device and KMS scanout recovered in-process after releasing old device");
             Ok(())
         }
-        false => Err(anyhow!(
-            "cannot recover Vulkan renderer without an enabled connected output"
-        )),
+        false => Err(anyhow!("cannot recover Vulkan renderer without an enabled connected output")),
     }
 }
 
@@ -2119,7 +2215,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     let mut desktop = bootstrap_compositor_core(None, CompositorBackend::Drm)?;
     desktop.state.cpu_output_capture_available = true;
-    let output_configs = select_outputs(&drm)?;
+    desktop.state.connected_drm_outputs.insert(
+        "vulkan".into(),
+        super::drm::connected_output_inventory(&drm)?,
+    );
+    let output_configs = select_outputs(&drm, None)?;
     let outputs =
         initialize_vulkan_outputs(&mut desktop, &renderer, &mut drm, &fd, output_configs)?;
     advertise_dmabuf(&mut desktop, &renderer, node)?;
@@ -2175,6 +2275,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         last_cpu_capture: HashMap::new(),
         screenshot_all_captures: HashMap::new(),
         fatal_error: None,
+        allocation_backoff: HashMap::new(),
+        allocation_reclaim_pending: false,
+        allocation_poll_backoff: AllocationBackoff::default(),
         surface_blocker_loop,
     };
     configure_vui_shell(&mut data);
@@ -2360,6 +2463,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 .is_some_and(|deadline| Instant::now() >= deadline)
         {
             if let Err(error) = resume_vulkan_session(&mut data, "settled resume") {
+                if !data.renderer.is_usable() {
+                    return Err(error
+                        .context("Vulkan resume recovery is no longer retryable")
+                        .into());
+                }
                 flog_warn!("raw Vulkan DRM resume deferred: {error:#}");
                 data.resume_retry_at = Some(Instant::now() + Duration::from_millis(500));
             }
@@ -2418,7 +2526,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     data.restart_shell_after_present = true;
                     flog("raw Vulkan DRM topology rebuild complete");
                 }
-                Ok(false) => {}
+                Ok(false) => data.desktop.state.display_trial_reconfigured(false),
+                Err(error) if data.desktop.state.trial_display_outputs().is_some() => {
+                    flog_warn!("Display trial modeset failed; scheduling rollback: {error:#}");
+                    data.desktop.state.display_trial_reconfigured(false);
+                }
                 Err(error) => {
                     data.fatal_error = Some(error.context(
                         "raw Vulkan DRM topology rebuild failed after retiring old scanout",
@@ -2432,9 +2544,38 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         data.desktop.state.process_deferred_ui_and_launches();
         dispatch_pending_vui_request(&mut data);
         stage_vulkan_hdr_transitions(&mut data);
-        if let Err(error) = data.renderer.poll() {
-            recover_vulkan_renderer(&mut data, &error)?;
-            continue;
+        let gpu_ready = if !data.allocation_poll_backoff.ready(Instant::now()) {
+            false
+        } else {
+            match data.renderer.poll() {
+                Ok(()) => {
+                    data.allocation_poll_backoff = AllocationBackoff::default();
+                    true
+                }
+                Err(error)
+                    if AshDrmRenderer::is_allocation_pressure(&error)
+                        && data.renderer.is_usable() =>
+                {
+                    data.allocation_poll_backoff.failed(Instant::now());
+                    data.allocation_reclaim_pending = true;
+                    false
+                }
+                Err(error) => {
+                    recover_vulkan_renderer(&mut data, &error)?;
+                    continue;
+                }
+            }
+        };
+        if gpu_ready && data.allocation_reclaim_pending {
+            if let Some(freed) = data.renderer.reclaim_allocation_pressure() {
+                data.allocation_reclaim_pending = false;
+                // A readback mapping can itself fail under memory pressure.
+                // All GPU work is now retired; permit that capture to retry.
+                data.capture_pending.clear();
+                data.desktop.state.invalidate_gpu_state();
+                data.desktop.state.mark_redraw();
+                flog_warn!("Vulkan allocation recovery released {freed} cached GPU resources after queued work completed; scanout retained");
+            }
         }
         while let Some(capture) = data.renderer.take_completed_capture() {
             finish_vulkan_capture(&mut data, capture);
@@ -2501,6 +2642,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         data.desktop.state.tick_layout();
         crate::core::portal::remove_dead_portal_sessions(&mut data.desktop.state);
         data.desktop.display.flush_clients()?;
+        if !gpu_ready {
+            continue;
+        }
         if !data.desktop.state.needs_redraw()
             && !data.outputs.iter().any(|output| {
                 data.desktop
@@ -2516,6 +2660,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         let mut presented_any = false;
         for index in 0..data.outputs.len() {
             let output_id = data.outputs[index].output_id;
+            if data
+                .allocation_backoff
+                .get(&output_id)
+                .is_some_and(|backoff| !backoff.ready(Instant::now()))
+            {
+                continue;
+            }
             if data.outputs[index].frame_pending
                 || !data.desktop.state.output_has_pending_damage(output_id)
             {
@@ -2725,7 +2876,26 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 output_lut,
                 hdr_output,
             ) {
-                Ok(submission) => submission,
+                Ok(submission) => {
+                    data.allocation_backoff.remove(&output_id);
+                    submission
+                }
+                Err(error)
+                    if AshDrmRenderer::is_allocation_pressure(&error)
+                        && data.renderer.is_usable() =>
+                {
+                    data.allocation_reclaim_pending = true;
+                    let backoff = data.allocation_backoff.entry(output_id).or_default();
+                    let delay = backoff.failed(Instant::now());
+                    if backoff.failures <= 3 {
+                        flog_warn!("Vulkan allocation failed on {}; keeping current scanout, retrying after {} ms (attempt {}): {error:#}", data.outputs[index].name, delay.as_millis(), backoff.failures);
+                    }
+                    data.desktop.state.mark_output_full_damage(
+                        output_id,
+                        crate::core::desktop::DamageSource::Unknown,
+                    );
+                    continue 'main;
+                }
                 Err(error) => {
                     data.desktop.state.mark_output_full_damage(
                         output_id,
@@ -3090,5 +3260,28 @@ mod tests {
         );
         assert_eq!(rect.loc, (296, 1982).into());
         assert_eq!(rect.size, (32, 32).into());
+    }
+}
+
+#[cfg(test)]
+mod allocation_recovery_tests {
+    use super::*;
+    #[test]
+    fn memory_pressure_retries_are_rate_limited_and_success_starts_a_new_incident() {
+        let now = Instant::now();
+        let mut state = AllocationBackoff::default();
+        assert!(state.ready(now));
+        assert_eq!(state.failed(now), Duration::from_millis(100));
+        assert!(!state.ready(now + Duration::from_millis(99)));
+        assert!(state.ready(now + Duration::from_millis(100)));
+        assert_eq!(state.failed(now), Duration::from_millis(500));
+        for _ in 0..50 {
+            assert_eq!(state.failed(now), Duration::from_secs(5));
+        }
+        assert!(!state.ready(now + Duration::from_secs(4)));
+        assert!(state.ready(now + Duration::from_secs(5)));
+        state = AllocationBackoff::default();
+        assert!(state.ready(now));
+        assert_eq!(state.failed(now), Duration::from_millis(100));
     }
 }

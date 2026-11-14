@@ -728,6 +728,8 @@ pub struct DrmBackend {
     pub session: LibSeatSession,
     pub primary_gpu: DrmNode,
     pub devices: HashMap<DrmNode, DrmDeviceState>,
+    /// Retain session-owned fds if a destructive rebuild fails, so rollback can retry.
+    recovery_fds: HashMap<DrmNode, DrmDeviceFd>,
 }
 
 /// Loop data for the DRM backend.
@@ -821,9 +823,54 @@ pub(crate) fn load_display_config() -> Vec<DisplayConfig> {
     displays
 }
 
+/// Resolve trial preferences without ever storing them in renderer inventory.
+pub(crate) fn load_display_config_with_override(
+    overrides: Option<&[focaldesk_settings_core::OutputConfig]>,
+) -> Vec<DisplayConfig> {
+    let mut displays = load_display_config();
+    if let Some(outputs) = overrides {
+        for output in outputs {
+            if !displays
+                .iter()
+                .any(|display| display.name == output.connector)
+            {
+                displays.push(DisplayConfig {
+                    name: output.connector.clone(),
+                    monitor_make: None,
+                    monitor_model: None,
+                    monitor_serial: None,
+                    enabled: true,
+                    mode_width: output.width,
+                    mode_height: output.height,
+                    refresh_mhz: output.refresh_mhz,
+                    available_modes: Vec::new(),
+                    scale: f64::from(output.scale),
+                    logical_x: output.x,
+                    logical_y: output.y,
+                    physical_width_mm: None,
+                    physical_height_mm: None,
+                    primary: output.primary,
+                    transform: DisplayTransform::Normal,
+                    role: output.role,
+                    hdr_supported: false,
+                    hdr_max_luminance_nits: None,
+                    hdr_max_fall_nits: None,
+                    hdr_requested: output.hdr_requested,
+                    hdr_enabled: false,
+                    hdr_appearance: output.hdr_appearance,
+                    color_profile: output.color_profile,
+                    icc_profile_path: output.icc_profile_path.clone(),
+                });
+            }
+        }
+        apply_saved_display_positions(&mut displays, outputs);
+    }
+    displays
+}
+
 // Inventory can lag a settings edit made outside the compositor session.
-// Positions belong to connectors, so use canonical layout settings rather than
-// restoring a stale inventory position that can strand the pointer behind a gap.
+// Canonical user preferences take priority over renderer inventory, including
+// modes confirmed through a transient display trial. Inventory retains capabilities.
 fn apply_saved_display_positions(
     displays: &mut [DisplayConfig],
     outputs: &[focaldesk_settings_core::OutputConfig],
@@ -835,6 +882,24 @@ fn apply_saved_display_positions(
         {
             display.logical_x = output.x;
             display.logical_y = output.y;
+            display.enabled = output.enabled;
+            display.mode_width = output.width;
+            display.mode_height = output.height;
+            display.refresh_mhz = output.refresh_mhz;
+            display.scale = f64::from(output.scale);
+            display.primary = output.primary;
+            display.transform = match output.transform {
+                focaldesk_settings_core::DisplayTransform::Normal => DisplayTransform::Normal,
+                focaldesk_settings_core::DisplayTransform::Rotate90 => DisplayTransform::Rotate90,
+                focaldesk_settings_core::DisplayTransform::Rotate180 => DisplayTransform::Rotate180,
+                focaldesk_settings_core::DisplayTransform::Rotate270 => DisplayTransform::Rotate270,
+            };
+            display.role = output.role;
+            display.color_profile = output.color_profile;
+            display.icc_profile_path = output.icc_profile_path.clone();
+            display.hdr_requested = output.hdr_requested || output.hdr_enabled;
+            display.hdr_enabled = false;
+            display.hdr_appearance = output.hdr_appearance;
         }
     }
 }
@@ -929,6 +994,7 @@ pub(crate) fn hdr_appearance_from_support(support: &HdrSupport) -> HdrAppearance
 /// Remember that exclusive HDR verified on this connector so the next ordinary
 /// session can Apply Requested HDR10 even if exclusive mode is not re-armed.
 fn enable_persisted_hdr_request(output_name: &str) {
+    persist_canonical_hdr_request(Some(output_name), true);
     let mut displays = load_display_config();
     let mut changed = false;
     for display in displays.iter_mut() {
@@ -947,6 +1013,7 @@ fn enable_persisted_hdr_request(output_name: &str) {
 /// Persist that `name` should not auto-request HDR again (used after a stalled HDR commit
 /// forces recovery). The user can still re-enable HDR explicitly through settings.
 fn disable_persisted_hdr_request(output_name: &str) {
+    persist_canonical_hdr_request(Some(output_name), false);
     let mut displays = load_display_config();
     let mut changed = false;
     for display in displays.iter_mut() {
@@ -964,6 +1031,7 @@ fn disable_persisted_hdr_request(output_name: &str) {
 }
 
 fn disable_all_persisted_hdr_requests() {
+    persist_canonical_hdr_request(None, false);
     let mut displays = load_display_config();
     let mut changed = false;
     for display in displays.iter_mut() {
@@ -1002,6 +1070,25 @@ fn hdr_failure_persist_action(
         HdrFailurePersist::DisableAll
     } else {
         HdrFailurePersist::DisableOne
+    }
+}
+
+fn persist_canonical_hdr_request(name: Option<&str>, enabled: bool) {
+    let outputs = focaldesk_settings_core::load_settings()
+        .displays
+        .outputs
+        .into_iter()
+        .filter(|output| name.is_none_or(|name| output.connector == name))
+        .map(|mut output| {
+            output.hdr_requested = enabled;
+            output.hdr_enabled = false;
+            output
+        })
+        .collect::<Vec<_>>();
+    if !outputs.is_empty() {
+        if let Err(error) = focaldesk_settings_core::save_display_outputs(&outputs) {
+            flog_warn!("Could not persist canonical HDR recovery preference: {error}");
+        }
     }
 }
 
@@ -1411,6 +1498,10 @@ fn remove_drm_device(
     loop_handle: &LoopHandle<'_, DrmLoopData>,
     node: DrmNode,
 ) {
+    data.core
+        .state
+        .connected_drm_outputs
+        .remove(&format!("{node:?}"));
     if let Some(device) = data.backend.devices.remove(&node) {
         loop_handle.remove(device.registration_token);
 
@@ -1439,7 +1530,30 @@ fn remove_drm_device(
     }
 }
 
-fn drm_connector_topology_changed(device: &DrmDeviceState, state: &DesktopState) -> Result<bool> {
+fn drm_connector_topology_changed(
+    device: &DrmDeviceState,
+    state: &DesktopState,
+    node: DrmNode,
+) -> Result<bool> {
+    let inventory = connected_output_inventory(device.drm_output_manager.device())?;
+    let names = |outputs: &[focaldesk_ipc::DisplayOutput]| {
+        outputs
+            .iter()
+            .map(|output| output.config.connector.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    if names(&inventory)
+        != names(
+            state
+                .connected_drm_outputs
+                .get(&format!("{node:?}"))
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        )
+    {
+        return Ok(true);
+    }
+    let configured = load_display_config_with_override(state.trial_display_outputs());
     let resources = device
         .drm_output_manager
         .device()
@@ -1461,6 +1575,12 @@ fn drm_connector_topology_changed(device: &DrmDeviceState, state: &DesktopState)
             .exclusive_hdr_output
             .as_deref()
             .is_some_and(|selected| selected != output_name)
+        {
+            continue;
+        }
+        if configured
+            .iter()
+            .any(|display| display.name == output_name && !display.enabled)
         {
             continue;
         }
@@ -1508,40 +1628,12 @@ fn drm_connector_topology_changed(device: &DrmDeviceState, state: &DesktopState)
     Ok(connected != active)
 }
 
-fn drm_connector_set_changed(device: &DrmDeviceState) -> Result<bool> {
-    let resources = device
-        .drm_output_manager
-        .device()
-        .resource_handles()
-        .context("failed to query DRM resources after resume")?;
-    let mut connected = std::collections::HashSet::new();
-
-    for connector in resources.connectors() {
-        let info = device
-            .drm_output_manager
-            .device()
-            .get_connector(*connector, false)
-            .context("failed to query DRM connector after resume")?;
-        if info.state() != drm::control::connector::State::Connected {
-            continue;
-        }
-        let output_name = connector_name(&info);
-        if device
-            .exclusive_hdr_output
-            .as_deref()
-            .is_some_and(|selected| selected != output_name)
-        {
-            continue;
-        }
-        connected.insert(*connector);
-    }
-
-    let active = device
-        .surfaces
-        .values()
-        .map(|surface| surface.connector)
-        .collect::<std::collections::HashSet<_>>();
-    Ok(connected != active)
+fn drm_connector_set_changed(
+    device: &DrmDeviceState,
+    state: &DesktopState,
+    node: DrmNode,
+) -> Result<bool> {
+    drm_connector_topology_changed(device, state, node)
 }
 
 fn reinitialize_drm_device(
@@ -1567,11 +1659,10 @@ fn reinitialize_drm_device(
         .backend
         .devices
         .get(&node)
-        .ok_or_else(|| anyhow!("cannot rebuild unknown DRM device {node:?}"))?
-        .drm_output_manager
-        .device()
-        .device_fd()
-        .clone();
+        .map(|device| device.drm_output_manager.device().device_fd().clone())
+        .or_else(|| data.backend.recovery_fds.get(&node).cloned())
+        .ok_or_else(|| anyhow!("cannot rebuild unknown DRM device {node:?}"))?;
+    data.backend.recovery_fds.insert(node, fd.clone());
     // Destroy painter resources while the old EGL context is still alive, and
     // make every other compositor cache rebuild against the replacement
     // renderer created by initialize_drm_device().
@@ -1579,7 +1670,9 @@ fn reinitialize_drm_device(
     data.core.ui_state.chrome.invalidate_gpu_state();
     remove_drm_device(data, loop_handle, node);
     initialize_drm_device(data, loop_handle, node, &path, fd)?;
+    data.backend.recovery_fds.remove(&node);
     data.core.state.restore_output_topology(topology);
+    data.core.state.display_trial_reconfigured(true);
     refresh_portal_services(&data.core.state.client_wayland_display);
     data.core
         .state
@@ -1816,7 +1909,7 @@ fn process_deferred_drm_topology_change(
     data.drm_topology_refresh_pending = false;
     let mut changed_nodes = Vec::new();
     for (node, device) in &data.backend.devices {
-        match drm_connector_set_changed(device) {
+        match drm_connector_set_changed(device, &data.core.state, *node) {
             Ok(true) => changed_nodes.push(*node),
             Ok(false) => flog_warn!(
                 "Ignoring transient deferred DRM change on {node:?}; connector set is unchanged"
@@ -2891,6 +2984,96 @@ pub(crate) fn connector_edid(
     None
 }
 
+/// Kernel connector inventory includes connected outputs without a scanout surface.
+/// Never infer physical presence from saved preferences or renderer JSON.
+pub(crate) fn connected_output_inventory(
+    device: &impl drm::control::Device,
+) -> Result<Vec<focaldesk_ipc::DisplayOutput>> {
+    use focaldesk_ipc::{DisplayMode, DisplayOutput};
+    let resources = device.resource_handles()?;
+    let saved = focaldesk_settings_core::load_settings().displays.outputs;
+    let monitors = load_display_config();
+    let mut result = Vec::new();
+    for handle in resources.connectors() {
+        let info = device.get_connector(*handle, false)?;
+        if info.state() != connector::State::Connected || info.modes().is_empty() {
+            continue;
+        }
+        let name = connector_name(&info);
+        let edid = connector_edid(device, *handle);
+        let identity = edid.as_deref().and_then(parse_edid_identity);
+        let support = hdr_detection::connector_hdr_support(device, *handle, edid.as_deref());
+        let modes = info
+            .modes()
+            .iter()
+            .map(|mode| {
+                let (w, h) = mode.size();
+                DisplayMode {
+                    width: i32::from(w),
+                    height: i32::from(h),
+                    refresh_mhz: (mode.vrefresh() as i32).max(1) * 1000,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mode = &modes[0];
+        let mut config = saved
+            .iter()
+            .find(|output| output.connector == name)
+            .cloned()
+            .unwrap_or_else(|| focaldesk_settings_core::OutputConfig {
+                connector: name.clone(),
+                enabled: false,
+                x: 0,
+                y: 0,
+                width: mode.width,
+                height: mode.height,
+                refresh_mhz: mode.refresh_mhz,
+                scale: 1.0,
+                transform: focaldesk_settings_core::DisplayTransform::Normal,
+                role: OutputRole::Normal,
+                primary: false,
+                color_profile: DisplayColorProfile::Auto,
+                icc_profile_path: None,
+                hdr_requested: false,
+                hdr_enabled: false,
+                hdr_appearance: HdrAppearance::default(),
+            });
+        if !modes.iter().any(|mode| {
+            mode.width == config.width
+                && mode.height == config.height
+                && mode.refresh_mhz == config.refresh_mhz
+        }) {
+            config.width = mode.width;
+            config.height = mode.height;
+            config.refresh_mhz = mode.refresh_mhz;
+        }
+        config.enabled = false;
+        config.primary = false;
+        config.hdr_enabled = false;
+        // A newly connected monitor must not acquire another monitor's ICC/HDR
+        // calibration merely by re-enabling a previously configured connector.
+        if saved_monitor_config(&monitors, &name, identity.as_ref()).is_none() {
+            config.icc_profile_path = None;
+            config.hdr_requested = false;
+            config.hdr_appearance = hdr_appearance_from_support(&support);
+        }
+        result.push(DisplayOutput {
+            config,
+            make: identity
+                .as_ref()
+                .map(|v| v.make.clone())
+                .unwrap_or_default(),
+            model: identity.as_ref().map(|v| v.model.clone()).unwrap_or(name),
+            modes,
+            hdr_supported: support.is_detected(),
+            hdr_active: false,
+            wide_gamut_active: false,
+            icc_lut_fallback_active: false,
+        });
+    }
+    Ok(result)
+}
+
 pub(crate) mod hdr_detection {
     use super::*;
 
@@ -3789,6 +3972,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             session: session.clone(),
             primary_gpu: primary_node,
             devices: HashMap::new(),
+            recovery_fds: HashMap::new(),
         },
         libinput,
         session_active: session.is_active(),
@@ -3929,7 +4113,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 .backend
                 .devices
                 .get(&node)
-                .map(|device| drm_connector_topology_changed(device, &data.core.state));
+                .map(|device| drm_connector_topology_changed(device, &data.core.state, node));
             if matches!(topology_changed, Some(Ok(true))) {
                 flog(&format!(
                     "DRM connector topology changed on {node:?}; rebuilding outputs"
@@ -4039,16 +4223,26 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         crate::backend::common::pump_desktop_services(&mut data.core.state);
 
         event_loop.dispatch(Some(Duration::from_millis(16)), &mut data)?;
-        if data.core.state.take_display_reconfigure_request()
-            && data.session_active
+        if data.session_active
             && !data.resume_pending
             && data.lifecycle == DrmLifecycle::Running
+            && data.core.state.take_display_reconfigure_request()
         {
-            let nodes = data.backend.devices.keys().copied().collect::<Vec<_>>();
+            let nodes = data
+                .backend
+                .devices
+                .keys()
+                .chain(data.backend.recovery_fds.keys())
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
             for node in nodes {
                 flog("DRM display settings changed; rebuilding outputs");
-                if let Err(err) = reinitialize_drm_device(&mut data, &loop_handle, node) {
-                    flog_warn!("Failed to rebuild DRM outputs after settings change: {err}");
+                match reinitialize_drm_device(&mut data, &loop_handle, node) {
+                    Ok(()) => {}
+                    Err(err) => {
+                        flog_warn!("Failed to rebuild DRM outputs after settings change: {err}");
+                        data.core.state.display_trial_reconfigured(false);
+                    }
                 }
             }
         }
@@ -4215,7 +4409,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                             surface.output.name().as_str(),
                             nvidia_dual,
                         );
-                        apply_persisted_hdr_failure(persist, surface.output.name().as_str());
+                        if data.core.state.trial_display_outputs().is_some() {
+                            data.core.state.display_trial_reconfigured(false);
+                        } else {
+                            apply_persisted_hdr_failure(persist, surface.output.name().as_str());
+                        }
                         if persist == HdrFailurePersist::DisableAll {
                             for output in data.core.state.outputs.values_mut() {
                                 clear_runtime_hdr_request(output);
@@ -5252,6 +5450,10 @@ fn initialize_drm_device(
 
     let (drm, notifier) =
         DrmDevice::new(fd.clone(), true).context("Failed to create DrmDevice for added node")?;
+    data.core
+        .state
+        .connected_drm_outputs
+        .insert(format!("{node:?}"), connected_output_inventory(&drm)?);
     let gbm = GbmDevice::new(fd.clone()).context("Failed to create GBM device for node")?;
 
     let (mut renderer, render_node_for_gpu) =
@@ -5437,7 +5639,8 @@ fn initialize_drm_device(
     let mut id: u64 = 1;
 
     let mut next_x = 0;
-    let configured_displays = load_display_config();
+    let configured_displays =
+        load_display_config_with_override(data.core.state.trial_display_outputs());
     for conn in &connector_handles {
         let info = drm_output_manager
             .device()
@@ -5498,8 +5701,19 @@ fn initialize_drm_device(
             .find(|display| display.name == output_name);
         // Connector names are not monitor identities. A monitor newly plugged
         // into DP-3 must not inherit DP-3's old ICC profile or HDR calibration.
-        let saved_monitor =
-            saved_monitor_config(&configured_displays, &output_name, edid_identity.as_ref());
+        let saved_monitor = if data
+            .core
+            .state
+            .trial_display_outputs()
+            .is_some_and(|outputs| outputs.iter().any(|output| output.connector == output_name))
+        {
+            saved_display
+        } else {
+            saved_monitor_config(&configured_displays, &output_name, edid_identity.as_ref())
+        };
+        if saved_display.is_some_and(|display| !display.enabled) {
+            continue;
+        }
         let hdr_requested_from_config = saved_monitor
             .map(|display| display.hdr_requested || display.hdr_enabled)
             .unwrap_or(false);
@@ -6080,10 +6294,11 @@ fn initialize_drm_device(
                                         surface.output.name().as_str(),
                                         nvidia_dual_head_hdr_allowed(),
                                     );
-                                    apply_persisted_hdr_failure(
-                                        persist,
-                                        surface.output.name().as_str(),
-                                    );
+                                    if state.core.state.trial_display_outputs().is_some() {
+                                        state.core.state.display_trial_reconfigured(false);
+                                    } else {
+                                        apply_persisted_hdr_failure(persist, surface.output.name().as_str());
+                                    }
                                     if exclusive_hdr_output.as_deref()
                                         == Some(surface.output.name().as_str())
                                     {
@@ -6169,7 +6384,9 @@ fn initialize_drm_device(
                                         Some(surface.output.name().as_str()),
                                         None,
                                     );
-                                    enable_persisted_hdr_request(surface.output.name().as_str());
+                                    if state.core.state.trial_display_outputs().is_none() {
+                                        enable_persisted_hdr_request(surface.output.name().as_str());
+                                    }
                                     crate::core::wayland::color_management_protocol::notify_preferred_color_changed(
                                         &mut state.core.state,
                                     );
@@ -6238,8 +6455,10 @@ fn initialize_drm_device(
 
     let displays = collect_display_configs(&temp_device, &data.core, &configured_displays);
 
-    if let Err(err) = write_display_config(&displays) {
-        flog(&format!("Failed to write display config: {err}"));
+    if data.core.state.trial_display_outputs().is_none() {
+        if let Err(err) = write_display_config(&displays) {
+            flog(&format!("Failed to write display config: {err}"));
+        }
     }
 
     data.backend.devices.insert(node, temp_device);

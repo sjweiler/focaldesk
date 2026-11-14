@@ -98,99 +98,7 @@ const HDR_CALIBRATION_PATTERN_OPTIONS: &[&str] = &[
     "10% peak window",
     "Full-field peak",
 ];
-const EDITABLE_KEYBINDINGS: &[(&str, &str, &str)] = &[
-    ("launch_terminal", "Open terminal", "Super+Enter"),
-    (
-        "launch_ai_console",
-        "Open Desktop Agent",
-        "Super+Ctrl+Shift+A",
-    ),
-    ("launch_browser", "Open browser", "Super+B"),
-    ("toggle_launcher", "Open launcher", "Ctrl+Alt+D"),
-    ("close_focused", "Close focused window", "Super+Q"),
-    ("lock_screen", "Lock screen", "Super+L"),
-    ("toggle_clipboard_history", "Clipboard history", "Super+V"),
-    ("magnifier_zoom_in", "Increase magnification", "Super+equal"),
-    (
-        "magnifier_zoom_out",
-        "Decrease magnification",
-        "Super+minus",
-    ),
-    ("focus_previous", "Focus previous window", "Super+F7"),
-    ("focus_next", "Focus next window", "Super+F8"),
-    ("split_left", "Place window in left half", "Super+Left"),
-    ("split_right", "Place window in right half", "Super+Right"),
-    ("split_top", "Place window in top half", "Super+Up"),
-    ("split_bottom", "Place window in bottom half", "Super+Down"),
-    ("toggle_split_layout", "Choose a split layout", "Super+Z"),
-    (
-        "swap_split_left",
-        "Swap with left split pane",
-        "Super+Shift+Left",
-    ),
-    (
-        "swap_split_right",
-        "Swap with right split pane",
-        "Super+Shift+Right",
-    ),
-    (
-        "swap_split_top",
-        "Swap with top split pane",
-        "Super+Shift+Up",
-    ),
-    (
-        "swap_split_bottom",
-        "Swap with bottom split pane",
-        "Super+Shift+Down",
-    ),
-    (
-        "resize_split_left",
-        "Move split divider left",
-        "Super+Alt+Left",
-    ),
-    (
-        "resize_split_right",
-        "Move split divider right",
-        "Super+Alt+Right",
-    ),
-    ("resize_split_top", "Move split divider up", "Super+Alt+Up"),
-    (
-        "resize_split_bottom",
-        "Move split divider down",
-        "Super+Alt+Down",
-    ),
-    (
-        "resize_split_left_fine",
-        "Nudge split divider left",
-        "Super+Alt+Shift+Left",
-    ),
-    (
-        "resize_split_right_fine",
-        "Nudge split divider right",
-        "Super+Alt+Shift+Right",
-    ),
-    (
-        "resize_split_top_fine",
-        "Nudge split divider up",
-        "Super+Alt+Shift+Up",
-    ),
-    (
-        "resize_split_bottom_fine",
-        "Nudge split divider down",
-        "Super+Alt+Shift+Down",
-    ),
-    ("focus_split_next", "Focus next split pane", "Super+Alt+Tab"),
-    (
-        "focus_split_previous",
-        "Focus previous split pane",
-        "Super+Alt+Shift+Tab",
-    ),
-    (
-        "undo_split_action",
-        "Undo last split action",
-        "Super+Alt+BackSpace",
-    ),
-];
+use focaldesk_shortcuts::EDITABLE_SHORTCUTS as EDITABLE_KEYBINDINGS;
 
 fn normalized_shortcut(shortcut: &str) -> Result<String, String> {
     let mut modifiers = Vec::new();
@@ -2989,7 +2897,8 @@ fn main() {
         gtk::gio::ApplicationFlags::NON_UNIQUE,
     );
     app.connect_activate(move |app| build_ui(app, initial_panel.as_deref()));
-    app.run();
+    // --panel is consumed above; do not let GApplication reject our custom flag.
+    app.run_with_args(&["focaldesk-settings"]);
 }
 
 fn install_focaldesk_theme() {
@@ -11588,8 +11497,10 @@ fn power_status_text(snapshot: &focaldesk_power::PowerSnapshot) -> String {
         )
         .unwrap_or_else(|| "No battery detected".to_string());
     let mut parts = vec![battery];
-    if let Some(online) = snapshot.line_power_online {
-        parts.push(if online { "Plugged in" } else { "On battery" }.to_string());
+    if snapshot.batteries.is_empty() || snapshot.line_power_online == Some(true) {
+        parts.push("Plugged in".to_string());
+    } else if snapshot.line_power_online == Some(false) {
+        parts.push("On battery".to_string());
     }
     if let Some(profile) = snapshot
         .performance_profile

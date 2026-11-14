@@ -257,7 +257,9 @@ just install-desktop-session
 These recipes install:
 
 - `/usr/local/bin/focaldesk-desktop`
-- `/usr/local/bin/focaldesk-settings`
+- `/usr/local/bin/focaldesk-settings` (default Tauri launcher)
+- `/usr/local/bin/focaldesk-settings-next` (Tauri executable)
+- `/usr/local/bin/focaldesk-settings-gtk` (GTK fallback)
 - `/usr/libexec/focaldesk/focaldesk-polkitd`
 - `/usr/share/wayland-sessions/focaldesk.desktop`
 - `/usr/lib/systemd/user/focaldesk-session.target`

@@ -521,6 +521,7 @@ struct CachedTexture {
     format: FramePixelFormat,
     modifier: Option<u64>,
     last_used_frame: u64,
+    uploaded: bool,
 }
 
 struct BorrowedTexture {
@@ -560,6 +561,7 @@ struct OutputResources {
     scene_image: vk::Image,
     fingerprint: u64,
     grid_size: u32,
+    uploaded: bool,
 }
 
 struct PendingFrame {
@@ -578,6 +580,41 @@ struct PendingFrame {
     _retentions: Vec<FrameRetention>,
 }
 
+/// Resources owned by an unsubmitted frame. Every fallible build stage records
+/// ownership here immediately; queue submission transfers the whole batch.
+#[derive(Default)]
+struct FrameBuild {
+    command: vk::CommandBuffer,
+    fence: vk::Fence,
+    semaphore: vk::Semaphore,
+    wait_semaphores: Vec<vk::Semaphore>,
+    framebuffers: Vec<vk::Framebuffer>,
+    retired_textures: Vec<TextureResource>,
+    retired_outputs: Vec<OutputResources>,
+    staging: Vec<BufferResource>,
+    capture: Option<PendingCapture>,
+    retentions: Vec<FrameRetention>,
+}
+impl FrameBuild {
+    fn into_pending(self, serial: u64) -> PendingFrame {
+        PendingFrame {
+            serial,
+            submitted_at: Instant::now(),
+            command: self.command,
+            fence: self.fence,
+            semaphore: self.semaphore,
+            wait_semaphores: self.wait_semaphores,
+            framebuffers: self.framebuffers,
+            retired_textures: self.retired_textures,
+            retired_outputs: self.retired_outputs,
+            retired_images: Vec::new(),
+            staging: self.staging,
+            capture: self.capture,
+            _retentions: self.retentions,
+        }
+    }
+}
+
 struct PendingCapture {
     id: u64,
     buffer: BufferResource,
@@ -587,6 +624,39 @@ struct PendingCapture {
     fourcc: u32,
     output_transfer: AshDrmTransfer,
     reference_white_nits: f32,
+}
+
+/// Roll back pipeline initialization if any later Vulkan allocation fails.
+struct PipelineBuild {
+    device: ash::Device,
+    render_passes: Vec<vk::RenderPass>,
+    pipelines: Vec<vk::Pipeline>,
+    shaders: Vec<vk::ShaderModule>,
+}
+impl PipelineBuild {
+    fn new(device: &ash::Device) -> Self {
+        Self {
+            device: device.clone(),
+            render_passes: Vec::new(),
+            pipelines: Vec::new(),
+            shaders: Vec::new(),
+        }
+    }
+}
+impl Drop for PipelineBuild {
+    fn drop(&mut self) {
+        unsafe {
+            for pipeline in self.pipelines.drain(..) {
+                self.device.destroy_pipeline(pipeline, None);
+            }
+            for shader in self.shaders.drain(..) {
+                self.device.destroy_shader_module(shader, None);
+            }
+            for pass in self.render_passes.drain(..) {
+                self.device.destroy_render_pass(pass, None);
+            }
+        }
+    }
 }
 
 struct Pipelines {
@@ -791,6 +861,8 @@ pub struct AshDrmRenderer {
     /// blocking `device_wait_idle` during unwinding would otherwise prevent
     /// the display manager from restarting the compositor.
     abandon_on_drop: bool,
+    device_destroyed: bool,
+    quiesced: bool,
     info: RendererInfo,
 }
 
@@ -799,7 +871,26 @@ impl fmt::Debug for AshDrmRenderer {
         f.debug_struct("AshDrmRenderer")
             .field("queue_family", &self.queue_family)
             .field("targets", &self.targets.len())
+            .field("linear_scenes", &self.linear_scenes.len())
+            .field("output_resources", &self.output_resources.len())
             .field("textures", &self.texture_cache.len())
+            .field("abandon_on_drop", &self.abandon_on_drop)
+            .field(
+                "pending_staging_buffers",
+                &self
+                    .pending
+                    .iter()
+                    .map(|frame| frame.staging.len())
+                    .sum::<usize>(),
+            )
+            .field(
+                "pending_retired_textures",
+                &self
+                    .pending
+                    .iter()
+                    .map(|frame| frame.retired_textures.len())
+                    .sum::<usize>(),
+            )
             .field("pending", &self.pending.len())
             .field("info", &self.info)
             .finish()
@@ -1076,6 +1167,8 @@ impl AshDrmRenderer {
             stream_frames: HashMap::new(),
             output_fingerprints: HashMap::new(),
             abandon_on_drop: false,
+            device_destroyed: false,
+            quiesced: false,
             info: RendererInfo {
                 api: crate::GraphicsApi::Vulkan,
                 adapter_name,
@@ -1349,8 +1442,12 @@ impl AshDrmRenderer {
             let reached = match unsafe { self.device.get_fence_status(self.pending[index].fence) } {
                 Ok(reached) => reached,
                 Err(error) => {
-                    self.abandon_on_drop = true;
-                    return Err(anyhow!("Vulkan submission status failed: {error}"));
+                    let error =
+                        anyhow::Error::new(error).context("Vulkan submission status failed");
+                    if !Self::is_allocation_pressure(&error) {
+                        self.abandon_on_drop = true;
+                    }
+                    return Err(error);
                 }
             };
             if reached {
@@ -1376,6 +1473,14 @@ impl AshDrmRenderer {
             } else {
                 index += 1;
             }
+        }
+        if self.pending.is_empty() && !self.retired_borrowed_descriptors.is_empty() {
+            unsafe {
+                self.device
+                    .free_descriptor_sets(self.descriptor_pool, &self.retired_borrowed_descriptors)
+            }
+            .context("release retired borrowed Vulkan descriptors")?;
+            self.retired_borrowed_descriptors.clear();
         }
         Ok(())
     }
@@ -1426,7 +1531,7 @@ impl AshDrmRenderer {
     }
 
     /// Prevent potentially blocking driver teardown after a timeout or device
-    /// loss. The backend replaces this renderer with a fresh Vulkan device.
+    /// loss. The backend must terminate; only process exit releases abandoned resources.
     pub fn abandon_device(&mut self) {
         self.abandon_on_drop = true;
     }
@@ -1434,6 +1539,64 @@ impl AshDrmRenderer {
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
+        target: &DrmRenderTarget,
+        background: &[SolidQuad],
+        surfaces: &[TextureQuad],
+        overlay: &[SolidQuad],
+        overlay_after_surface: usize,
+        foreground: &[SolidQuad],
+        foreground_after_surface: usize,
+        mesh_textures: &[TextureQuad],
+        meshes: &[TexturedMesh],
+        mesh_before_surface: usize,
+        damage: &[[i32; 4]],
+        stream_id: u64,
+        capture_id: Option<u64>,
+        output_matrix: [[f32; 3]; 3],
+        output_transfer: AshDrmTransfer,
+        output_lut: Option<AshDrmOutputLut<'_>>,
+        hdr_output: Option<AshDrmHdrOutput>,
+    ) -> Result<AshDrmSubmission> {
+        let mut build = FrameBuild::default();
+        let result = self.render_inner(
+            &mut build,
+            target,
+            background,
+            surfaces,
+            overlay,
+            overlay_after_surface,
+            foreground,
+            foreground_after_surface,
+            mesh_textures,
+            meshes,
+            mesh_before_surface,
+            damage,
+            stream_id,
+            capture_id,
+            output_matrix,
+            output_transfer,
+            output_lut,
+            hdr_output,
+        );
+        if let Err(error) = &result {
+            if self.abandon_on_drop
+                || error.chain().any(|cause| {
+                    cause.downcast_ref::<vk::Result>() == Some(&vk::Result::ERROR_DEVICE_LOST)
+                })
+            {
+                self.abandon_on_drop = true;
+                self.pending.push(build.into_pending(self.frame_no));
+            } else {
+                self.rollback_frame(build);
+            }
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_inner(
+        &mut self,
+        build: &mut FrameBuild,
         target: &DrmRenderTarget,
         background: &[SolidQuad],
         surfaces: &[TextureQuad],
@@ -1524,6 +1687,9 @@ impl AshDrmRenderer {
                 )
                 .map(|scene| scene.resource)
         };
+        if let Some(resource) = retired_linear {
+            build.retired_textures.push(resource);
+        }
         let linear_image = self.linear_scenes[&stream_id].resource.image.image;
         let linear_view = self.linear_scenes[&stream_id].resource.image.view;
         let linear_initialized = self.linear_scenes[&stream_id].initialized
@@ -1571,17 +1737,13 @@ impl AshDrmRenderer {
                     .command_buffer_count(1),
             )?
         }[0];
+        build.command = command;
         unsafe {
             self.device
                 .begin_command_buffer(command, &vk::CommandBufferBeginInfo::default())
         }?;
 
         let mut textures = Vec::with_capacity(surfaces.len());
-        let mut retired_textures = Vec::new();
-        if let Some(resource) = retired_linear {
-            retired_textures.push(resource);
-        }
-        let mut staging = Vec::new();
         let retired_output = self.prepare_output_resources(
             command,
             stream_id,
@@ -1589,8 +1751,11 @@ impl AshDrmRenderer {
             linear_view,
             output_lut,
             lut_fingerprint,
-            &mut staging,
+            &mut build.staging,
         )?;
+        if let Some(resource) = retired_output {
+            build.retired_outputs.push(resource);
+        }
         let output_descriptor = self.output_resources[&stream_id].descriptor_set;
         let output_grid_size = self.output_resources[&stream_id].grid_size;
         for surface in surfaces {
@@ -1612,7 +1777,8 @@ impl AshDrmRenderer {
                 .texture_cache
                 .get(&surface.cache_key)
                 .is_some_and(|cached| {
-                    cached.width == surface.width
+                    cached.uploaded
+                        && cached.width == surface.width
                         && cached.height == surface.height
                         && cached.format == surface.format
                         && cached.modifier == modifier
@@ -1623,7 +1789,9 @@ impl AshDrmRenderer {
             // retiring a new external image every frame.
             let external = surface.dmabuf.is_some();
             if texture_needs_refresh(compatible, external, !surface.damage.is_empty()) {
-                if let Some(resource) = self.prepare_texture(command, surface, &mut staging)? {
+                if let Some(resource) =
+                    self.prepare_texture(command, surface, &mut build.staging)?
+                {
                     let cached = CachedTexture {
                         resource,
                         width: surface.width,
@@ -1631,9 +1799,10 @@ impl AshDrmRenderer {
                         format: surface.format,
                         modifier,
                         last_used_frame: self.frame_no,
+                        uploaded: external,
                     };
                     if let Some(old) = self.texture_cache.insert(surface.cache_key, cached) {
-                        retired_textures.push(old.resource);
+                        build.retired_textures.push(old.resource);
                     }
                 }
             }
@@ -1656,14 +1825,17 @@ impl AshDrmRenderer {
                 .texture_cache
                 .get(&texture.cache_key)
                 .is_some_and(|cached| {
-                    cached.width == texture.width
+                    cached.uploaded
+                        && cached.width == texture.width
                         && cached.height == texture.height
                         && cached.format == texture.format
                         && cached.modifier == modifier
                 });
             let external = texture.dmabuf.is_some();
             if texture_needs_refresh(compatible, external, !texture.damage.is_empty()) {
-                if let Some(resource) = self.prepare_texture(command, texture, &mut staging)? {
+                if let Some(resource) =
+                    self.prepare_texture(command, texture, &mut build.staging)?
+                {
                     let cached = CachedTexture {
                         resource,
                         width: texture.width,
@@ -1671,9 +1843,10 @@ impl AshDrmRenderer {
                         format: texture.format,
                         modifier,
                         last_used_frame: self.frame_no,
+                        uploaded: external,
                     };
                     if let Some(old) = self.texture_cache.insert(texture.cache_key, cached) {
-                        retired_textures.push(old.resource);
+                        build.retired_textures.push(old.resource);
                     }
                 }
             }
@@ -1701,6 +1874,7 @@ impl AshDrmRenderer {
                 as_bytes(&mesh.vertices),
                 vk::BufferUsageFlags::VERTEX_BUFFER,
             )?;
+            build.staging.push(vertex);
             let index = self
                 .create_host_buffer(as_bytes(&mesh.indices), vk::BufferUsageFlags::INDEX_BUFFER)?;
             prepared_meshes.push(Some(PreparedMesh {
@@ -1708,8 +1882,7 @@ impl AshDrmRenderer {
                 index: index.buffer,
                 index_count: mesh.indices.len() as u32,
             }));
-            staging.push(vertex);
-            staging.push(index);
+            build.staging.push(index);
         }
         let active_keys = surfaces
             .iter()
@@ -1721,7 +1894,7 @@ impl AshDrmRenderer {
             let keep = active_keys.contains(key)
                 || self.frame_no.wrapping_sub(cached.last_used_frame) <= 120;
             if !keep {
-                retired_textures.push(std::mem::replace(
+                build.retired_textures.push(std::mem::replace(
                     &mut cached.resource,
                     TextureResource::null(),
                 ));
@@ -1838,6 +2011,7 @@ impl AshDrmRenderer {
                 None,
             )
         }?;
+        build.framebuffers.push(scene_framebuffer);
         for render_area in scene_areas {
             self.record_scene_pass(
                 command,
@@ -1889,6 +2063,7 @@ impl AshDrmRenderer {
                 None,
             )
         }?;
+        build.framebuffers.push(output_framebuffer);
         for render_area in output_areas {
             self.record_output_pass(
                 command,
@@ -2000,14 +2175,15 @@ impl AshDrmRenderer {
             None
         };
 
+        build.capture = capture;
         let release = vk::ImageMemoryBarrier::default()
-            .src_access_mask(if capture.is_some() {
+            .src_access_mask(if build.capture.is_some() {
                 vk::AccessFlags::TRANSFER_READ
             } else {
                 vk::AccessFlags::COLOR_ATTACHMENT_WRITE
             })
             .dst_access_mask(vk::AccessFlags::MEMORY_READ)
-            .old_layout(if capture.is_some() {
+            .old_layout(if build.capture.is_some() {
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL
             } else {
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
@@ -2020,7 +2196,7 @@ impl AshDrmRenderer {
         unsafe {
             self.device.cmd_pipeline_barrier(
                 command,
-                if capture.is_some() {
+                if build.capture.is_some() {
                     vk::PipelineStageFlags::TRANSFER
                 } else {
                     vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
@@ -2074,119 +2250,75 @@ impl AshDrmRenderer {
                 implicit_dmabufs.push(plane.clone());
             }
         }
-        let mut wait_semaphores = Vec::with_capacity(implicit_dmabufs.len());
         for dmabuf in &implicit_dmabufs {
             let Some(sync_file) = export_dmabuf_read_fence(dmabuf.as_raw_fd())? else {
                 continue;
             };
-            match self.import_sync_file_semaphore(sync_file) {
-                Ok(semaphore) => wait_semaphores.push(semaphore),
-                Err(error) => {
-                    unsafe {
-                        for semaphore in wait_semaphores.drain(..) {
-                            self.device.destroy_semaphore(semaphore, None);
-                        }
-                    }
-                    return Err(error);
-                }
-            }
+            build
+                .wait_semaphores
+                .push(self.import_sync_file_semaphore(sync_file)?);
         }
-
         let mut export = vk::ExportSemaphoreCreateInfo::default()
             .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
-        let semaphore = match unsafe {
+        let semaphore = unsafe {
             self.device.create_semaphore(
                 &vk::SemaphoreCreateInfo::default().push_next(&mut export),
                 None,
             )
-        } {
-            Ok(semaphore) => semaphore,
-            Err(error) => {
-                unsafe {
-                    for wait in wait_semaphores.drain(..) {
-                        self.device.destroy_semaphore(wait, None);
-                    }
-                }
-                return Err(error).context("create Vulkan KMS release semaphore");
-            }
-        };
-        let fence = match unsafe {
+        }
+        .context("create Vulkan KMS release semaphore")?;
+        build.semaphore = semaphore;
+        let fence = unsafe {
             self.device
                 .create_fence(&vk::FenceCreateInfo::default(), None)
-        } {
-            Ok(fence) => fence,
-            Err(error) => {
-                unsafe {
-                    for wait in wait_semaphores.drain(..) {
-                        self.device.destroy_semaphore(wait, None);
-                    }
-                    self.device.destroy_semaphore(semaphore, None);
-                }
-                return Err(error).context("create Vulkan completion fence");
-            }
-        };
+        }
+        .context("create Vulkan completion fence")?;
+        build.fence = fence;
         let signal = [semaphore];
         let commands = [command];
         // The producer fence must also order the FOREIGN ownership acquire and
         // its layout transition, not just fragment sampling. Without the
         // maintenance8 ownership-transfer dependency flag, these operations
         // have no defined pipeline stage and require an ALL_COMMANDS wait.
-        let wait_stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; wait_semaphores.len()];
-        if let Err(error) = unsafe {
+        let wait_stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; build.wait_semaphores.len()];
+        build.retentions = surfaces
+            .iter()
+            .chain(mesh_textures)
+            .filter_map(|surface| surface.retention.clone())
+            .collect::<Vec<_>>();
+        unsafe {
             self.device.queue_submit(
                 self.queue,
                 &[vk::SubmitInfo::default()
-                    .wait_semaphores(&wait_semaphores)
+                    .wait_semaphores(&build.wait_semaphores)
                     .wait_dst_stage_mask(&wait_stages)
                     .command_buffers(&commands)
                     .signal_semaphores(&signal)],
                 fence,
             )
-        } {
-            unsafe {
-                for wait in wait_semaphores.drain(..) {
-                    self.device.destroy_semaphore(wait, None);
-                }
-                self.device.destroy_semaphore(semaphore, None);
-                self.device.destroy_fence(fence, None);
-            }
-            return Err(error).context("submit raw Vulkan composition");
         }
-        let retentions = surfaces
-            .iter()
-            .chain(mesh_textures)
-            .filter_map(|surface| surface.retention.clone())
-            .collect::<Vec<_>>();
-        let raw_fd = match unsafe {
+        .context("submit raw Vulkan composition")?;
+        self.quiesced = false;
+        // Uploads become reusable only after a successful queue submission.
+        for key in &active_keys {
+            if let Some(cached) = self.texture_cache.get_mut(key) {
+                cached.uploaded = true;
+            }
+        }
+        if let Some(output) = self.output_resources.get_mut(&stream_id) {
+            output.uploaded = true;
+        }
+        self.pending
+            .push(std::mem::take(build).into_pending(self.frame_no));
+        // From this point poll/drop own the submitted batch even if export fails.
+        let raw_fd = unsafe {
             self.external_semaphore_fd.get_semaphore_fd(
                 &vk::SemaphoreGetFdInfoKHR::default()
                     .semaphore(semaphore)
                     .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD),
             )
-        } {
-            Ok(raw_fd) => raw_fd,
-            Err(error) => {
-                // The queue owns all frame resources after a successful
-                // submit, even if exporting its KMS fence fails. Track the
-                // submission so poll/drop can release them after completion.
-                self.pending.push(PendingFrame {
-                    serial: self.frame_no,
-                    submitted_at: Instant::now(),
-                    fence,
-                    command,
-                    semaphore,
-                    wait_semaphores,
-                    framebuffers: vec![scene_framebuffer, output_framebuffer],
-                    retired_textures,
-                    retired_outputs: retired_output.into_iter().collect(),
-                    retired_images: Vec::new(),
-                    staging,
-                    capture,
-                    _retentions: retentions,
-                });
-                return Err(error).context("export Vulkan KMS sync file");
-            }
-        };
+        }
+        .context("export Vulkan KMS sync file")?;
         let fence_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
 
         // Commit retained-rendering state only once submission and sync-file
@@ -2231,21 +2363,10 @@ impl AshDrmRenderer {
                 tracing::warn!(%error, "failed to publish Vulkan read fence to DMA-BUF");
             }
         }
-        self.pending.push(PendingFrame {
-            serial: self.frame_no,
-            submitted_at: Instant::now(),
-            fence,
-            command,
-            semaphore,
-            wait_semaphores,
-            framebuffers: vec![scene_framebuffer, output_framebuffer],
-            retired_textures,
-            retired_outputs: retired_output.into_iter().collect(),
-            retired_images,
-            staging,
-            capture,
-            _retentions: retentions,
-        });
+        self.pending
+            .last_mut()
+            .expect("submitted frame")
+            .retired_images = retired_images;
         Ok(AshDrmSubmission { fence_fd })
     }
 
@@ -2253,6 +2374,7 @@ impl AshDrmRenderer {
         if self.pipelines.contains_key(&format) {
             return Ok(());
         }
+        let mut build = PipelineBuild::new(&self.device);
         let scene_attachment = [vk::AttachmentDescription::default()
             .format(vk::Format::R16G16B16A16_SFLOAT)
             .samples(vk::SampleCountFlags::TYPE_1)
@@ -2275,6 +2397,7 @@ impl AshDrmRenderer {
                 None,
             )
         }?;
+        build.render_passes.push(scene_render_pass);
         let output_attachment = [vk::AttachmentDescription::default()
             .format(format)
             .samples(vk::SampleCountFlags::TYPE_1)
@@ -2290,6 +2413,7 @@ impl AshDrmRenderer {
                 None,
             )
         }?;
+        build.render_passes.push(output_render_pass);
         let solid = self.create_pipeline(
             scene_render_pass,
             self.solid_layout,
@@ -2297,6 +2421,7 @@ impl AshDrmRenderer {
             false,
             false,
         )?;
+        build.pipelines.push(solid);
         let texture = self.create_pipeline(
             scene_render_pass,
             self.texture_layout,
@@ -2304,6 +2429,7 @@ impl AshDrmRenderer {
             true,
             false,
         )?;
+        build.pipelines.push(texture);
         let mesh = self.create_pipeline(
             scene_render_pass,
             self.texture_layout,
@@ -2311,6 +2437,7 @@ impl AshDrmRenderer {
             true,
             true,
         )?;
+        build.pipelines.push(mesh);
         let output = self.create_pipeline(
             output_render_pass,
             self.output_layout,
@@ -2318,6 +2445,7 @@ impl AshDrmRenderer {
             false,
             false,
         )?;
+        build.pipelines.push(output);
         self.pipelines.insert(
             format,
             Pipelines {
@@ -2329,6 +2457,8 @@ impl AshDrmRenderer {
                 output,
             },
         );
+        build.pipelines.clear();
+        build.render_passes.clear();
         Ok(())
     }
 
@@ -2342,18 +2472,21 @@ impl AshDrmRenderer {
     ) -> Result<vk::Pipeline> {
         let vertex_words = compile_shader(source, naga::ShaderStage::Vertex, "vs_main")?;
         let fragment_words = compile_shader(source, naga::ShaderStage::Fragment, "fs_main")?;
+        let mut build = PipelineBuild::new(&self.device);
         let vertex = unsafe {
             self.device.create_shader_module(
                 &vk::ShaderModuleCreateInfo::default().code(&vertex_words),
                 None,
             )
         }?;
+        build.shaders.push(vertex);
         let fragment = unsafe {
             self.device.create_shader_module(
                 &vk::ShaderModuleCreateInfo::default().code(&fragment_words),
                 None,
             )
         }?;
+        build.shaders.push(fragment);
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -2436,12 +2569,15 @@ impl AshDrmRenderer {
             self.device
                 .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
         }
-        .map_err(|(_, error)| error)
+        .map_err(|(partial, error)| {
+            build.pipelines.extend(
+                partial
+                    .into_iter()
+                    .filter(|handle| *handle != vk::Pipeline::null()),
+            );
+            error
+        })
         .context("create raw Vulkan composition pipeline");
-        unsafe {
-            self.device.destroy_shader_module(vertex, None);
-            self.device.destroy_shader_module(fragment, None);
-        }
         Ok(result?[0])
     }
 
@@ -2830,7 +2966,9 @@ impl AshDrmRenderer {
             .output_resources
             .get(&stream_id)
             .is_some_and(|resource| {
-                resource.scene_image == scene_image && resource.fingerprint == fingerprint
+                resource.uploaded
+                    && resource.scene_image == scene_image
+                    && resource.fingerprint == fingerprint
             });
         if compatible {
             return Ok(None);
@@ -2850,7 +2988,15 @@ impl AshDrmRenderer {
             vk::Format::R8G8B8A8_UNORM,
             vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
         )?;
-        let stage = self.create_staging(&rgba)?;
+        let stage = match self.create_staging(&rgba) {
+            Ok(stage) => stage,
+            Err(error) => {
+                unsafe {
+                    self.destroy_image(image);
+                }
+                return Err(error);
+            }
+        };
         let to_copy = vk::ImageMemoryBarrier::default()
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
             .old_layout(vk::ImageLayout::UNDEFINED)
@@ -2911,7 +3057,10 @@ impl AshDrmRenderer {
                     .descriptor_pool(self.descriptor_pool)
                     .set_layouts(&layouts),
             )
-        }?[0];
+        }
+        .inspect_err(|_| unsafe {
+            self.destroy_image(image);
+        })?[0];
         let scene_info = [vk::DescriptorImageInfo::default()
             .image_view(scene_view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
@@ -2949,6 +3098,7 @@ impl AshDrmRenderer {
                 scene_image,
                 fingerprint,
                 grid_size: lut.grid_size,
+                uploaded: false,
             },
         ))
     }
@@ -3001,7 +3151,15 @@ impl AshDrmRenderer {
             format,
             vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
         )?;
-        let stage = self.create_staging(&surface.pixels)?;
+        let stage = match self.create_staging(&surface.pixels) {
+            Ok(stage) => stage,
+            Err(error) => {
+                unsafe {
+                    self.destroy_image(image);
+                }
+                return Err(error);
+            }
+        };
         let to_copy = vk::ImageMemoryBarrier::default()
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
             .old_layout(vk::ImageLayout::UNDEFINED)
@@ -3100,6 +3258,13 @@ impl AshDrmRenderer {
         })
     }
 
+    // Heap capacity is deliberately labeled: it is not a live free-memory budget.
+    fn allocation_context(&self, operation: &str, bytes: u64, memory_type: u32) -> String {
+        let selected = self.memory_properties.memory_types[memory_type as usize];
+        let heap = self.memory_properties.memory_heaps[selected.heap_index as usize];
+        format!("{operation}: requested_bytes={bytes} memory_type={memory_type} memory_flags={:?} heap_index={} heap_capacity_bytes={}", selected.property_flags, selected.heap_index, heap.size)
+    }
+
     fn import_dmabuf_image(
         &self,
         target: &DrmRenderTarget,
@@ -3161,7 +3326,10 @@ impl AshDrmRenderer {
         let requirements = unsafe { self.device.get_image_memory_requirements(image) };
         let owned_fd = target.planes[0]
             .try_clone()
-            .context("duplicate DMA-BUF for Vulkan import")?;
+            .context("duplicate DMA-BUF for Vulkan import")
+            .inspect_err(|_| unsafe {
+                self.device.destroy_image(image, None);
+            })?;
         let raw_fd = owned_fd.into_raw_fd();
         let mut fd_properties = vk::MemoryFdPropertiesKHR::default();
         if let Err(error) = unsafe {
@@ -3212,7 +3380,9 @@ impl AshDrmRenderer {
                     drop(OwnedFd::from_raw_fd(raw_fd));
                     self.device.destroy_image(image, None);
                 }
-                return Err(error).context("import DMA-BUF memory");
+                return Err(error).with_context(|| {
+                    self.allocation_context("import DMA-BUF memory", requirements.size, memory_type)
+                });
             }
         };
         if let Err(error) = unsafe { self.device.bind_image_memory(image, memory, 0) } {
@@ -3275,7 +3445,10 @@ impl AshDrmRenderer {
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 None,
             )
-        }?;
+        }
+        .with_context(|| {
+            format!("create owned image {width}x{height} format={format:?} usage={usage:?}")
+        })?;
         let requirements = unsafe { self.device.get_image_memory_requirements(image) };
         let memory_type = match self.memory_type(
             requirements.memory_type_bits,
@@ -3298,7 +3471,13 @@ impl AshDrmRenderer {
             Ok(memory) => memory,
             Err(error) => {
                 unsafe { self.device.destroy_image(image, None) };
-                return Err(error.into());
+                return Err(error).with_context(|| {
+                    self.allocation_context(
+                        &format!("allocate owned image {width}x{height} format={format:?}"),
+                        requirements.size,
+                        memory_type,
+                    )
+                });
             }
         };
         if let Err(error) = unsafe { self.device.bind_image_memory(image, memory, 0) } {
@@ -3374,7 +3553,13 @@ impl AshDrmRenderer {
             Ok(memory) => memory,
             Err(error) => {
                 unsafe { self.device.destroy_buffer(buffer, None) };
-                return Err(error.into());
+                return Err(error).with_context(|| {
+                    self.allocation_context(
+                        "allocate host buffer memory",
+                        requirements.size,
+                        memory_type,
+                    )
+                });
             }
         };
         if let Err(error) = unsafe { self.device.bind_buffer_memory(buffer, memory, 0) } {
@@ -3437,7 +3622,13 @@ impl AshDrmRenderer {
             Ok(memory) => memory,
             Err(error) => {
                 unsafe { self.device.destroy_buffer(buffer, None) };
-                return Err(error.into());
+                return Err(error).with_context(|| {
+                    self.allocation_context(
+                        "allocate readback buffer memory",
+                        requirements.size,
+                        memory_type,
+                    )
+                });
             }
         };
         if let Err(error) = unsafe { self.device.bind_buffer_memory(buffer, memory, 0) } {
@@ -3514,48 +3705,116 @@ impl AshDrmRenderer {
             .ok_or_else(|| anyhow!("no compatible Vulkan memory type for {flags:?}"))
     }
 
-    fn destroy_pending(&self, frame: PendingFrame) {
-        unsafe {
-            if let Some(capture) = frame.capture {
-                self.device.destroy_buffer(capture.buffer.buffer, None);
-                self.device.free_memory(capture.buffer.memory, None);
-            }
-            for output in frame.retired_outputs {
+    fn rollback_frame(&mut self, mut build: FrameBuild) {
+        // Old resources may still be referenced by earlier submissions. They
+        // remain fence-owned even when this frame never reaches queue_submit.
+        if let Some(pending) = self.pending.iter_mut().max_by_key(|frame| frame.serial) {
+            pending.retired_textures.append(&mut build.retired_textures);
+            pending.retired_outputs.append(&mut build.retired_outputs);
+        }
+        self.destroy_pending(build.into_pending(self.frame_no));
+    }
+
+    pub fn is_allocation_pressure(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<vk::Result>().copied(),
+                Some(
+                    vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+                        | vk::Result::ERROR_OUT_OF_HOST_MEMORY
+                        | vk::Result::ERROR_OUT_OF_POOL_MEMORY
+                        | vk::Result::ERROR_FRAGMENTED_POOL
+                )
+            )
+        })
+    }
+
+    /// Reclaim only when no queued work can still refer to a cached resource.
+    /// Call after poll. This does not wait or poll again: outstanding work
+    /// keeps ownership until the main loop observes completion.
+    pub fn reclaim_allocation_pressure(&mut self) -> Option<usize> {
+        if !self.pending.is_empty() {
+            return None;
+        }
+        let textures = std::mem::take(&mut self.texture_cache);
+        let targets = std::mem::take(&mut self.targets);
+        let scenes = std::mem::take(&mut self.linear_scenes);
+        let outputs = std::mem::take(&mut self.output_resources);
+        let count = textures.len() + targets.len() + scenes.len() + outputs.len();
+        // Clear these together: LUT descriptors refer to scene image views and
+        // cannot survive their destruction, even if Vulkan reuses a raw handle.
+        for (_, output) in outputs {
+            unsafe {
                 self.device
                     .free_descriptor_sets(self.descriptor_pool, &[output.descriptor_set])
                     .ok();
                 self.destroy_image(output.lut);
             }
-            for image in frame.retired_images {
-                self.destroy_image(image);
-            }
-            for texture in frame.retired_textures {
-                if texture.image.image == vk::Image::null() {
-                    continue;
-                }
-                if texture.foreign {
-                    // The imported fd is independent; the Wayland buffer itself remains retained by the scene.
-                }
-                self.device
-                    .free_descriptor_sets(self.descriptor_pool, &[texture.descriptor_set])
-                    .ok();
-                self.destroy_image(texture.image);
-            }
-            for buffer in frame.staging {
-                self.device.destroy_buffer(buffer.buffer, None);
-                self.device.free_memory(buffer.memory, None);
-            }
-            for framebuffer in frame.framebuffers {
-                self.device.destroy_framebuffer(framebuffer, None);
-            }
-            for semaphore in frame.wait_semaphores {
-                self.device.destroy_semaphore(semaphore, None);
-            }
-            self.device.destroy_semaphore(frame.semaphore, None);
-            self.device.destroy_fence(frame.fence, None);
-            self.device
-                .free_command_buffers(self.command_pool, &[frame.command]);
         }
+        for (_, scene) in scenes {
+            unsafe {
+                self.device
+                    .free_descriptor_sets(self.descriptor_pool, &[scene.resource.descriptor_set])
+                    .ok();
+                self.destroy_image(scene.resource.image);
+            }
+        }
+        for (_, target) in targets {
+            unsafe {
+                self.destroy_image(target.image);
+            }
+        }
+        for (_, cached) in textures {
+            unsafe {
+                self.device
+                    .free_descriptor_sets(self.descriptor_pool, &[cached.resource.descriptor_set])
+                    .ok();
+                self.destroy_image(cached.resource.image);
+            }
+        }
+        Some(count)
+    }
+
+    pub fn is_usable(&self) -> bool {
+        !self.abandon_on_drop && !self.device_destroyed
+    }
+
+    /// Fence an empty submission behind all work on the shared graphics queue.
+    /// Unlike device_wait_idle this has an explicit timeout. Failure latches a
+    /// process-exit-only state; it must never be followed by in-process retries.
+    pub fn quiesce(&mut self, timeout: Duration) -> Result<()> {
+        ensure!(
+            self.is_usable(),
+            "Vulkan device is no longer recoverable in-process"
+        );
+        if let Err(error) = quiesce_queue(&self.device, self.queue, timeout) {
+            self.abandon_on_drop = true;
+            return Err(error);
+        }
+        self.quiesced = true;
+        Ok(())
+    }
+
+    /// The embedded renderer must have been dropped after quiesce and before
+    /// this call. Release the old logical device BEFORE allocating its successor.
+    pub fn recreate_quiesced(&mut self, major: u32, minor: u32) -> Result<()> {
+        self.recreate_with(|| Self::new(major, minor))
+    }
+
+    fn recreate_with(&mut self, create: impl FnOnce() -> Result<Self>) -> Result<()> {
+        ensure!(
+            self.quiesced && self.is_usable(),
+            "Vulkan recreation requires a quiesced usable device"
+        );
+        self.destroy_quiesced();
+        let replacement =
+            create().context("create replacement Vulkan device after freeing old device")?;
+        *self = replacement;
+        Ok(())
+    }
+
+    fn destroy_pending(&self, frame: PendingFrame) {
+        destroy_frame(&self.device, self.command_pool, self.descriptor_pool, frame);
     }
 
     unsafe fn destroy_image(&self, image: ImageResource) {
@@ -3564,6 +3823,64 @@ impl AshDrmRenderer {
             self.device.destroy_image(image.image, None);
             self.device.free_memory(image.memory, None);
         }
+    }
+}
+
+fn destroy_frame(
+    device: &ash::Device,
+    command_pool: vk::CommandPool,
+    descriptor_pool: vk::DescriptorPool,
+    frame: PendingFrame,
+) {
+    unsafe {
+        if let Some(capture) = frame.capture {
+            device.destroy_buffer(capture.buffer.buffer, None);
+            device.free_memory(capture.buffer.memory, None);
+        }
+        for output in frame.retired_outputs {
+            device
+                .free_descriptor_sets(descriptor_pool, &[output.descriptor_set])
+                .ok();
+            destroy_image(device, output.lut);
+        }
+        for image in frame.retired_images {
+            destroy_image(device, image);
+        }
+        for texture in frame.retired_textures {
+            if texture.image.image == vk::Image::null() {
+                continue;
+            }
+            if texture.foreign {
+                // The imported fd is independent; the Wayland buffer itself remains retained by the scene.
+            }
+            device
+                .free_descriptor_sets(descriptor_pool, &[texture.descriptor_set])
+                .ok();
+            destroy_image(device, texture.image);
+        }
+        for buffer in frame.staging {
+            device.destroy_buffer(buffer.buffer, None);
+            device.free_memory(buffer.memory, None);
+        }
+        for framebuffer in frame.framebuffers {
+            device.destroy_framebuffer(framebuffer, None);
+        }
+        for semaphore in frame.wait_semaphores {
+            device.destroy_semaphore(semaphore, None);
+        }
+        device.destroy_semaphore(frame.semaphore, None);
+        device.destroy_fence(frame.fence, None);
+        if frame.command != vk::CommandBuffer::null() {
+            device.free_command_buffers(command_pool, &[frame.command]);
+        }
+    }
+}
+
+unsafe fn destroy_image(device: &ash::Device, image: ImageResource) {
+    unsafe {
+        device.destroy_image_view(image.view, None);
+        device.destroy_image(image.image, None);
+        device.free_memory(image.memory, None);
     }
 }
 
@@ -3608,58 +3925,13 @@ impl TextureResource {
     }
 }
 
-impl Drop for AshDrmRenderer {
-    fn drop(&mut self) {
-        if self.abandon_on_drop {
-            // The process is exiting. Let the kernel close the Vulkan device
-            // file descriptors rather than risking an unbounded driver wait.
-            return;
-        }
+impl AshDrmRenderer {
+    fn destroy_quiesced(&mut self) {
+        debug_assert!(self.quiesced);
+        self.device_destroyed = true;
         unsafe {
-            self.device.device_wait_idle().ok();
             for frame in self.pending.drain(..) {
-                // Inline cleanup avoids borrowing all of self during drain.
-                for output in frame.retired_outputs {
-                    self.device
-                        .free_descriptor_sets(self.descriptor_pool, &[output.descriptor_set])
-                        .ok();
-                    self.device.destroy_image_view(output.lut.view, None);
-                    self.device.destroy_image(output.lut.image, None);
-                    self.device.free_memory(output.lut.memory, None);
-                }
-                for image in frame.retired_images {
-                    self.device.destroy_image_view(image.view, None);
-                    self.device.destroy_image(image.image, None);
-                    self.device.free_memory(image.memory, None);
-                }
-                for texture in frame.retired_textures {
-                    if texture.image.image != vk::Image::null() {
-                        self.device
-                            .free_descriptor_sets(self.descriptor_pool, &[texture.descriptor_set])
-                            .ok();
-                        self.device.destroy_image_view(texture.image.view, None);
-                        self.device.destroy_image(texture.image.image, None);
-                        self.device.free_memory(texture.image.memory, None);
-                    }
-                }
-                for buffer in frame.staging {
-                    self.device.destroy_buffer(buffer.buffer, None);
-                    self.device.free_memory(buffer.memory, None);
-                }
-                if let Some(capture) = frame.capture {
-                    self.device.destroy_buffer(capture.buffer.buffer, None);
-                    self.device.free_memory(capture.buffer.memory, None);
-                }
-                for framebuffer in frame.framebuffers {
-                    self.device.destroy_framebuffer(framebuffer, None);
-                }
-                for semaphore in frame.wait_semaphores {
-                    self.device.destroy_semaphore(semaphore, None);
-                }
-                self.device.destroy_semaphore(frame.semaphore, None);
-                self.device.destroy_fence(frame.fence, None);
-                self.device
-                    .free_command_buffers(self.command_pool, &[frame.command]);
+                destroy_frame(&self.device, self.command_pool, self.descriptor_pool, frame);
             }
             for (_, target) in self.targets.drain() {
                 self.device.destroy_image_view(target.image.view, None);
@@ -3729,6 +4001,44 @@ impl Drop for AshDrmRenderer {
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
+    }
+}
+fn quiesce_queue(device: &ash::Device, queue: vk::Queue, timeout: Duration) -> Result<()> {
+    let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
+        .context("create Vulkan quiesce fence")?;
+    if let Err(error) = unsafe { device.queue_submit(queue, &[], fence) } {
+        unsafe {
+            device.destroy_fence(fence, None);
+        }
+        return Err(error).context("submit Vulkan quiesce fence");
+    }
+    // A failed wait leaves a potentially queued fence alive until process exit.
+    unsafe {
+        device.wait_for_fences(
+            &[fence],
+            true,
+            timeout.as_nanos().min(u64::MAX as u128) as u64,
+        )
+    }
+    .context("wait for Vulkan quiesce fence")?;
+    unsafe {
+        device.destroy_fence(fence, None);
+    }
+    Ok(())
+}
+
+impl Drop for AshDrmRenderer {
+    fn drop(&mut self) {
+        if self.abandon_on_drop || self.device_destroyed {
+            return;
+        }
+        if !self.quiesced {
+            if let Err(error) = self.quiesce(GPU_SUBMISSION_TIMEOUT) {
+                tracing::error!("Vulkan teardown could not quiesce; deferring device release to process exit: {error:#}");
+                return;
+            }
+        }
+        self.destroy_quiesced();
     }
 }
 
@@ -4599,3 +4909,7 @@ mod tests {
         assert_eq!(regions[0].extent.height, 100);
     }
 }
+
+#[cfg(test)]
+#[path = "ash_drm/recovery_tests.rs"]
+mod recovery_tests;

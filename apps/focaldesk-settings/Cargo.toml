@@ -3,9 +3,33 @@ name = "focaldesk-settings"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["gtk-ui"]
+gtk-ui = ["dep:gtk", "dep:adw", "dep:focaldesk-gtk"]
+tauri-ui = ["dep:tauri", "dep:tauri-build", "dep:rfd", "dep:gtk3", "tauri/custom-protocol"]
+
+[[bin]]
+name = "focaldesk-settings"
+path = "src/main.rs"
+required-features = ["gtk-ui"]
+
+[[bin]]
+name = "focaldesk-settings-next"
+path = "src/tauri_main.rs"
+required-features = ["tauri-ui"]
+
+[build-dependencies]
+tauri-build = { version = "2", optional = true }
+
 [dependencies]
-gtk = { package = "gtk4", version = "0.9", features = ["v4_12"] }
-adw = { package = "libadwaita", version = "0.7", features = ["v1_4"] }
+tempfile = "3"
+tauri = { version = "2", optional = true }
+rfd = { version = "0.15", optional = true, default-features = false, features = ["xdg-portal", "tokio"] }
+sha2 = "0.10"
+base64 = "0.22"
+
+gtk = { package = "gtk4", version = "0.9", features = ["v4_12"], optional = true }
+adw = { package = "libadwaita", version = "0.7", features = ["v1_4"], optional = true }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
@@ -15,10 +39,12 @@ dirs = "5"
 image.workspace = true
 focaldesk-logging = { path = "../../crates/focaldesk-logging" }
 focaldesk-launcher-state = { path = "../../crates/focaldesk-launcher-state" }
-focaldesk-gtk = { path = "../../crates/focaldesk-gtk" }
+focaldesk-gtk = { path = "../../crates/focaldesk-gtk", optional = true }
 focaldesk-config = { path = "../../crates/focaldesk-config" }
 focaldesk-ipc = { path = "../../crates/focaldesk-ipc" }
+focaldesk-shortcuts = { path = "../../crates/focaldesk-shortcuts" }
 focaldesk-settings-core = { path = "../../crates/focaldesk-settings-core" }
+focaldesk-audio = { path = "../../crates/focaldesk-audio" }
 focaldesk-power = { path = "../../crates/focaldesk-power" }
 focaldesk-bluetooth = { path = "../../crates/focaldesk-bluetooth" }
 focaldesk-sounds = { path = "../../crates/focaldesk-sounds" }
@@ -28,3 +54,6 @@ focaldesk-permissions = { path = "../../crates/focaldesk-permissions" }
 tracing = { workspace = true }
 zbus = "4"
 libc = { workspace = true }
+url = "2"
+gio = "0.20"
+gtk3 = { package = "gtk", version = "0.18", optional = true }

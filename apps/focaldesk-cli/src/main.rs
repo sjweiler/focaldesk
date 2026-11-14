@@ -29,6 +29,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     match command.as_str() {
+        "kill" => execute_desktop_action(DesktopAction::BeginKillSelection),
         "notify" => {
             let title = args.next().context("notify requires a title")?;
             let mut timeout_ms = None;
@@ -81,6 +82,70 @@ fn main() -> anyhow::Result<()> {
                 other => bail!("unexpected response: {other:?}"),
             }
         }
+        "theme-editor-status" | "theme-editor-command" => {
+            let request = if command == "theme-editor-status" {
+                IpcRequest::GetThemeEditorStatus {
+                    protocol_version: focaldesk_ipc::THEME_EDITOR_PROTOCOL_VERSION,
+                }
+            } else {
+                let path = args
+                    .next()
+                    .context("theme-editor-command requires a JSON command file")?;
+                let command = serde_json::from_reader(std::fs::File::open(path)?)?;
+                IpcRequest::ThemeEditor {
+                    protocol_version: focaldesk_ipc::THEME_EDITOR_PROTOCOL_VERSION,
+                    command: Box::new(command),
+                }
+            };
+            match send_desktop_request(&request).map_err(anyhow::Error::msg)? {
+                response @ IpcResponse::ThemeEditorStatus { .. } => {
+                    println!("{}", serde_json::to_string_pretty(&response)?);
+                    Ok(())
+                }
+                IpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        }
+        "display-configuration" | "preview-displays" | "confirm-displays" | "revert-displays" => {
+            let request = match command.as_str() {
+                "display-configuration" => IpcRequest::GetDisplayConfiguration,
+                "preview-displays" => {
+                    #[derive(serde::Deserialize)]
+                    struct Trial {
+                        expected: Vec<focaldesk_settings_core::OutputConfig>,
+                        outputs: Vec<focaldesk_settings_core::OutputConfig>,
+                    }
+                    let path = args.next().context(
+                        "preview-displays requires a JSON file with expected and outputs arrays",
+                    )?;
+                    let trial: Trial = serde_json::from_reader(std::fs::File::open(path)?)?;
+                    IpcRequest::PreviewDisplays {
+                        expected: trial.expected,
+                        outputs: trial.outputs,
+                    }
+                }
+                "confirm-displays" => IpcRequest::ConfirmDisplays {
+                    preview_id: args
+                        .next()
+                        .context("confirm-displays requires the current trial id")?
+                        .parse()?,
+                },
+                _ => IpcRequest::RevertDisplays {
+                    preview_id: args
+                        .next()
+                        .context("revert-displays requires the current trial id")?
+                        .parse()?,
+                },
+            };
+            match send_desktop_request(&request).map_err(anyhow::Error::msg)? {
+                IpcResponse::DisplayConfiguration { configuration } => {
+                    println!("{}", serde_json::to_string_pretty(&configuration)?);
+                    Ok(())
+                }
+                IpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        }
         "display-runtime-status" => {
             let response = send_desktop_request(&IpcRequest::GetDisplayRuntimeStatus)
                 .map_err(anyhow::Error::msg)?;
@@ -89,6 +154,23 @@ fn main() -> anyhow::Result<()> {
                     println!("{}", serde_json::to_string_pretty(&outputs)?);
                     Ok(())
                 }
+                IpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        }
+        "display-trial-calibration-pattern" => {
+            let preview_id = args.next().context("requires a trial id")?.parse()?;
+            let connector = args.next().context("requires a connector")?;
+            let pattern =
+                parse_hdr_calibration_pattern(&args.next().context("requires a pattern")?)?;
+            match send_desktop_request(&IpcRequest::SetDisplayTrialCalibrationPattern {
+                preview_id,
+                connector,
+                pattern,
+            })
+            .map_err(anyhow::Error::msg)?
+            {
+                IpcResponse::Ok => Ok(()),
                 IpcResponse::Error { message } => bail!(message),
                 other => bail!("unexpected response: {other:?}"),
             }
@@ -1767,10 +1849,18 @@ fn write_json_atomic(path: &std::path::Path, value: &impl serde::Serialize) -> a
 
 fn print_usage() {
     eprintln!("usage:");
+    eprintln!("  focaldesk-cli kill (click an application; Escape/right-click cancels)");
     eprintln!("  focaldesk-cli notify <title> [body...] [--timeout-ms <ms>]");
     eprintln!("  focaldesk-cli identify-displays");
     eprintln!("  focaldesk-cli desktop-snapshot");
     eprintln!("  focaldesk-cli display-runtime-status");
+    eprintln!("  focaldesk-cli display-configuration");
+    eprintln!("  focaldesk-cli theme-editor-status");
+    eprintln!("  focaldesk-cli theme-editor-command <command.json>");
+    eprintln!("  focaldesk-cli preview-displays <trial.json>");
+    eprintln!("  focaldesk-cli confirm-displays <trial-id>");
+    eprintln!("  focaldesk-cli display-trial-calibration-pattern <trial-id> <connector> <pattern>");
+    eprintln!("  focaldesk-cli revert-displays <trial-id>");
     eprintln!(
         "  focaldesk-cli hdr-calibration-pattern <connector> <off|overview|near-black|reference-white|peak-window|peak-full-frame>"
     );

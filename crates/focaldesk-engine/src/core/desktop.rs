@@ -1,6 +1,8 @@
 #![allow(unused_imports)]
 
+mod display_configuration;
 mod input;
+mod input_configuration;
 mod magnifier;
 
 use focaldesk_types::types::{OutputId, WindowId, WorkspaceId};
@@ -1868,6 +1870,8 @@ pub struct DesktopState {
     // focus/input
     pub seat_name: String,
     pub focused_window: Option<WindowId>,
+    pub(crate) kill_selection: bool,
+    kill_selection_button: Option<MouseButton>,
     workspace_focus: HashMap<(OutputId, WorkspaceId), WindowId>,
     split_divider_drag: Option<SplitDividerDrag>,
     split_resize_hud: Option<SplitResizeHud>,
@@ -1960,6 +1964,9 @@ pub struct DesktopState {
     /// this to rebuild their physical KMS/scanout objects from the persisted
     /// display configuration instead of waiting for a udev connector event.
     display_reconfigure_requested: bool,
+    display_trial: Option<display_configuration::DisplayTrial>,
+    display_trial_sequence: u64,
+    pub(crate) connected_drm_outputs: HashMap<String, Vec<focaldesk_ipc::DisplayOutput>>,
 
     /// Undecorated winit window: set on left-press over chrome top bar; backend calls platform window drag.
     host_window_drag_requested: bool,
@@ -2287,7 +2294,10 @@ fn libinput_device_id(device: &LibinputDevice) -> String {
     )
 }
 
-fn apply_libinput_device_settings(device: &mut LibinputDevice, settings: &InputDeviceSettings) {
+fn apply_libinput_device_settings(
+    device: &mut LibinputDevice,
+    settings: &InputDeviceSettings,
+) -> Result<(), String> {
     let can_disable = !device.has_capability(LibinputDeviceCapability::Keyboard)
         && device
             .config_send_events_modes()
@@ -2299,17 +2309,23 @@ fn apply_libinput_device_settings(device: &mut LibinputDevice, settings: &InputD
             } else {
                 SendEventsMode::DISABLED
             };
-            let _ = device.config_send_events_set_mode(mode);
+            device
+                .config_send_events_set_mode(mode)
+                .map_err(|error| format!("Input device rejected the setting: {error:?}"))?;
         }
     }
     if device.config_tap_finger_count() > 0 {
         if let Some(enabled) = settings.tap_to_click {
-            let _ = device.config_tap_set_enabled(enabled);
+            device
+                .config_tap_set_enabled(enabled)
+                .map_err(|error| format!("Input device rejected the setting: {error:?}"))?;
         }
     }
     if device.config_dwt_is_available() {
         if let Some(enabled) = settings.disable_while_typing {
-            let _ = device.config_dwt_set_enabled(enabled);
+            device
+                .config_dwt_set_enabled(enabled)
+                .map_err(|error| format!("Input device rejected the setting: {error:?}"))?;
         }
     }
     if device.config_accel_is_available() {
@@ -2320,11 +2336,15 @@ fn apply_libinput_device_settings(device: &mut LibinputDevice, settings: &InputD
         };
         if let Some(profile) = profile {
             if device.config_accel_profiles().contains(&profile) {
-                let _ = device.config_accel_set_profile(profile);
+                device
+                    .config_accel_set_profile(profile)
+                    .map_err(|error| format!("Input device rejected the setting: {error:?}"))?;
             }
         }
         if let Some(speed) = settings.acceleration_speed {
-            let _ = device.config_accel_set_speed(speed.clamp(-1.0, 1.0));
+            device
+                .config_accel_set_speed(speed.clamp(-1.0, 1.0))
+                .map_err(|error| format!("Input device rejected the setting: {error:?}"))?;
         }
     }
     let scroll_method = match settings.scroll_method {
@@ -2336,19 +2356,26 @@ fn apply_libinput_device_settings(device: &mut LibinputDevice, settings: &InputD
     };
     if let Some(method) = scroll_method {
         if device.config_scroll_methods().contains(&method) {
-            let _ = device.config_scroll_set_method(method);
+            device
+                .config_scroll_set_method(method)
+                .map_err(|error| format!("Input device rejected the setting: {error:?}"))?;
         }
     }
     if device.config_left_handed_is_available() {
         if let Some(enabled) = settings.left_handed {
-            let _ = device.config_left_handed_set(enabled);
+            device
+                .config_left_handed_set(enabled)
+                .map_err(|error| format!("Input device rejected the setting: {error:?}"))?;
         }
     }
     if device.config_middle_emulation_is_available() {
         if let Some(enabled) = settings.middle_button_emulation {
-            let _ = device.config_middle_emulation_set_enabled(enabled);
+            device
+                .config_middle_emulation_set_enabled(enabled)
+                .map_err(|error| format!("Input device rejected the setting: {error:?}"))?;
         }
     }
+    Ok(())
 }
 
 impl DesktopState {
@@ -2940,6 +2967,10 @@ impl DesktopState {
 
     pub fn process_notification_timers(&mut self) {
         let now = Instant::now();
+        if self.theme.expire_editor_preview(now) {
+            self.render.fonts_prewarm_done = false;
+            self.mark_all_outputs_full_damage(DamageSource::Unknown);
+        }
         let poll_interval = Duration::from_millis(250);
         if now.saturating_duration_since(self.last_notification_poll_at) < poll_interval {
             return;
@@ -3055,7 +3086,7 @@ impl DesktopState {
             self.mark_focused_output_full_damage(DamageSource::Unknown);
         }
 
-        let on_ac = snapshot.line_power_online.unwrap_or(false);
+        let on_ac = !snapshot.has_battery() || snapshot.line_power_online.unwrap_or(false);
         let low_battery = snapshot.is_low_battery(LOW_BATTERY_THRESHOLD_PERCENT);
 
         if on_ac || !low_battery {
@@ -3259,6 +3290,7 @@ impl DesktopState {
     }
 
     pub(crate) fn handle_session_suspend(&mut self) {
+        self.revert_display_trial();
         // libinput is suspended immediately after this callback, so releases
         // for keys held during the transition may never arrive. Leaving one
         // modifier pressed in Smithay makes lock-screen text input reject all
@@ -3480,7 +3512,9 @@ impl DesktopState {
         }
         let id = libinput_device_id(&device);
         if let Some(settings) = self.input_settings.devices.get(&id) {
-            apply_libinput_device_settings(&mut device, settings);
+            if let Err(error) = apply_libinput_device_settings(&mut device, settings) {
+                flog_warn!("Could not restore input device settings: {error}");
+            }
         }
         self.libinput_devices.insert(id, device);
     }
@@ -3492,7 +3526,9 @@ impl DesktopState {
     fn apply_all_libinput_device_settings(&mut self) {
         for (id, device) in &mut self.libinput_devices {
             if let Some(settings) = self.input_settings.devices.get(id) {
-                apply_libinput_device_settings(device, settings);
+                if let Err(error) = apply_libinput_device_settings(device, settings) {
+                    flog_warn!("Could not apply input device settings: {error}");
+                }
             }
         }
     }
@@ -3565,6 +3601,19 @@ impl DesktopState {
         request: IpcRequest,
         response: mpsc::Sender<IpcResponse>,
     ) -> Option<IpcResponse> {
+        if self.display_trial.is_some()
+            && matches!(
+                &request,
+                IpcRequest::SetDisplays { .. }
+                    | IpcRequest::SetHdrAppearance { .. }
+                    | IpcRequest::SetHdrCalibrationPattern { .. }
+                    | IpcRequest::Reload
+            )
+        {
+            return Some(IpcResponse::Error {
+                message: "Confirm or revert the active display trial first.".into(),
+            });
+        }
         match request {
             IpcRequest::Get { key } => {
                 match get_config_key(&load_config(), &key).or_else(|| get_runtime_key(self, &key)) {
@@ -3700,6 +3749,37 @@ impl DesktopState {
                     })
                 }
             }
+            IpcRequest::GetDisplayConfiguration => Some(IpcResponse::DisplayConfiguration {
+                configuration: self.display_configuration(),
+            }),
+            IpcRequest::PreviewDisplays { expected, outputs } => {
+                Some(match self.preview_displays(expected, outputs) {
+                    Ok(configuration) => IpcResponse::DisplayConfiguration { configuration },
+                    Err(message) => IpcResponse::Error { message },
+                })
+            }
+            IpcRequest::ConfirmDisplays { preview_id } => {
+                Some(match self.confirm_displays(preview_id) {
+                    Ok(configuration) => IpcResponse::DisplayConfiguration { configuration },
+                    Err(message) => IpcResponse::Error { message },
+                })
+            }
+            IpcRequest::RevertDisplays { preview_id } => {
+                Some(match self.revert_displays(preview_id) {
+                    Ok(configuration) => IpcResponse::DisplayConfiguration { configuration },
+                    Err(message) => IpcResponse::Error { message },
+                })
+            }
+            IpcRequest::SetDisplayTrialCalibrationPattern {
+                preview_id,
+                connector,
+                pattern,
+            } => Some(
+                match self.display_trial_calibration_pattern(preview_id, &connector, pattern) {
+                    Ok(()) => IpcResponse::Ok,
+                    Err(message) => IpcResponse::Error { message },
+                },
+            ),
             IpcRequest::SetDisplays { outputs } => match self.apply_display_configs(outputs) {
                 Ok(()) => Some(IpcResponse::Ok),
                 Err(message) => Some(IpcResponse::Error { message }),
@@ -3723,6 +3803,21 @@ impl DesktopState {
             IpcRequest::GetDesktopSnapshot => Some(IpcResponse::DesktopSnapshot {
                 snapshot: self.desktop_snapshot(),
             }),
+            IpcRequest::GetInputConfiguration => Some(IpcResponse::InputConfiguration {
+                configuration: Box::new(self.input_configuration()),
+            }),
+            IpcRequest::SetInputConfiguration {
+                expected,
+                expected_saved,
+                input,
+            } => Some(
+                match self.set_input_configuration(*expected, *expected_saved, *input) {
+                    Ok(configuration) => IpcResponse::InputConfiguration {
+                        configuration: Box::new(configuration),
+                    },
+                    Err(message) => IpcResponse::Error { message },
+                },
+            ),
             IpcRequest::GetInputDevices => Some(IpcResponse::InputDevices {
                 devices: self.input_device_snapshots(),
             }),
@@ -3764,6 +3859,18 @@ impl DesktopState {
                     });
                 }
                 let result = match *command {
+                    ThemeEditorCommand::PreviewOwned { document, token } => {
+                        self.theme.preview_owned(&document, token)
+                    }
+                    ThemeEditorCommand::ApplyOwned {
+                        document,
+                        token,
+                        expected_revision,
+                    } => self
+                        .theme
+                        .apply_owned(&document, token, expected_revision)
+                        .map(|_| ()),
+                    ThemeEditorCommand::RevertOwned { token } => self.theme.revert_owned(token),
                     ThemeEditorCommand::Preview { document } => {
                         self.theme.preview_editor_document(&document).map(|_| ())
                     }
@@ -4027,6 +4134,14 @@ impl DesktopState {
                 self.space.map_element(window.clone(), location, true);
                 self.refresh_window_fractional_scale(&window);
                 self.mark_focused_output_full_damage(DamageSource::Unknown);
+            }
+            DesktopAction::BeginKillSelection => {
+                if self.lock_screen.active {
+                    return Err("Unlock the session before selecting an application".into());
+                }
+                self.kill_selection = true;
+                self.set_compositor_cursor_icon(CursorIcon::Crosshair);
+                self.mark_all_outputs_full_damage(DamageSource::Cursor);
             }
             DesktopAction::CloseFocused => self.close_focused(),
             DesktopAction::TerminateX11Application { window_id } => {
@@ -4564,6 +4679,16 @@ impl DesktopState {
             }
             if geometry_changed {
                 self.update_output_size_from_work(output_id, physical_size, scale_factor, old_work);
+                if let Some(output) = self.outputs.get_mut(&output_id) {
+                    let mode = Mode {
+                        size: physical_size,
+                        refresh: config.refresh_mhz,
+                    };
+                    output
+                        .handle
+                        .change_current_state(Some(mode), None, None, None);
+                    output.handle.set_preferred(mode);
+                }
             }
             if color_changed {
                 self.refresh_output_color(output_id);
@@ -4596,6 +4721,10 @@ impl DesktopState {
                 .get(&fallback)
                 .map(|output| output.active_workspace)
                 .unwrap_or_else(|| self.focused_workspace());
+            if control_panel_outputs.contains(&self.focused_output) {
+                self.focused_output = fallback;
+                self.active_workspace = workspace;
+            }
             let windows = self
                 .windows
                 .iter()
@@ -5095,6 +5224,9 @@ impl DesktopState {
         // receive compositor fallback rail/dock chrome, including during the
         // short period before its companion client has mapped.
         if self.outputs.get(&output_id).is_some_and(|output| {
+            if self.display_trial.is_some() {
+                return output.role == OutputRole::ControlPanel;
+            }
             load_settings()
                 .displays
                 .outputs
@@ -6258,11 +6390,19 @@ impl DesktopState {
                 self.displaced_split_windows.remove(&window_id);
             }
 
-            if self.focused_window == Some(window_id) {
+            let lost_focus = self.focused_window == Some(window_id);
+            if lost_focus {
                 self.focused_window = None;
             }
             self.workspace_focus
                 .retain(|_, focused_id| *focused_id != window_id);
+            // Removing the active surface must also move the seat's keyboard
+            // and selection focus. Otherwise the revealed app looks active but
+            // its next copy is rejected as coming from a non-focused client,
+            // leaving the previous clipboard contents in place.
+            if lost_focus {
+                self.focus_top_window_on_focused_output(self.focused_workspace());
+            }
             self.mark_all_outputs_full_damage(DamageSource::CommitBbox);
         }
     }
@@ -7427,6 +7567,8 @@ impl DesktopState {
     }
 
     fn lock_session(&mut self) {
+        self.kill_selection = false;
+        self.update_pointer_cursor(self.pointer_pos);
         self.clear_snap_preview();
         for output in self.desktop_outputs.values_mut() {
             output.egui.close_all_panels();
@@ -8092,7 +8234,7 @@ impl DesktopState {
         self.mark_focused_output_full_damage(DamageSource::Unknown);
     }
 
-    fn focus_top_window_on_focused_output(&mut self, workspace: WorkspaceId) {
+    pub(crate) fn focus_top_window_on_focused_output(&mut self, workspace: WorkspaceId) {
         let remembered =
             self.workspace_focus
                 .get(&(self.focused_output, workspace))
@@ -8530,6 +8672,11 @@ impl DesktopState {
                 outputs_by_name
                     .get(&displaced.connector)
                     .copied()
+                    .filter(|id| {
+                        self.outputs
+                            .get(id)
+                            .is_some_and(|output| output.role == OutputRole::Normal)
+                    })
                     .map(|output_id| (*window_id, output_id, displaced.clone()))
             })
             .collect();
@@ -8601,16 +8748,36 @@ impl DesktopState {
             }
         }
 
-        let first_output = self.outputs.keys().next().copied();
-        let primary = snapshot
-            .primary_output
-            .as_ref()
-            .and_then(|name| outputs_by_name.get(name).copied())
+        let first_output = self
+            .outputs
+            .iter()
+            .find(|(_, output)| output.role == OutputRole::Normal)
+            .map(|(id, _)| *id);
+        let primary = self
+            .trial_display_outputs()
+            .and_then(|outputs| outputs.iter().find(|output| output.primary))
+            .and_then(|output| outputs_by_name.get(&output.connector).copied())
+            .or_else(|| {
+                snapshot
+                    .primary_output
+                    .as_ref()
+                    .and_then(|name| outputs_by_name.get(name).copied())
+            })
+            .filter(|id| {
+                self.outputs
+                    .get(id)
+                    .is_some_and(|output| output.role == OutputRole::Normal)
+            })
             .or(first_output);
         let focused = snapshot
             .focused_output
             .as_ref()
             .and_then(|name| outputs_by_name.get(name).copied())
+            .filter(|id| {
+                self.outputs
+                    .get(id)
+                    .is_some_and(|output| output.role == OutputRole::Normal)
+            })
             .or(primary);
 
         let (Some(primary), Some(focused)) = (primary, focused) else {
@@ -8658,7 +8825,12 @@ impl DesktopState {
                         .first()
                         .and_then(|output| self.output_id_for_space_output(output))
                 }),
-            };
+            }
+            .filter(|id| {
+                self.outputs
+                    .get(id)
+                    .is_some_and(|output| output.role == OutputRole::Normal)
+            });
             let Some(index) = self
                 .windows
                 .iter()
@@ -9520,6 +9692,10 @@ impl DesktopState {
     }
 
     fn update_pointer_cursor(&mut self, position: Point<f64, Logical>) {
+        if self.kill_selection {
+            self.set_compositor_cursor_icon(CursorIcon::Crosshair);
+            return;
+        }
         if self
             .dnd_cursor_phase
             .as_ref()
@@ -9953,6 +10129,8 @@ impl DesktopState {
 
             seat_name: "seat-0".to_string(),
             focused_window: None,
+            kill_selection: false,
+            kill_selection_button: None,
             workspace_focus: HashMap::new(),
             pointer_pos: (0.0, 0.0).into(),
             toplevel_pointer: None,
@@ -10027,6 +10205,9 @@ impl DesktopState {
             settings_ipc_watchers: Vec::new(),
             settings_ipc_config: load_config(),
             display_reconfigure_requested: false,
+            display_trial: None,
+            display_trial_sequence: 0,
+            connected_drm_outputs: HashMap::new(),
             host_window_drag_requested: false,
             pending_compositor_move: None,
             pending_xdg_move: None,
@@ -11191,6 +11372,46 @@ impl DesktopState {
         }
     }
 
+    fn kill_application_at(&mut self, position: Point<f64, Logical>) -> Result<(), String> {
+        let Some((target, _)) = self.pointer_surface_under(position) else {
+            return Ok(());
+        };
+        match target {
+            #[cfg(feature = "xwayland")]
+            PointerFocusTarget::Xwayland(surface) => {
+                let pid = surface.get_client_pid().map_err(|e| e.to_string())?;
+                let server_pid = self.xwayland_client.as_ref()
+                    .ok_or("XWayland client unavailable")?
+                    .get_credentials(&self.display_handle).map_err(|e| e.to_string())?.pid;
+                if pid <= 1 || pid > i32::MAX as u32 || pid == std::process::id() || pid == server_pid as u32 {
+                    return Err("Refusing to terminate a desktop server process".into());
+                }
+                if unsafe { libc::kill(pid as i32, libc::SIGKILL) } != 0 {
+                    return Err(std::io::Error::last_os_error().to_string());
+                }
+            }
+            PointerFocusTarget::Wayland(surface) => {
+                // Only application windows are selectable; desktop layers are excluded.
+                let mut root = surface.clone();
+                loop {
+                    if self.window_id_for_wl_surface(&root).is_some() { break; }
+                    let Some(parent) = get_parent(&root) else { return Ok(()); };
+                    root = parent;
+                }
+                let client = self.display_handle.get_client(surface.id()).map_err(|e| e.to_string())?;
+                #[cfg(feature = "xwayland")]
+                if self.xwayland_client.as_ref().is_some_and(|server| server.id() == client.id()) {
+                    return Err("Refusing to disconnect the XWayland server".into());
+                }
+                self.display_handle.backend_handle().kill_client(
+                    client.id(),
+                    smithay::reexports::wayland_server::backend::DisconnectReason::ConnectionClosed,
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn terminate_x11_application(&self, window_id: WindowId) -> Result<(), String> {
         #[cfg(feature = "xwayland")]
         {
@@ -11385,6 +11606,13 @@ impl DesktopState {
             modifiers,
         } = prepared;
 
+        if self.kill_selection {
+            if self.lock_screen.active || (sym == keysyms::KEY_Escape && matches!(state, KeyState::Pressed)) {
+                self.kill_selection = false;
+                self.update_pointer_cursor(self.pointer_pos);
+            }
+            return;
+        }
         let keybinds = self.keybinds.clone();
         flog(format!(
             "KEY DEBUG: keycode={} sym={} state={:?} modifiers={:?}",
