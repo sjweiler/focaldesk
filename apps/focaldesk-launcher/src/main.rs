@@ -1239,6 +1239,11 @@ fn build_ui(app: &adw::Application) {
     window.add_css_class("focaldesk-app");
     window.set_title(Some("Launcher"));
     window.set_default_size(720, 620);
+    let app_for_close = app.clone();
+    window.connect_close_request(move |_| {
+        app_for_close.quit();
+        glib::Propagation::Proceed
+    });
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
     root.add_css_class("launcher-root");

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=FocalDesk Files
+Comment=Browse and manage your files
+Exec=focaldesk-files
+Icon=focaldesk-files
+Terminal=false
+Categories=System;FileManager;
+StartupNotify=true

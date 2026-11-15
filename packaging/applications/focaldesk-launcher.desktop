@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=FocalDesk Launcher
+Comment=Find and launch applications
+Exec=focaldesk-launcher
+Icon=focaldesk-launcher
+Terminal=false
+Categories=Utility;
+StartupNotify=true

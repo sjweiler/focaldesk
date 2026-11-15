@@ -369,6 +369,8 @@ install-mcp:
 install-files:
     cargo build --release -p focaldesk-files
     sudo install -Dm755 target/release/focaldesk-files /usr/local/bin/focaldesk-files
+    sudo install -Dm644 packaging/applications/focaldesk-files.desktop /usr/local/share/applications/focaldesk-files.desktop
+    sudo install -Dm644 packaging/icons/focaldesk-files.svg /usr/local/share/icons/hicolor/scalable/apps/focaldesk-files.svg
 
 install-settings:
     npm ci --prefix apps/focaldesk-settings/frontend
@@ -379,6 +381,7 @@ install-settings:
     sudo install -Dm755 -o root -g root target/release/focaldesk-settings-next /usr/local/bin/focaldesk-settings-next
     sudo install -Dm755 -o root -g root packaging/bin/focaldesk-settings /usr/local/bin/focaldesk-settings
     sudo install -Dm644 -o root -g root packaging/applications/focaldesk-settings.desktop /usr/local/share/applications/focaldesk-settings.desktop
+    sudo install -Dm644 -o root -g root packaging/icons/focaldesk-settings.svg /usr/local/share/icons/hicolor/scalable/apps/focaldesk-settings.svg
 
 install-ai-console:
     cargo build --release -p focaldesk-ai-console
@@ -482,6 +485,8 @@ install-polkit:
 install-launcher:
     cargo build --release -p focaldesk-launcher
     sudo install -Dm755 target/release/focaldesk-launcher /usr/local/bin/focaldesk-launcher
+    sudo install -Dm644 packaging/applications/focaldesk-launcher.desktop /usr/local/share/applications/focaldesk-launcher.desktop
+    sudo install -Dm644 packaging/icons/focaldesk-launcher.svg /usr/local/share/icons/hicolor/scalable/apps/focaldesk-launcher.svg
 
 install-focaldm-greeter: release-focaldm-greeter
     sudo install -Dm755 target/release/focaldm-greeter "{{focaldm_greeter_bin}}"

@@ -36,6 +36,11 @@
 755 usr/lib64/security/pam_focald_secrets.so
 644 usr/share/focaldesk/default.toml
 644 usr/local/share/applications/focaldesk-settings.desktop
+644 usr/local/share/applications/focaldesk-files.desktop
+644 usr/local/share/applications/focaldesk-launcher.desktop
+644 usr/local/share/icons/hicolor/scalable/apps/focaldesk-settings.svg
+644 usr/local/share/icons/hicolor/scalable/apps/focaldesk-files.svg
+644 usr/local/share/icons/hicolor/scalable/apps/focaldesk-launcher.svg
 644 usr/share/focaldesk/wallpaper/focaldesk_wallpaper_hdr1400.exr
 644 usr/share/focaldesk/optional-themes/lunar_transport.fdtheme
 644 usr/share/focaldesk/optional-themes/moonbase.fdtheme
