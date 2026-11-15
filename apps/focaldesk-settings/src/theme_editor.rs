@@ -67,7 +67,7 @@ pub enum FileAction {
         source: String,
     },
     Save {
-        path: String,
+        path: Option<String>,
         expected_hash: Option<String>,
         document: Box<ThemeDocument>,
     },
@@ -215,6 +215,58 @@ fn describe(document: ThemeDocument, source: Option<FileVersion>) -> Result<Edit
         preview,
     })
 }
+/// Default editor destination, following the user data directory convention.
+pub fn default_save_path(document: &ThemeDocument) -> Result<PathBuf> {
+    Ok(dirs::data_dir()
+        .context("The user data directory is unavailable")?
+        .join("focaldesk/themes")
+        .join(focaldesk_themes::theme_slug(&document.name)?)
+        .join("theme.toml"))
+}
+
+/// Keep saved themes independent of the original wallpaper's location.
+pub fn save_document(
+    document: &ThemeDocument,
+    path: &Path,
+    expected: Option<&str>,
+) -> Result<ThemeDocument> {
+    validate(document)?;
+    // Check conflicts before creating any assets.
+    let current = if path.exists() { Some(file_hash(path)?) } else { None };
+    if current.as_deref() != expected {
+        bail!("The destination changed or already exists. Reopen it before overwriting.");
+    }
+    let parent = path.parent().context("Missing destination directory")?;
+    let mut saved = document.clone();
+    if document.wallpaper.path.is_some() {
+        let package = ThemePackage::from_document(document)?;
+        let asset = &package.assets[0];
+        let extension = Path::new(&asset.path).extension().unwrap().to_str().unwrap();
+        // Content-addressed names keep a failed or stale save from changing the
+        // wallpaper referenced by the previous document.
+        let destination = parent.join(format!("wallpaper-{}.{}", asset.sha256, extension));
+        fs::create_dir_all(parent)?;
+        let bytes = fs::read(document.wallpaper.path.as_ref().unwrap())?;
+        if bytes.len() as u64 != asset.size || format!("{:x}", Sha256::digest(&bytes)) != asset.sha256 {
+            bail!("The wallpaper changed while saving. Try again.");
+        }
+        match fs::OpenOptions::new().write(true).create_new(true).open(&destination) {
+            Ok(mut file) => { file.write_all(&bytes)?; file.sync_all()?; }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if fs::symlink_metadata(&destination)?.file_type().is_symlink()
+                    || fs::read(&destination)? != bytes {
+                    bail!("The saved wallpaper asset was modified.");
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        saved.wallpaper.path = Some(destination.to_string_lossy().into_owned());
+    }
+    fs::create_dir_all(parent)?;
+    atomic_save(path, expected, &saved.to_toml()?)?;
+    Ok(saved)
+}
+
 fn atomic_save(path: &Path, expected: Option<&str>, source: &str) -> Result<()> {
     let current = if path.exists() {
         Some(read(path, 100 * 1024 * 1024)?)
@@ -304,11 +356,14 @@ pub fn file_action(action: FileAction) -> Result<EditorDocument> {
             document,
         } => {
             validate(&document)?;
-            let path = path_checked(&path, "toml")?;
+            let path = match path {
+                Some(path) => path_checked(&path, "toml")?,
+                None => default_save_path(&document)?,
+            };
+            let document = save_document(&document, &path, expected_hash.as_deref())?;
             let source = document.to_toml()?;
-            atomic_save(&path, expected_hash.as_deref(), &source)?;
             describe(
-                *document,
+                document,
                 Some(FileVersion {
                     path: path.to_string_lossy().into_owned(),
                     hash: hash(&source),
@@ -375,6 +430,31 @@ pub fn convert_color(color: ThemeColor, space: ThemeColorSpace) -> Result<ThemeC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saves_wallpaper_with_theme_and_preserves_previous_assets_on_conflict() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original.png");
+        image::RgbImage::from_pixel(2, 2, image::Rgb([30, 80, 140])).save(&original).unwrap();
+        let mut document = default_document().unwrap().document;
+        document.name = "My New Theme".into();
+        document.wallpaper.path = Some(original.to_string_lossy().into_owned());
+        assert!(default_save_path(&document).unwrap().ends_with("focaldesk/themes/my-new-theme/theme.toml"));
+        let path = root.path().join("themes/my-new-theme/theme.toml");
+        let saved = save_document(&document, &path, None).unwrap();
+        let wallpaper = PathBuf::from(saved.wallpaper.path.as_ref().unwrap());
+        assert_eq!(wallpaper.parent(), path.parent());
+        fs::remove_file(original).unwrap();
+        assert!(wallpaper.exists());
+        assert_eq!(ThemeDocument::load(&path).unwrap(), saved);
+        assert!(save_document(&saved, &path, None).is_err());
+        let expected = file_hash(&path).unwrap();
+        assert_eq!(save_document(&saved, &path, Some(&expected)).unwrap(), saved);
+        let mut without_wallpaper = saved;
+        without_wallpaper.wallpaper.path = None;
+        save_document(&without_wallpaper, &path, Some(&expected)).unwrap();
+        assert!(ThemeDocument::load(&path).unwrap().wallpaper.path.is_none());
+    }
 
     #[test]
     fn projection_loads_wallpaper_and_clears_it_when_removed() {

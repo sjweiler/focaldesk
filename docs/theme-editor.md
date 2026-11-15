@@ -35,8 +35,12 @@ interpolation space and alpha mode, linear angle, and radial center/radius.
 
 ## Save, preview, and apply
 
-**Save** writes the source `ThemeDocument` as TOML. Saving a document is
-separate from changing the running desktop.
+**Save** defaults new themes to `$HOME/.local/share/focaldesk/themes/<slug>/theme.toml`
+(or `$XDG_DATA_HOME/focaldesk/themes/<slug>/theme.toml` when configured).
+The slug comes from the theme name. The editor creates the directory, copies the
+selected wallpaper into it, and saves its absolute path in `theme.toml`.
+Subsequent saves update the opened file; **Save As** chooses another destination.
+Saving a document is separate from changing the running desktop.
 
 With **Live preview** enabled, valid edits are sent to the compositor after a
 short debounce. A preview is temporary. **Apply** makes the current document

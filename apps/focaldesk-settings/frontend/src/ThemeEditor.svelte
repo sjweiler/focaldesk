@@ -29,8 +29,8 @@
     try{
       if(type==='new'){accept(await invoke<EditorDocument>('theme_editor_file',{action:{type:'new'}}));return;}
       if(type==='install'){if(!source)return;accept(await invoke<EditorDocument>('theme_editor_file',{action:{type:'install',path:source.path,expected_hash:source.hash,overwrite}}));message='Package installed. Select it in Appearance to keep it across sessions.';return;}
-      let chosen:{path:string;hash:string|null}|null=null;
-      if(type==='save'&&source&&!packageOpen)chosen=source;
+      let chosen:{path:string|null;hash:string|null}|null=null;
+      if(type==='save')chosen=source&&!packageOpen?source:{path:null,hash:null};
       else chosen=await invoke('choose_theme_file',{kind:type==='open'?'open':type==='export'?'export':'save'});
       if(!chosen)return;
       const next=await invoke<EditorDocument>('theme_editor_file',{action:type==='open'?{type:'open',path:chosen.path}:{type,path:chosen.path,expected_hash:chosen.hash,document:copy(draft)}});
