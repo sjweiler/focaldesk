@@ -3858,6 +3858,14 @@ pub(crate) fn translate_backend_input_event<B: smithay::backend::input::InputBac
     state: &DesktopState,
     input: &smithay::backend::input::InputEvent<B>,
 ) -> Option<focaldesk_input::InputEvent> {
+    translate_backend_input_event_for_output(state, input, None)
+}
+
+pub(crate) fn translate_backend_input_event_for_output<B: smithay::backend::input::InputBackend>(
+    state: &DesktopState,
+    input: &smithay::backend::input::InputEvent<B>,
+    touch_output: Option<OutputId>,
+) -> Option<focaldesk_input::InputEvent> {
     use smithay::backend::input::InputEvent;
 
     let pointer_output = state
@@ -3870,7 +3878,9 @@ pub(crate) fn translate_backend_input_event<B: smithay::backend::input::InputBac
     // mapping.
     let output_id = match input {
         InputEvent::TouchDown { .. } | InputEvent::TouchMotion { .. } => {
-            state.sole_control_panel_output().unwrap_or(pointer_output)
+            touch_output
+                .or_else(|| state.sole_control_panel_output())
+                .unwrap_or(pointer_output)
         }
         _ => pointer_output,
     };

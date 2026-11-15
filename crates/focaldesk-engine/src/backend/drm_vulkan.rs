@@ -55,9 +55,8 @@ use super::common::{finish_xwayland_startup, start_xwayland};
 use super::drm::{
     connector_edid, disable_explicit_kms_fences, drm_card_vendor_id, hdr_appearance_from_support,
     hdr_detection, load_display_config_with_override, merge_disconnected_display_configs,
-    parse_edid_identity, saved_monitor_config, select_connector_mode,
-    translate_backend_input_event, write_display_config, DisplayConfig, DisplayModeConfig,
-    HdrSupport,
+    parse_edid_identity, saved_monitor_config, select_connector_mode, write_display_config,
+    DisplayConfig, DisplayModeConfig, HdrSupport,
 };
 use super::vui_shell::{QuickSettingsState, VuiShell};
 use super::wgpu_nested::{VulkanCompositorScene, VulkanSceneBuilder};
@@ -83,6 +82,10 @@ const HDR_SCANOUT_FORMATS: [Fourcc; 4] = [
     Fourcc::Xbgr2101010,
     Fourcc::Abgr2101010,
 ];
+mod gpu;
+
+use gpu::SecondaryGpu;
+
 type VulkanScanout = GbmBufferedSurface<GbmAllocator<DrmDeviceFd>, ()>;
 
 #[derive(Debug)]
@@ -161,6 +164,7 @@ struct OutputConfig {
     transform: Transform,
     scale: f64,
     origin: Point<i32, Logical>,
+    position_configured: bool,
     primary: bool,
     output_id: OutputId,
     physical_size_mm: (i32, i32),
@@ -321,19 +325,33 @@ impl Drop for KmsCursor {
     }
 }
 
+/// Resources tied to exactly one DRM/Vulkan device. Never share these across GPUs.
+struct VulkanDevice {
+    renderer: AshDrmRenderer,
+    drm: DrmDevice,
+    drm_fd: DrmDeviceFd,
+    node: DrmNode,
+    disable_explicit_kms_fences: bool,
+}
+
 struct VulkanDrmData {
     desktop: NestedDesktop,
     #[cfg(feature = "xwayland")]
     xwayland_event_loop: EventLoop<'static, crate::core::desktop::DesktopState>,
     // Must drop before the host renderer whose Vulkan device it borrows.
     vui_shell: Option<VuiShell>,
-    renderer: AshDrmRenderer,
+    primary_gpu: VulkanDevice,
+    secondary_gpus: HashMap<DrmNode, SecondaryGpu>,
+    secondary_test_enabled: bool,
+    secondary_desktop_enabled: bool,
+    next_secondary_output_id: u64,
+    next_bridge_capture_id: u64,
+    bridge_captures: HashMap<u64, (DrmNode, OutputId)>,
+    touch_devices: HashSet<String>,
+    pending_secondary_gpus: HashMap<DrmNode, PathBuf>,
     scene_builder: VulkanSceneBuilder,
     vui_output: Option<OutputId>,
     vui_text_keys: HashSet<u32>,
-    drm: DrmDevice,
-    drm_fd: DrmDeviceFd,
-    primary_node: DrmNode,
     session: LibSeatSession,
     outputs: Vec<VulkanOutput>,
     retired_output_globals: Vec<(
@@ -342,7 +360,6 @@ struct VulkanDrmData {
     )>,
     libinput: Libinput,
     session_active: bool,
-    disable_explicit_kms_fences: bool,
     resume_pending: bool,
     resume_retry_at: Option<Instant>,
     restart_shell_after_present: bool,
@@ -388,10 +405,14 @@ impl Drop for VulkanDrmData {
     fn drop(&mut self) {
         // The embedded VUI renderer borrows this device. Dispose of it before
         // the owning renderer field is dropped, after a bounded queue drain.
-        let idle =
-            self.renderer.is_usable() && self.renderer.quiesce(Duration::from_secs(5)).is_ok();
+        let idle = self.primary_gpu.renderer.is_usable()
+            && self
+                .primary_gpu
+                .renderer
+                .quiesce(Duration::from_secs(5))
+                .is_ok();
         if !idle {
-            self.renderer.abandon_device();
+            self.primary_gpu.renderer.abandon_device();
             if let Some(shell) = self.vui_shell.as_mut() {
                 shell.abandon_ash_renderer();
             }
@@ -450,11 +471,11 @@ fn configure_vui_shell(data: &mut VulkanDrmData) {
     );
     let ash_result = unsafe {
         shell.use_ash_renderer(
-            data.renderer.instance(),
-            data.renderer.physical_device(),
-            data.renderer.device(),
-            data.renderer.queue(),
-            data.renderer.queue_family(),
+            data.primary_gpu.renderer.instance(),
+            data.primary_gpu.renderer.physical_device(),
+            data.primary_gpu.renderer.device(),
+            data.primary_gpu.renderer.queue(),
+            data.primary_gpu.renderer.queue_family(),
         )
     };
     if let Err(error) = ash_result {
@@ -540,8 +561,13 @@ fn dispatch_pending_vui_request(data: &mut VulkanDrmData) {
 fn dispatch_vui_input<B: smithay::backend::input::InputBackend>(
     data: &mut VulkanDrmData,
     input: &SmithayInputEvent<B>,
+    touch_output: Option<OutputId>,
 ) {
-    let Some(event) = translate_backend_input_event(&data.desktop.state, input) else {
+    let Some(event) = super::drm::translate_backend_input_event_for_output(
+        &data.desktop.state,
+        input,
+        touch_output,
+    ) else {
         return;
     };
     if let InputEvent::Key { keycode, state, .. } = event {
@@ -696,7 +722,10 @@ fn pause_vulkan_session(data: &mut VulkanDrmData, reason: &str) {
             output.present_started_at = None;
         }
     }
-    data.drm.pause();
+    for gpu in data.secondary_gpus.values_mut() {
+        gpu.pause();
+    }
+    data.primary_gpu.drm.pause();
     data.libinput.suspend();
     data.desktop.state.handle_session_suspend();
     flog_warn!("raw Vulkan DRM session paused: {reason}");
@@ -706,7 +735,10 @@ fn resume_vulkan_session(data: &mut VulkanDrmData, reason: &str) -> Result<()> {
     if !data.session.is_active() {
         return Err(anyhow!("libseat has not restored device ownership"));
     }
-    data.drm.activate(true).context("reactivate DRM device")?;
+    data.primary_gpu
+        .drm
+        .activate(true)
+        .context("reactivate DRM device")?;
     // A Vulkan device that survives suspend can still return apparently valid
     // sync-file fences which NVIDIA can no longer import into KMS.  Reusing
     // that device leaves the first post-resume frame pending forever and a
@@ -722,6 +754,7 @@ fn resume_vulkan_session(data: &mut VulkanDrmData, reason: &str) -> Result<()> {
     data.libinput
         .resume()
         .map_err(|()| anyhow!("resume libinput"))?;
+    gpu::resume_secondary_gpus(data);
     data.session_active = true;
     data.resume_pending = false;
     data.resume_retry_at = None;
@@ -740,6 +773,14 @@ fn resume_vulkan_session(data: &mut VulkanDrmData, reason: &str) -> Result<()> {
 fn select_outputs(
     drm: &DrmDevice,
     overrides: Option<&[focaldesk_settings_core::OutputConfig]>,
+) -> Result<Vec<OutputConfig>> {
+    select_outputs_for_device(drm, overrides, true)
+}
+
+fn select_outputs_for_device(
+    drm: &DrmDevice,
+    overrides: Option<&[focaldesk_settings_core::OutputConfig]>,
+    write_inventory: bool,
 ) -> Result<Vec<OutputConfig>> {
     let resources = drm.resource_handles().context("query DRM resources")?;
     let configured = load_display_config_with_override(overrides);
@@ -861,7 +902,8 @@ fn select_outputs(
             .filter(|scale| scale.is_finite() && (1.0..=4.0).contains(scale))
             .unwrap_or(1.0);
         let logical_width = (f64::from(width) / scale).round() as i32;
-        let transform = saved
+        let transform = saved_monitor
+            .or(saved)
             .map(|display| display.transform.smithay())
             .unwrap_or(Transform::Normal);
         let logical_width = if matches!(transform, Transform::_90 | Transform::_270) {
@@ -869,7 +911,8 @@ fn select_outputs(
         } else {
             logical_width
         };
-        let origin = saved
+        let origin = saved_monitor
+            .or(saved)
             .map(|display| Point::from((display.logical_x, display.logical_y)))
             .unwrap_or_else(|| Point::from((next_x, 0)));
         next_x = next_x.max(origin.x + logical_width);
@@ -895,6 +938,7 @@ fn select_outputs(
             transform,
             scale,
             origin,
+            position_configured: saved_monitor.or(saved).is_some(),
             primary: configured_output
                 .map(|output| output.primary)
                 .unwrap_or_else(|| saved.is_some_and(|display| display.primary)),
@@ -914,57 +958,67 @@ fn select_outputs(
             role,
         });
     }
+    if outputs.is_empty() && !write_inventory {
+        return Ok(outputs);
+    }
     if outputs.is_empty() {
         Err(anyhow!(
             "no enabled connected DRM output with a usable mode"
         ))
     } else {
-        let snapshots = outputs
-            .iter()
-            .map(|output| {
-                let saved = configured
-                    .iter()
-                    .find(|display| display.name == output.name);
-                let metadata = output.hdr_support.edid_hdr_metadata;
-                DisplayConfig {
-                    name: output.name.clone(),
-                    monitor_make: Some(output.make.clone()),
-                    monitor_model: Some(output.model.clone()),
-                    monitor_serial: Some(output.serial_number.clone()),
-                    enabled: true,
-                    mode_width: output.width as i32,
-                    mode_height: output.height as i32,
-                    refresh_mhz: (output.mode.vrefresh() as i32).max(1) * 1_000,
-                    available_modes: output.available_modes.clone(),
-                    scale: output.scale,
-                    logical_x: output.origin.x,
-                    logical_y: output.origin.y,
-                    physical_width_mm: Some(output.physical_size_mm.0),
-                    physical_height_mm: Some(output.physical_size_mm.1),
-                    primary: output.primary,
-                    transform: saved
-                        .map(|display| display.transform.clone())
-                        .unwrap_or(super::drm::DisplayTransform::Normal),
-                    role: output.role,
-                    hdr_supported: output.hdr_support.is_detected(),
-                    hdr_max_luminance_nits: metadata.map(|value| f32::from(value.max_luminance)),
-                    hdr_max_fall_nits: metadata.map(|value| f32::from(value.max_fall)),
-                    hdr_requested: output.hdr_requested,
-                    hdr_enabled: false,
-                    hdr_appearance: output.hdr_appearance,
-                    color_profile: output.color_profile,
-                    icc_profile_path: output.icc_profile_path.clone(),
-                }
-            })
-            .collect::<Vec<_>>();
+        let snapshots = output_config_snapshots(&outputs, &configured);
         let snapshots = merge_disconnected_display_configs(snapshots, &configured);
-        if overrides.is_none() {
+        if write_inventory && overrides.is_none() {
             if let Err(error) = write_display_config(&snapshots) {
                 flog_warn!("Raw Vulkan could not refresh display inventory: {error:#}");
             }
         }
         Ok(outputs)
     }
+}
+
+fn output_config_snapshots(
+    outputs: &[OutputConfig],
+    configured: &[DisplayConfig],
+) -> Vec<DisplayConfig> {
+    outputs
+        .iter()
+        .map(|output| {
+            let saved = configured
+                .iter()
+                .find(|display| display.name == output.name);
+            let metadata = output.hdr_support.edid_hdr_metadata;
+            DisplayConfig {
+                name: output.name.clone(),
+                monitor_make: Some(output.make.clone()),
+                monitor_model: Some(output.model.clone()),
+                monitor_serial: Some(output.serial_number.clone()),
+                enabled: true,
+                mode_width: output.width as i32,
+                mode_height: output.height as i32,
+                refresh_mhz: (output.mode.vrefresh() as i32).max(1) * 1_000,
+                available_modes: output.available_modes.clone(),
+                scale: output.scale,
+                logical_x: output.origin.x,
+                logical_y: output.origin.y,
+                physical_width_mm: Some(output.physical_size_mm.0),
+                physical_height_mm: Some(output.physical_size_mm.1),
+                primary: output.primary,
+                transform: saved
+                    .map(|display| display.transform.clone())
+                    .unwrap_or(super::drm::DisplayTransform::Normal),
+                role: output.role,
+                hdr_supported: output.hdr_support.is_detected(),
+                hdr_max_luminance_nits: metadata.map(|value| f32::from(value.max_luminance)),
+                hdr_max_fall_nits: metadata.map(|value| f32::from(value.max_fall)),
+                hdr_requested: output.hdr_requested,
+                hdr_enabled: false,
+                hdr_appearance: output.hdr_appearance,
+                color_profile: output.color_profile,
+                icc_profile_path: output.icc_profile_path.clone(),
+            }
+        })
+        .collect::<Vec<_>>()
 }
 
 fn target_from_dmabuf(dmabuf: &Dmabuf) -> Result<DrmRenderTarget> {
@@ -1388,6 +1442,7 @@ fn initialize_vulkan_outputs(
 ) -> Result<Vec<VulkanOutput>> {
     let render_formats = ash_formats(renderer);
     let mut outputs = Vec::with_capacity(output_configs.len());
+    let desktop_was_empty = desktop.state.outputs.is_empty();
     let mut configured_primary = None;
     for config in output_configs {
         flog_warn!(
@@ -1425,6 +1480,17 @@ fn initialize_vulkan_outputs(
                 "raw Vulkan DRM output {} has no primary-plane IN_FENCE_FD",
                 config.name
             ));
+        }
+        if !prefer_hdr {
+            if let Some(state) = hdr_detection::hdr_kms::build_connector_hdr_state(
+                drm,
+                config.connector,
+                &config.hdr_support,
+                false,
+                None,
+            )? {
+                scanout.surface().use_hdr_state(state)?;
+            }
         }
         let cursor = match create_kms_cursor(drm, fd, &scanout) {
             Ok(cursor) => cursor,
@@ -1582,18 +1648,25 @@ fn initialize_vulkan_outputs(
         .state
         .cursor_manager
         .set_hardware_cursor_ready(false);
-    desktop.state.primary_output = configured_primary.unwrap_or(outputs[0].output_id);
-    desktop.state.focused_output = desktop.state.primary_output;
+    if let Some(primary) = configured_primary.or_else(|| {
+        desktop_was_empty
+            .then(|| outputs.first().map(|output| output.output_id))
+            .flatten()
+    }) {
+        desktop.state.primary_output = primary;
+        desktop.state.focused_output = primary;
+    }
     desktop.state.mark_redraw();
     Ok(outputs)
 }
 
 fn vulkan_connector_set_changed(data: &VulkanDrmData) -> Result<bool> {
     let resources = data
+        .primary_gpu
         .drm
         .resource_handles()
         .context("query DRM resources after connector event")?;
-    let inventory = super::drm::connected_output_inventory(&data.drm)?;
+    let inventory = super::drm::connected_output_inventory(&data.primary_gpu.drm)?;
     let names = |outputs: &[focaldesk_ipc::DisplayOutput]| {
         outputs
             .iter()
@@ -1617,12 +1690,12 @@ fn vulkan_connector_set_changed(data: &VulkanDrmData) -> Result<bool> {
     for handle in resources.connectors() {
         // Read cached kernel state: forcing a probe here can itself retrain a
         // link and produce another hotplug event on NVIDIA.
-        let info = data.drm.get_connector(*handle, false)?;
+        let info = data.primary_gpu.drm.get_connector(*handle, false)?;
         if info.state() != connector::State::Connected || info.modes().is_empty() {
             continue;
         }
         let name = format!("{}-{}", info.interface().as_str(), info.interface_id());
-        let edid = connector_edid(&data.drm, *handle);
+        let edid = connector_edid(&data.primary_gpu.drm, *handle);
         let identity = edid.as_deref().and_then(parse_edid_identity);
         if configured
             .iter()
@@ -1651,10 +1724,12 @@ fn rebuild_vulkan_outputs(data: &mut VulkanDrmData) -> Result<bool> {
     // currently working topology.
     data.desktop.state.connected_drm_outputs.insert(
         "vulkan".into(),
-        super::drm::connected_output_inventory(&data.drm)?,
+        super::drm::connected_output_inventory(&data.primary_gpu.drm)?,
     );
-    let output_configs = match select_outputs(&data.drm, data.desktop.state.trial_display_outputs())
-    {
+    let output_configs = match select_outputs(
+        &data.primary_gpu.drm,
+        data.desktop.state.trial_display_outputs(),
+    ) {
         Ok(configs) => configs,
         Err(error) => {
             flog_warn!("raw Vulkan DRM topology rebuild deferred: {error:#}");
@@ -1694,7 +1769,7 @@ fn rebuild_vulkan_outputs(data: &mut VulkanDrmData) -> Result<bool> {
             data.desktop.state.space.unmap_output(&state.handle);
         }
         hdr_detection::hdr_kms::destroy_hdr_metadata_blob(
-            &data.drm,
+            &data.primary_gpu.drm,
             output.hdr_metadata_blob.take(),
         );
         data.desktop
@@ -1709,7 +1784,7 @@ fn rebuild_vulkan_outputs(data: &mut VulkanDrmData) -> Result<bool> {
             .output_state
             .outputs
             .shift_remove(&output.output_id);
-        data.renderer.remove_stream(output.output_id.0);
+        data.primary_gpu.renderer.remove_stream(output.output_id.0);
     }
     data.outputs.clear();
     data.capture_pending.clear();
@@ -1717,9 +1792,9 @@ fn rebuild_vulkan_outputs(data: &mut VulkanDrmData) -> Result<bool> {
     data.scene_builder.clear();
     data.outputs = initialize_vulkan_outputs(
         &mut data.desktop,
-        &data.renderer,
-        &mut data.drm,
-        &data.drm_fd,
+        &data.primary_gpu.renderer,
+        &mut data.primary_gpu.drm,
+        &data.primary_gpu.drm_fd,
         output_configs,
     )?;
     data.desktop.state.restore_output_topology(snapshot);
@@ -1759,7 +1834,7 @@ fn maintain_vulkan_hdr_state(data: &mut VulkanDrmData) {
         let connector = data.outputs[index].connector;
         let require_max_bpc = data.outputs[index].hdr_support.max_bpc.is_some();
         match hdr_detection::hdr_kms::validate_connector_hdr_state(
-            &data.drm,
+            &data.primary_gpu.drm,
             connector,
             true,
             require_max_bpc,
@@ -1805,7 +1880,7 @@ fn maintain_vulkan_hdr_state(data: &mut VulkanDrmData) {
                     .hdr_metadata_blob
                     .expect("HDR expectation requires a metadata blob");
                 let staged = hdr_detection::hdr_kms::build_connector_hdr_state(
-                    &data.drm,
+                    &data.primary_gpu.drm,
                     connector,
                     &data.outputs[index].hdr_support,
                     true,
@@ -1899,7 +1974,7 @@ fn stage_vulkan_hdr_transitions(data: &mut VulkanDrmData) {
 
         let output = &mut data.outputs[index];
         let connector_state = hdr_detection::hdr_kms::build_connector_hdr_state(
-            &data.drm,
+            &data.primary_gpu.drm,
             output.connector,
             &output.hdr_support,
             target,
@@ -1958,9 +2033,11 @@ fn save_vulkan_screenshot(
     let name = data
         .outputs
         .iter()
+        .chain(gpu::desktop_outputs(data))
         .find(|output| output.output_id == output_id)
         .map(|output| output.name.as_str())
-        .unwrap_or("output");
+        .unwrap_or("output")
+        .to_string();
     let (width, height, rgba) = match crop {
         Some((crop, logical_size)) => {
             let scale_x = width as f64 / logical_size.w.max(1) as f64;
@@ -1996,7 +2073,7 @@ fn save_vulkan_screenshot(
         width,
         height,
         &rgba,
-        name,
+        &name,
         data.desktop.state.screenshot_seq,
     ) {
         Ok(path) => flog(format!("Screenshot saved to {}", path.display())),
@@ -2005,34 +2082,34 @@ fn save_vulkan_screenshot(
 }
 
 fn finish_all_outputs_screenshot(data: &mut VulkanDrmData) {
-    if data.outputs.is_empty()
-        || data
-            .outputs
+    let outputs = data
+        .outputs
+        .iter()
+        .chain(gpu::desktop_outputs(data))
+        .collect::<Vec<_>>();
+    if outputs.is_empty()
+        || outputs
             .iter()
             .any(|output| !data.screenshot_all_captures.contains_key(&output.output_id))
     {
         return;
     }
-    let min_x = data
-        .outputs
+    let min_x = outputs
         .iter()
         .map(|output| output.origin.x)
         .min()
         .unwrap_or(0);
-    let min_y = data
-        .outputs
+    let min_y = outputs
         .iter()
         .map(|output| output.origin.y)
         .min()
         .unwrap_or(0);
-    let max_x = data
-        .outputs
+    let max_x = outputs
         .iter()
         .map(|output| output.origin.x.saturating_add(output.width as i32))
         .max()
         .unwrap_or(0);
-    let max_y = data
-        .outputs
+    let max_y = outputs
         .iter()
         .map(|output| output.origin.y.saturating_add(output.height as i32))
         .max()
@@ -2050,7 +2127,7 @@ fn finish_all_outputs_screenshot(data: &mut VulkanDrmData) {
         return;
     };
     let mut desktop = vec![0_u8; byte_len];
-    for output in &data.outputs {
+    for output in &outputs {
         let Some((source_width, source_height, pixels)) =
             data.screenshot_all_captures.get(&output.output_id)
         else {
@@ -2142,21 +2219,21 @@ fn finish_vulkan_capture(data: &mut VulkanDrmData, capture: AshDrmCapture) {
 }
 
 fn recover_vulkan_renderer(data: &mut VulkanDrmData, reason: &anyhow::Error) -> Result<()> {
-    if AshDrmRenderer::is_allocation_pressure(reason) && data.renderer.is_usable() {
+    if AshDrmRenderer::is_allocation_pressure(reason) && data.primary_gpu.renderer.is_usable() {
         data.allocation_reclaim_pending = true;
         data.desktop.state.mark_redraw();
-        flog_warn!("Vulkan allocation pressure; retaining scanout and scheduling cache reclamation: {reason:#}; renderer={:?}", data.renderer);
+        flog_warn!("Vulkan allocation pressure; retaining scanout and scheduling cache reclamation: {reason:#}; renderer={:?}", data.primary_gpu.renderer);
         return Ok(());
     }
     flog_warn!(
         "recreating raw Vulkan device and scanout: {reason:#}; renderer={:?}; outputs={}",
-        data.renderer,
+        data.primary_gpu.renderer,
         data.outputs.len()
     );
     // Lost/hung devices cannot safely be replaced repeatedly inside this process.
     // A finite drain gates destruction of both the embedded and owning renderer.
-    if let Err(error) = data.renderer.quiesce(Duration::from_secs(5)) {
-        data.renderer.abandon_device();
+    if let Err(error) = data.primary_gpu.renderer.quiesce(Duration::from_secs(5)) {
+        data.primary_gpu.renderer.abandon_device();
         if let Some(shell) = data.vui_shell.as_mut() {
             shell.abandon_ash_renderer();
         }
@@ -2165,8 +2242,9 @@ fn recover_vulkan_renderer(data: &mut VulkanDrmData, reason: &anyhow::Error) -> 
     }
     data.vui_shell = None;
     data.desktop.state.invalidate_gpu_state();
-    data.renderer.recreate_quiesced(data.primary_node.major(), data.primary_node.minor())
+    data.primary_gpu.renderer.recreate_quiesced(data.primary_gpu.node.major(), data.primary_gpu.node.minor())
         .inspect_err(|error| flog_warn!("Raw Vulkan replacement failed after old-device cleanup: {error:#}; original failure: {reason:#}"))?;
+    gpu::primary_renderer_recreated(data);
     data.allocation_backoff.clear();
     data.allocation_poll_backoff = AllocationBackoff::default();
     data.allocation_reclaim_pending = false;
@@ -2189,8 +2267,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let loop_handle = event_loop.handle();
     let (mut session, session_notifier) =
         LibSeatSession::new().map_err(|error| anyhow!("initialize libseat: {error}"))?;
-    let primary_path: PathBuf = primary_gpu(session.seat())?
-        .ok_or_else(|| anyhow!("no primary GPU found for seat {}", session.seat()))?;
+    let primary_path = match std::env::var_os("FOCALDESK_DRM_PRIMARY_DEVICE") {
+        Some(path) => PathBuf::from(path),
+        None => primary_gpu(session.seat())?
+            .ok_or_else(|| anyhow!("no primary GPU found for seat {}", session.seat()))?,
+    };
     let node = DrmNode::from_path(&primary_path).context("identify primary DRM node")?;
     let gpu_vendor_id = drm_card_vendor_id(&primary_path);
     let disable_explicit_kms_fences = disable_explicit_kms_fences(gpu_vendor_id);
@@ -2251,20 +2332,31 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         desktop,
         #[cfg(feature = "xwayland")]
         xwayland_event_loop,
-        renderer,
+        primary_gpu: VulkanDevice {
+            renderer,
+            drm,
+            drm_fd: fd,
+            node,
+            disable_explicit_kms_fences,
+        },
+        secondary_gpus: HashMap::new(),
+        pending_secondary_gpus: HashMap::new(),
+        secondary_test_enabled: std::env::var("FOCALDESK_DRM_SECONDARY_TEST").as_deref() == Ok("1"),
+        secondary_desktop_enabled: std::env::var("FOCALDESK_DRM_SECONDARY_DESKTOP").as_deref()
+            == Ok("1"),
+        next_secondary_output_id: 1 << 32,
+        next_bridge_capture_id: 1,
+        bridge_captures: HashMap::new(),
+        touch_devices: HashSet::new(),
         scene_builder: VulkanSceneBuilder::default(),
         vui_shell: None,
         vui_output: None,
         vui_text_keys: HashSet::new(),
-        drm,
-        drm_fd: fd,
-        primary_node: node,
         session: session.clone(),
         outputs,
         retired_output_globals: Vec::new(),
         libinput,
         session_active: session.is_active(),
-        disable_explicit_kms_fences,
         resume_pending: false,
         resume_retry_at: None,
         restart_shell_after_present: false,
@@ -2282,7 +2374,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     };
     configure_vui_shell(&mut data);
 
-    if data.disable_explicit_kms_fences {
+    if data.primary_gpu.disable_explicit_kms_fences {
         flog_warn!(
             "Raw Vulkan disabled explicit KMS input fences for NVIDIA; submissions wait before implicit-sync atomic commits"
         );
@@ -2311,9 +2403,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let _input_token = loop_handle.insert_source(input_backend, move |event, _, data| {
         match &event {
             SmithayInputEvent::DeviceAdded { device } => {
+                if device.has_capability(smithay::reexports::input::DeviceCapability::Touch) {
+                    data.touch_devices.insert(device.sysname().to_string());
+                }
                 data.desktop.state.register_libinput_device(device.clone());
             }
             SmithayInputEvent::DeviceRemoved { device } => {
+                data.touch_devices.remove(device.sysname());
                 data.desktop.state.unregister_libinput_device(device);
             }
             _ => {}
@@ -2346,7 +2442,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     .handle_lid_switch(matches!(event.state(), SwitchState::On));
             }
         }
-        dispatch_vui_input::<LibinputInputBackend>(data, &event);
+        let touch_output = gpu::touch_output(data, &event);
+        dispatch_vui_input::<LibinputInputBackend>(data, &event, touch_output);
         update_kms_cursor(data);
     })?;
 
@@ -2420,7 +2517,29 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             }
         })?;
 
-    let _udev_token = loop_handle.insert_source(udev, |event, _, data| {
+    flog_warn!(
+        "Raw Vulkan multi-GPU: secondary_desktop={} secondary_test={}",
+        data.secondary_desktop_enabled,
+        data.secondary_test_enabled
+    );
+    for (device_id, path) in udev.device_list() {
+        let Ok(node) = DrmNode::from_dev_id(device_id) else {
+            continue;
+        };
+        gpu::discover_device(&mut data, &loop_handle, node, &path);
+    }
+    let udev_handle = loop_handle.clone();
+    let _udev_token = loop_handle.insert_source(udev, move |event, _, data| {
+        if let UdevEvent::Added {
+            device_id,
+            ref path,
+        } = event
+        {
+            if let Ok(node) = DrmNode::from_dev_id(device_id) {
+                gpu::discover_device(data, &udev_handle, node, path);
+            }
+        }
+
         let device_id = match event {
             UdevEvent::Added { device_id, .. }
             | UdevEvent::Changed { device_id }
@@ -2429,7 +2548,15 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         let Ok(node) = DrmNode::from_dev_id(device_id) else {
             return;
         };
-        if node == data.primary_node {
+        if node != data.primary_gpu.node {
+            if let UdevEvent::Removed { .. } = event {
+                gpu::remove_device(data, &udev_handle, node);
+            } else if let Some(gpu) = data.secondary_gpus.get_mut(&node) {
+                gpu.reconfigure_at = Some(Instant::now() + Duration::from_millis(750));
+            }
+            return;
+        }
+        if node == data.primary_gpu.node {
             // Property changes and our own modesets also emit udev changes.
             // Let link training settle, then rebuild only for a changed set.
             data.connector_probe_at = Some(Instant::now() + Duration::from_millis(750));
@@ -2441,7 +2568,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     flog_warn!(
         "Raw Vulkan DRM ready: outputs={} renderer={} (no Vulkan display WSI)",
         data.outputs.len(),
-        data.renderer.info().adapter_name
+        data.primary_gpu.renderer.info().adapter_name
     );
     'main: while data.desktop.state.running {
         if let Some(rx) = sleep_notifications.as_ref() {
@@ -2463,7 +2590,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 .is_some_and(|deadline| Instant::now() >= deadline)
         {
             if let Err(error) = resume_vulkan_session(&mut data, "settled resume") {
-                if !data.renderer.is_usable() {
+                if !data.primary_gpu.renderer.is_usable() {
                     return Err(error
                         .context("Vulkan resume recovery is no longer retryable")
                         .into());
@@ -2480,10 +2607,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         pump_desktop_services(&mut data.desktop.state);
         if data.desktop.state.take_display_reconfigure_request() {
             data.topology_refresh_pending = true;
+            gpu::request_reconfigure(&mut data);
             flog_warn!("raw Vulkan DRM display settings changed; scheduling topology rebuild");
         }
 
         event_loop.dispatch(Some(FRAME_INTERVAL), &mut data)?;
+        gpu::service_secondary_gpus(&mut data, &loop_handle);
         let now = Instant::now();
         let display = data.desktop.display.handle();
         data.retired_output_globals.retain(|(deadline, global)| {
@@ -2547,14 +2676,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         let gpu_ready = if !data.allocation_poll_backoff.ready(Instant::now()) {
             false
         } else {
-            match data.renderer.poll() {
+            match data.primary_gpu.renderer.poll() {
                 Ok(()) => {
                     data.allocation_poll_backoff = AllocationBackoff::default();
                     true
                 }
                 Err(error)
                     if AshDrmRenderer::is_allocation_pressure(&error)
-                        && data.renderer.is_usable() =>
+                        && data.primary_gpu.renderer.is_usable() =>
                 {
                     data.allocation_poll_backoff.failed(Instant::now());
                     data.allocation_reclaim_pending = true;
@@ -2567,7 +2696,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             }
         };
         if gpu_ready && data.allocation_reclaim_pending {
-            if let Some(freed) = data.renderer.reclaim_allocation_pressure() {
+            if let Some(freed) = data.primary_gpu.renderer.reclaim_allocation_pressure() {
                 data.allocation_reclaim_pending = false;
                 // A readback mapping can itself fail under memory pressure.
                 // All GPU work is now retired; permit that capture to retry.
@@ -2577,8 +2706,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 flog_warn!("Vulkan allocation recovery released {freed} cached GPU resources after queued work completed; scanout retained");
             }
         }
-        while let Some(capture) = data.renderer.take_completed_capture() {
-            finish_vulkan_capture(&mut data, capture);
+        while let Some(capture) = data.primary_gpu.renderer.take_completed_capture() {
+            if capture.id & gpu::desktop::BRIDGE_STREAM_BASE != 0 {
+                gpu::complete_bridge_capture(&mut data, capture);
+            } else {
+                finish_vulkan_capture(&mut data, capture);
+            }
         }
         if let Some(output_name) = data.outputs.iter().find_map(|output| {
             (output.frame_pending
@@ -2642,6 +2775,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         data.desktop.state.tick_layout();
         crate::core::portal::remove_dead_portal_sessions(&mut data.desktop.state);
         data.desktop.display.flush_clients()?;
+        data.desktop.state.materialize_full_redraw_damage();
+        gpu::render_secondary_desktops(&mut data, gpu_ready);
         if !gpu_ready {
             continue;
         }
@@ -2702,10 +2837,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 && (!trusted_shell_ready || quick_settings_fallback_open)
             {
                 sync_vui_shell_context(&mut data);
-                let vui_error = data
-                    .vui_shell
-                    .as_mut()
-                    .and_then(|shell| shell.composite_ash(&mut data.renderer, &mut scene).err());
+                let vui_error = data.vui_shell.as_mut().and_then(|shell| {
+                    shell
+                        .composite_ash(&mut data.primary_gpu.renderer, &mut scene)
+                        .err()
+                });
                 if let Some(error) = vui_error {
                     flog_warn!("disabling raw Vulkan VUI shell after render failure: {error:#}");
                     if let Some(damage) = data.vui_shell.as_ref().and_then(VuiShell::damage_rect) {
@@ -2857,7 +2993,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     Rectangle::from_loc_and_size((*x, *y), (*width, *height))
                 })
                 .collect::<Vec<_>>();
-            let submission = match data.renderer.render(
+            let submission = match data.primary_gpu.renderer.render(
                 &target,
                 &scene.background,
                 &scene.surfaces,
@@ -2882,7 +3018,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 }
                 Err(error)
                     if AshDrmRenderer::is_allocation_pressure(&error)
-                        && data.renderer.is_usable() =>
+                        && data.primary_gpu.renderer.is_usable() =>
                 {
                     data.allocation_reclaim_pending = true;
                     let backoff = data.allocation_backoff.entry(output_id).or_default();
@@ -2945,7 +3081,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         continue;
                     }
                 };
-                let portal_submission = data.renderer.render(
+                let portal_submission = data.primary_gpu.renderer.render(
                     &target,
                     &scene.background,
                     &scene.surfaces,
@@ -2965,7 +3101,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     None,
                 );
                 match portal_submission.and_then(|submission| {
-                    data.renderer
+                    data.primary_gpu
+                        .renderer
                         .publish_target_write_fence(&target, submission.fence_fd)
                 }) {
                     Ok(()) => capture.frame.success(
@@ -2995,7 +3132,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 data.capture_pending.insert(output_id);
                 data.last_cpu_capture.insert(output_id, Instant::now());
             }
-            let sync = if data.disable_explicit_kms_fences {
+            let sync = if data.primary_gpu.disable_explicit_kms_fences {
                 let fence = KmsFence(submission.fence_fd);
                 match fence.wait_timeout(KMS_PRESENT_TIMEOUT) {
                     Ok(true) => None,

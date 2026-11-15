@@ -343,41 +343,48 @@ fn configure_layer_window_without_monitor(
     }
 }
 
+fn discovered_display_inventory() -> Option<serde_json::Value> {
+    focaldesk_settings_core::settings_path()
+        .parent()
+        .and_then(|path| std::fs::read_to_string(path.join("displays.json")).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+}
+
 fn companion_connectors() -> Vec<String> {
-    load_settings()
-        .displays
-        .outputs
-        .into_iter()
-        .filter(|output| {
-            output.enabled && output.role == focaldesk_settings_core::OutputRole::ControlPanel
-        })
-        .map(|output| output.connector)
-        .collect()
+    role_connectors_from_inventory(
+        &load_settings().displays.outputs,
+        discovered_display_inventory().as_ref(),
+        OutputRole::ControlPanel,
+    )
 }
 
 fn normal_connectors() -> Vec<String> {
-    let settings = load_settings();
-    let inventory = focaldesk_settings_core::settings_path()
-        .parent()
-        .and_then(|path| std::fs::read_to_string(path.join("displays.json")).ok())
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
-    normal_connectors_from_inventory(&settings.displays.outputs, inventory.as_ref())
+    normal_connectors_from_inventory(
+        &load_settings().displays.outputs,
+        discovered_display_inventory().as_ref(),
+    )
 }
 
 fn normal_connectors_from_inventory(
     configured: &[focaldesk_settings_core::OutputConfig],
     inventory: Option<&serde_json::Value>,
 ) -> Vec<String> {
+    role_connectors_from_inventory(configured, inventory, OutputRole::Normal)
+}
+
+fn role_connectors_from_inventory(
+    configured: &[focaldesk_settings_core::OutputConfig],
+    inventory: Option<&serde_json::Value>,
+    role: OutputRole,
+) -> Vec<String> {
     let mut connectors = configured
         .iter()
-        .filter(|output| {
-            output.enabled && output.role == focaldesk_settings_core::OutputRole::Normal
-        })
+        .filter(|output| output.enabled && output.role == role)
         .map(|output| output.connector.clone())
         .collect::<Vec<_>>();
-    // A fresh installation has no saved output configuration. Use the
-    // compositor's discovered connectors until the user saves settings;
-    // otherwise every real monitor is rejected and only one fallback maps.
+    // Monitor roles are resolved by EDID in the compositor. If a monitor moves
+    // to another GPU, use its newly discovered connector as well as the saved
+    // name. Exact connector settings still take precedence over inventory.
     for output in inventory
         .and_then(serde_json::Value::as_array)
         .into_iter()
@@ -389,8 +396,11 @@ fn normal_connectors_from_inventory(
         if configured.iter().any(|saved| saved.connector == name) {
             continue;
         }
+        let discovered_role = if output.get("role").and_then(serde_json::Value::as_str) == Some("ControlPanel") {
+            OutputRole::ControlPanel
+        } else { OutputRole::Normal };
         if output.get("enabled").and_then(serde_json::Value::as_bool) == Some(true)
-            && output.get("role").and_then(serde_json::Value::as_str) != Some("ControlPanel")
+            && discovered_role == role && !connectors.iter().any(|connector| connector == name)
         {
             connectors.push(name.to_string());
         }
@@ -6080,6 +6090,24 @@ fn rgba(color: [f32; 4]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn control_panel_follows_inventory_when_its_gpu_connector_changes() {
+        let configured: Vec<focaldesk_settings_core::OutputConfig> = serde_json::from_value(serde_json::json!([{
+            "connector": "HDMI-A-5", "enabled": true, "role": "ControlPanel",
+            "x": 5, "y": 0, "width": 1920, "height": 1080,
+            "refresh_mhz": 60000, "scale": 1.0, "primary": false
+        }])).unwrap();
+        let inventory = serde_json::json!([
+            {"name": "HDMI-A-5", "enabled": false, "role": "ControlPanel"},
+            {"name": "HDMI-A-1", "enabled": true, "role": "ControlPanel"},
+            {"name": "DP-3", "enabled": true, "role": "Normal"}
+        ]);
+        let companions = super::role_connectors_from_inventory(&configured, Some(&inventory), focaldesk_settings_core::OutputRole::ControlPanel);
+        assert!(companions.iter().any(|connector| connector == "HDMI-A-1"));
+        assert!(!companions.iter().any(|connector| connector == "DP-3"));
+        assert_eq!(super::normal_connectors_from_inventory(&configured, Some(&inventory)), vec!["DP-3"]);
+    }
+
     #[test]
     fn fresh_install_uses_all_discovered_normal_outputs() {
         let inventory = serde_json::json!([

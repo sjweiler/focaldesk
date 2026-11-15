@@ -222,6 +222,9 @@ depend on EGL.
 verifies the combined build without installing it. The legacy `drm-wgpu`
 feature remains as a build-script compatibility alias.
 
+For per-device discovery, secondary GPU SDR desktop rendering, touch mapping,
+and the optional scanout test, see [multi-GPU Vulkan](multi-gpu-vulkan.md).
+
 This is the recommended development path because a compositor crash only closes
 the nested window. Backend-specific DRM/KMS shortcuts such as screenshots are
 not available in nested mode.
