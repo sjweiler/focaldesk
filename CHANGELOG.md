@@ -19,6 +19,13 @@ version numbers where practical.
 
 ### Added
 
+- Added opt-in raw Vulkan multi-GPU output rendering, hardware-validated with
+  RTX 4090 primary displays and an Intel UHD 770 independently rendering the
+  ViewSonic companion. Includes secondary layer-surface allocation feedback,
+  bounded recovery from the compatibility copy path, and an Intel-only GTK
+  companion renderer override. Secondary outputs currently use SDR and software
+  cursors. Added reproducible CPU/Intel embedding benchmarks; automatic AI GPU
+  scheduling remains future work.
 - Added reproducible workspace dependency UML from Cargo metadata, reviewed
   runtime architecture, rendering and IPC sequences, and rendering type views.
   Includes editable PlantUML, locally rendered SVGs, source anchors, and

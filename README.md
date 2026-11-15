@@ -25,6 +25,10 @@ tracked in [Known Issues](docs/known-issues.md).
 - Custom Wayland compositor with selectable GLES and raw-Ash Vulkan DRM/KMS
   renderers, plus nested winit and experimental nested wgpu/Vulkan backends.
 - Keyboard-oriented workspaces and multi-monitor window management.
+- Multi-GPU output rendering with the raw Vulkan backend, hardware-validated
+  with an RTX 4090 driving two TCL displays and an Intel UHD 770 independently
+  rendering the ViewSonic companion. Secondary outputs currently use SDR
+  ([setup and limitations](docs/multi-gpu-vulkan.md)).
 - XWayland support for X11 applications, including tested Wine/DXVK workflows.
 - GLES and Vulkan rendering with damage tracking and experimental HDR and color
   management. Raw Ash Vulkan is the project owner's primary daily-tested path;
@@ -63,6 +67,7 @@ release.
 | Wayland text input and input methods | text-input-v3 implemented; input-method-v2 restricted to configured IME executables |
 | DRM/KMS and nested winit backends | Working, alpha |
 | Workspaces and multi-monitor layout | Working, with ongoing edge-case work |
+| Multi-GPU rendering | Supported, opt-in on raw Vulkan; NVIDIA RTX 4090 + Intel UHD 770 hardware-validated. Independent Intel companion rendering works; secondary outputs use SDR and software cursors. See [setup and validation](docs/multi-gpu-vulkan.md). |
 | XWayland application support | Working, alpha |
 | PipeWire/portal screen capture | Experimental |
 | Remote desktop | Experimental Phase 3: one output, one view-only RDP client, loopback/SSH-tunnel access only |

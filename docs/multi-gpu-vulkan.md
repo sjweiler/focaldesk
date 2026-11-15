@@ -1,4 +1,4 @@
-# Vulkan multi-GPU desktop
+# Multi-GPU support: Vulkan desktop
 
 The raw Vulkan backend supports opt-in SDR desktop rendering on secondary GPUs.
 The primary GPU retains its existing desktop and HDR path. Devices own separate
@@ -13,6 +13,34 @@ the desktop to the right. The compositor publishes the discovered connector and
 resolved role in the display inventory, so the companion can follow a control
 panel from an NVIDIA connector to an Intel connector. Secondary rendering currently uses SDR and a software
 cursor; HDR remains on the primary path.
+
+## Hardware-validated configuration
+
+Multi-GPU output rendering was verified on 2026-11-15 with Fedora 45,
+NVIDIA driver 615.78.08, an RTX 4090 driving two TCL displays, and an Intel
+UHD Graphics 770 driving the ViewSonic companion over HDMI. The companion uses
+an Intel Vulkan client renderer and the compositor's secondary Intel renderer,
+avoiding the NVIDIA-to-system-memory-to-Intel compatibility copy for that UI.
+Live driver/process inspection confirmed Intel allocations for the companion
+and compositor; the companion stayed running without restarts during the
+inference benchmarks. The user reported noticeably smoother interaction;
+an exact before/after FPS improvement has not been measured.
+
+The TCL displays were reduced from 165 Hz to 120 Hz after sporadic, independent
+brief blanking. 120 Hz is the current baseline; the cause of the 165 Hz blanking
+is unresolved. This observation does not establish that multi-GPU rendering
+caused it, or that other displays cannot operate at higher refresh rates.
+
+Intel compute also ran alongside the companion: an OpenVINO MiniLM embedding
+benchmark verified execution on the UHD 770 with matching CPU/GPU outputs.
+The i9-13900K was faster for the tested FP32 workload. See the
+[benchmark methodology and results](intel-inference-benchmark.md). This is a
+standalone compute validation; automatic per-workload GPU scheduling is not
+implemented.
+
+This validates the recorded topology. Other GPU/driver combinations, arbitrary
+cross-device client-buffer imports, secondary HDR, and the full hotplug/resume
+matrix still require separate validation.
 
 ## Build and enable
 
@@ -63,9 +91,53 @@ late completion cannot overwrite a newer output generation.
 
 This fallback costs primary-GPU work and CPU/PCIe bandwidth. It is a compatibility
 path, not a zero-copy or high-refresh cross-device guarantee. Direct import on
-real Intel/NVIDIA driver combinations still requires hardware validation.
-Per-surface feedback, DMA-BUF export from secondary client allocations, and
-GPU-to-GPU copy optimization remain future improvements.
+arbitrary Intel/NVIDIA client-buffer combinations still requires hardware validation.
+Secondary layer-shell surfaces (including the companion dashboard) receive
+surface-specific DMA-BUF feedback identifying the secondary GPU as their allocation
+device. Its advertised formats are the intersection of primary import-validation
+formats and secondary sampling formats. With no intersection, primary allocation
+and the copy fallback remain available. Other clients retain the primary GPU's
+default allocation preferences. Clients must support and honor surface feedback;
+this does not guarantee cross-driver import or force a running client to switch
+its rendering device.
+
+Copy mode probes direct rendering again at most once every two seconds when
+there is new output damage, after pending copies have completed. This lets a
+client's replacement buffers restore independent rendering without rebuilding
+the output. `Secondary Vulkan allocation feedback` reports the preferred device;
+`Secondary Vulkan direct rendering restored` reports recovery from copying.
+DMA-BUF export from secondary client allocations and GPU-to-GPU copy optimization
+remain future improvements.
+
+## Intel companion client renderer
+
+Surface feedback controls buffer allocation preferences, but does not reliably
+switch an already-created GTK Vulkan renderer to the output GPU. On the tested
+NVIDIA/Intel system, the default NVIDIA GTK renderer crashed in
+`gdk_vulkan_context_check_swapchain` / `terminator_CreateSwapchainKHR` after
+`VK_ERROR_OUT_OF_DATE_KHR` when the companion received Intel allocation feedback.
+The dashboard briefly appeared, then disappeared while systemd restarted it.
+
+For an Intel-connected companion on x86_64, verify that
+`/usr/share/vulkan/icd.d/intel_icd.x86_64.json` exists, then install the optional
+companion-only drop-in:
+
+```sh
+install -Dm644 packaging/systemd/user/focaldesk-companion-intel.conf \
+  "$HOME/.config/systemd/user/focaldesk-companion-dashboard.service.d/70-intel-renderer.conf"
+systemctl --user daemon-reload
+systemctl --user restart focaldesk-companion-dashboard.service
+```
+
+This selects Intel before GTK creates its Vulkan device, without restarting the
+compositor. It affects only the companion service. Recheck this override if the
+companion is moved to another GPU or the Intel driver manifest changes.
+
+Check `systemctl --user show focaldesk-companion-dashboard.service -p MainPID
+-p NRestarts -p Environment`: the PID should stay stable, the restart count should
+stop increasing, and the environment should identify the Intel driver manifest.
+A stable process establishes crash recovery; visible dashboard rendering and
+absence of new `Cross-GPU copy enabled` messages must also be checked.
 
 ## Touch input
 

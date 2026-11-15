@@ -1,0 +1,78 @@
+{
+  "model": "sentence-transformers/all-MiniLM-L6-v2",
+  "revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+  "openvino": "2025.4.0-20398-7a975177ff4-releases/2025/4",
+  "platform": "Linux-7.2.15-300.fc45.x86_64-x86_64-with-glibc2.44",
+  "batch_size": 1,
+  "sequence_length": 128,
+  "devices": {
+    "CPU": "13th Gen Intel(R) Core(TM) i9-13900K",
+    "GPU.0": "Intel(R) UHD Graphics 770 (iGPU)",
+    "GPU.1": "NVIDIA GeForce RTX 4090 (dGPU)"
+  },
+  "phases": [
+    {
+      "device": "CPU",
+      "execution_devices": [
+        "CPU"
+      ],
+      "compile_seconds": 0.09300723900014418,
+      "iterations": 6531,
+      "median_ms": 4.520794998825295,
+      "p95_ms": 5.240631999186007,
+      "p99_ms": 5.780648497966467,
+      "embeddings_per_second": 217.70773265294352,
+      "embedding_dimensions": 384,
+      "frames": {
+        "connector": "HDMI-A-1",
+        "samples": 740,
+        "elapsed_seconds": 30.39866818599694,
+        "median_ms": 36.251619,
+        "p95_ms": 51.079936,
+        "p99_ms": 54.098345,
+        "max_ms": 78.553348,
+        "over_33ms": 580,
+        "measurement": "GTK frame callback intervals; not touch or physical presentation latency"
+      }
+    },
+    {
+      "device": "GPU.0",
+      "execution_devices": [
+        "GPU.0"
+      ],
+      "compile_seconds": 0.5339921699996921,
+      "iterations": 3688,
+      "median_ms": 7.456189499862376,
+      "p95_ms": 10.711820448523213,
+      "p99_ms": 11.156360152490379,
+      "embeddings_per_second": 122.92272220950423,
+      "embedding_dimensions": 384,
+      "frames": {
+        "connector": "HDMI-A-1",
+        "samples": 779,
+        "elapsed_seconds": 30.396151986002224,
+        "median_ms": 35.648248,
+        "p95_ms": 50.080238,
+        "p99_ms": 53.786884,
+        "max_ms": 98.033496,
+        "over_33ms": 559,
+        "measurement": "GTK frame callback intervals; not touch or physical presentation latency"
+      }
+    }
+  ],
+  "complete": true,
+  "baseline_frames": {
+    "connector": "HDMI-A-1",
+    "samples": 587,
+    "elapsed_seconds": 30.451342240001395,
+    "median_ms": 50.018372,
+    "p95_ms": 63.223383,
+    "p99_ms": 70.138036,
+    "max_ms": 131.920633,
+    "over_33ms": 567,
+    "measurement": "GTK frame callback intervals; not touch or physical presentation latency"
+  },
+  "cpu_gpu_cosine_similarity": [
+    0.9999999999997589
+  ]
+}

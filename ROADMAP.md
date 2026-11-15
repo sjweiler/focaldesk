@@ -21,6 +21,9 @@ truth for what is usable today.
 
 ## Rendering and display work
 
+- [x] Support independent secondary-GPU output rendering on raw Vulkan;
+  validate RTX 4090 primary displays with an Intel UHD 770 companion output
+  ([configuration and hardware findings](docs/multi-gpu-vulkan.md)).
 - Profile the completed subsurface damage path across GTK, Qt, browsers, games,
   mixed-scale outputs, and direct DRM/KMS sessions.
 - Continue reducing categorized full-output fallbacks using captured damage

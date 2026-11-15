@@ -9,6 +9,7 @@ use smithay::backend::allocator::gbm::GbmBuffer;
 use smithay::backend::allocator::{dmabuf::AsDmabuf, Allocator};
 
 pub(in super::super) const BRIDGE_STREAM_BASE: u64 = 1 << 62;
+const DIRECT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const BRIDGE_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const IDENTITY: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
@@ -20,6 +21,7 @@ struct BridgeTarget {
 #[derive(Default)]
 struct FrameState {
     bridge: bool,
+    last_direct_attempt: Option<Instant>,
     bridge_target: Option<BridgeTarget>,
     bridge_started: Option<Instant>,
     bridge_capture: Option<u64>,
@@ -30,6 +32,18 @@ struct FrameState {
     retry: AllocationBackoff,
 }
 
+impl FrameState {
+    fn should_probe_direct(&self, now: Instant) -> bool {
+        self.bridge
+            && self.bridge_pixels.is_none()
+            && self.bridge_capture.is_none()
+            && self.bridge_started.is_none()
+            && self
+                .last_direct_attempt
+                .is_some_and(|last| now.saturating_duration_since(last) >= DIRECT_RETRY_INTERVAL)
+    }
+}
+
 pub(super) struct SecondaryDesktop {
     pub outputs: Vec<VulkanOutput>,
     builder: VulkanSceneBuilder,
@@ -37,11 +51,13 @@ pub(super) struct SecondaryDesktop {
     ids: HashMap<connector::Handle, OutputId>,
     pub reconfigure_requested: bool,
     sample_formats: HashSet<(u32, u64)>,
+    feedback: smithay::wayland::dmabuf::DmabufFeedback,
 }
 
 impl SecondaryDesktop {
     pub fn new(data: &mut VulkanDrmData, device: &mut VulkanDevice) -> Result<Self> {
         let mut desktop = Self {
+            feedback: secondary_feedback(data, device)?,
             outputs: Vec::new(),
             builder: VulkanSceneBuilder::default(),
             frames: HashMap::new(),
@@ -236,6 +252,7 @@ impl SecondaryDesktop {
             .renderer
             .recreate_quiesced(device.node.major(), device.node.minor())?;
         self.sample_formats = device.renderer.sample_formats().into_iter().collect();
+        self.feedback = secondary_feedback(data, device)?;
         self.initialize(data, device)?;
         data.desktop.state.restore_output_topology(snapshot);
         Ok(())
@@ -310,6 +327,18 @@ impl SecondaryDesktop {
         let mut presented = false;
         for output in &mut self.outputs {
             let id = output.output_id;
+            // Layer-shell surfaces belong to exactly one output. Prefer that
+            // output's GPU without changing allocation policy for other clients.
+            if let Some(state) = data.desktop.state.outputs.get(&id) {
+                let map = smithay::desktop::layer_map_for_output(&state.handle);
+                for layer in map.layers() {
+                    layer.send_dmabuf_feedback(
+                        &state.handle,
+                        |_, _| Some(state.handle.clone()),
+                        |_, _| &self.feedback,
+                    );
+                }
+            }
             let frame = self.frames.get_mut(&id).unwrap();
             if output.frame_pending {
                 if output
@@ -342,6 +371,12 @@ impl SecondaryDesktop {
             }
             if frame.bridge_pixels.is_none() && !data.desktop.state.output_has_pending_damage(id) {
                 continue;
+            }
+            // Copy mode must not be permanent: feedback can cause a client to
+            // replace its NVIDIA buffers with secondary-compatible allocations.
+            // Bound probes so a driver that rejects import keeps its usable copy path.
+            if frame.should_probe_direct(Instant::now()) {
+                frame.bridge = false;
             }
             if frame.bridge && frame.bridge_pixels.is_none() {
                 if !primary_ready
@@ -386,6 +421,9 @@ impl SecondaryDesktop {
             // GPU. A full redraw here also makes retries and fallback transitions
             // correct when a client buffer straddles two devices.
             scene.damage = vec![[0, 0, output.width as i32, output.height as i32]];
+            if !bridged {
+                frame.last_direct_attempt = Some(Instant::now());
+            }
             if !bridged
                 && scene
                     .surfaces
@@ -432,6 +470,12 @@ impl SecondaryDesktop {
                     frame.ready_fence = Some(KmsFence(submission.fence_fd));
                     frame.fence_started = Some(Instant::now());
                     if !bridged {
+                        if frame.last_bridge.take().is_some() {
+                            flog_warn!(
+                                "Secondary Vulkan direct rendering restored: output={}",
+                                output.name
+                            );
+                        }
                         data.desktop.state.clear_output_repaint_request(id);
                     }
                     if capture {
@@ -480,6 +524,44 @@ impl SecondaryDesktop {
         }
         Ok(presented)
     }
+}
+
+// Only advertise pairs accepted by both import validation on the primary and
+// sampling on the secondary. The main device tells clients where to allocate;
+// formats alone cannot make a vendor-specific NVIDIA allocation Intel-local.
+fn secondary_feedback(
+    data: &VulkanDrmData,
+    device: &VulkanDevice,
+) -> Result<smithay::wayland::dmabuf::DmabufFeedback> {
+    let formats = device
+        .renderer
+        .sample_formats()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let compatible = data
+        .desktop
+        .state
+        .wgpu_dmabuf_formats
+        .iter()
+        .copied()
+        .filter(|format| formats.contains(&(format.code as u32, u64::from(format.modifier))))
+        .collect::<Vec<_>>();
+    // With no shared formats retain primary allocation and the copy fallback.
+    let (node, formats) = if compatible.is_empty() {
+        (
+            data.primary_gpu.node,
+            data.desktop.state.wgpu_dmabuf_formats.clone(),
+        )
+    } else {
+        (device.node, compatible)
+    };
+    flog_warn!(
+        "Secondary Vulkan allocation feedback: output_gpu={:?} allocation_gpu={:?} compatible_formats={}",
+        device.node, node, formats.len()
+    );
+    DmabufFeedbackBuilder::new(node.dev_id(), formats)
+        .build()
+        .context("build secondary output DMA-BUF feedback")
 }
 
 fn queue_frame(output: &mut VulkanOutput, frame: &mut FrameState, implicit: bool) -> Result<()> {
@@ -670,6 +752,7 @@ mod tests {
             ids: HashMap::new(),
             reconfigure_requested: false,
             sample_formats: HashSet::new(),
+            feedback: DmabufFeedbackBuilder::new(0, []).build().unwrap(),
         }
     }
 
@@ -683,6 +766,27 @@ mod tests {
             output_transfer: AshDrmTransfer::Srgb,
             reference_white_nits: 100.0,
         }
+    }
+
+    #[test]
+    fn direct_retry_is_bounded_and_preserves_pending_copies() {
+        let now = Instant::now();
+        let mut frame = FrameState {
+            bridge: true,
+            last_direct_attempt: Some(now),
+            ..FrameState::default()
+        };
+        assert!(!frame.should_probe_direct(now));
+        let retry = now + DIRECT_RETRY_INTERVAL;
+        assert!(frame.should_probe_direct(retry));
+        frame.bridge_capture = Some(1);
+        assert!(!frame.should_probe_direct(retry));
+        frame.bridge_capture = None;
+        frame.bridge_started = Some(now);
+        assert!(!frame.should_probe_direct(retry));
+        frame.bridge_started = None;
+        frame.bridge = false;
+        assert!(!frame.should_probe_direct(retry));
     }
 
     #[test]

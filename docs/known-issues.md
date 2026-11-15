@@ -6,6 +6,13 @@ use FocalDesk as the only environment protecting important work.
 - DRM/KMS, HDR, suspend/resume, hardware cursors, direct scanout, multi-GPU,
   hotplug, mixed refresh rates, scaling, and transforms remain hardware- and
   driver-dependent.
+- Multi-GPU rendering is supported on raw Vulkan and validated with RTX 4090
+  primary outputs plus an Intel UHD 770 companion. Secondary outputs use SDR
+  and software cursors; incompatible client buffers retain a copy fallback.
+  The tested GTK companion needs the documented Intel renderer override.
+  Sporadic individual TCL blanking was reported at 165 Hz; 120 Hz is the current
+  baseline and the cause remains unresolved. See
+  [multi-GPU setup and hardware findings](multi-gpu-vulkan.md).
 - Portal/PipeWire capture is experimental. The raw Vulkan compatibility
   readback path is capped at 5 FPS to protect desktop responsiveness; use the
   GLES backend for OBS until Vulkan DMA-BUF portal export lands. Wide-gamut SDR capture currently

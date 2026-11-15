@@ -1,0 +1,14 @@
+clang22-libs-22.1.8-2.fc45.x86_64
+clang22-resource-filesystem-22.1.8-2.fc45.x86_64
+compiler-rt22-22.1.8-2.fc45.x86_64
+intel-gmmlib-22.10.2-1.fc45.x86_64
+intel-igc-2.41.16-1.fc45.x86_64
+intel-igc-libs-2.41.16-1.fc45.x86_64
+intel-opencl-26.35.39758.21-2.fc45.x86_64
+intel-opencl-clang-22.1.4-1.fc45.x86_64
+libomp22-22.1.8-2.fc45.x86_64
+libomp22-devel-22.1.8-2.fc45.x86_64
+lld22-libs-22.1.8-2.fc45.x86_64
+llvm22-filesystem-22.1.8-2.fc45.x86_64
+llvm22-libs-22.1.8-2.fc45.x86_64
+spirv-llvm-translator22-22.0.0-1.fc45.x86_64

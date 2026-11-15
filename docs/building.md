@@ -222,8 +222,11 @@ depend on EGL.
 verifies the combined build without installing it. The legacy `drm-wgpu`
 feature remains as a build-script compatibility alias.
 
-For per-device discovery, secondary GPU SDR desktop rendering, touch mapping,
-and the optional scanout test, see [multi-GPU Vulkan](multi-gpu-vulkan.md).
+Multi-GPU rendering is supported with `FOCALDESK_DRM_SECONDARY_DESKTOP=1` on
+raw Vulkan, with RTX 4090 primary outputs and an independent Intel UHD 770
+companion validated on hardware. For setup, the Intel GTK renderer override,
+secondary SDR limitations, touch mapping, and the optional scanout test, see
+[multi-GPU Vulkan](multi-gpu-vulkan.md).
 
 This is the recommended development path because a compositor crash only closes
 the nested window. Backend-specific DRM/KMS shortcuts such as screenshots are
