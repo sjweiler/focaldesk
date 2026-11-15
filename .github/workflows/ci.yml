@@ -70,7 +70,7 @@ jobs:
             libgbm-dev \
             libgtk-4-dev \
             libwebkit2gtk-4.1-dev \
-            webkit2gtk-driver \
+            webkitgtk-webdriver \
             libappindicator3-dev \
             librsvg2-dev \
             libadwaita-1-dev \
