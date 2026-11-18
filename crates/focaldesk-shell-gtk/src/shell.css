@@ -341,6 +341,7 @@ window.task-shelf-window {
 }
 
 .rail-workspace-button.active {
+  color: #e2ecf7;
   box-shadow: inset 3px 0 alpha(@fd_shell_accent, 0.78);
 }
 
