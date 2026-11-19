@@ -7,7 +7,7 @@
     <persistenceSelectorStrategy class="org.opennms.netmgt.collection.support.PersistAllSelectorStrategy"/>
     <storageStrategy class="org.opennms.netmgt.collection.support.IndexStorageStrategy"/>
   </resourceType>
-  <group name="focaldesk-compositor" ifType="all">
+  <group name="focaldesk-compositor" ifType="ignore">
     <mibObj oid="@FD_OBJECTS@.1.1" instance="0" alias="fdUptime" type="gauge"/>
     <mibObj oid="@FD_OBJECTS@.1.2" instance="0" alias="fdProducerEpoch" type="string"/>
     <mibObj oid="@FD_OBJECTS@.1.7" instance="0" alias="fdInventoryEpoch" type="string"/>

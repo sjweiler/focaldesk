@@ -415,9 +415,13 @@ of later scanout initialization. These are not driver/hardware reset counters.
 Each configured display reports width/height and selected mode refresh in
 millihertz (currently derived from DRM's integer-Hz mode value). Test-pattern
 outputs report unknown refresh as JSON `null`. Display state is `active`,
-`inactive` (paused/failed device), or `notConfigured` (previously observed but no
-longer configured); the last state does not distinguish unplugged from disabled.
-Retired rows retain counts but clear mode fields to `null`. Presented-frame counts
+`inactive` (paused or failed device), `failed` (an output-specific incident),
+`disabled` (saved configuration), `disconnected` (DRM connector or GPU
+removed), or `notConfigured` (no output with a usable mode). Retired rows
+retain counters but clear mode fields to `null`. Connected output incidents
+count when KMS presentation or rendering completion fails or times out.
+The first completed presentation afterward counts as recovery. Unplugging
+or disabling a failed connector clears the incident without counting recovery. Presented-frame counts
 advance only after successful KMS page-flip completion for an outstanding frame,
 not on render submission or cleanup. Compute observed per-output FPS from count
 and sample-time deltas within one producer epoch.

@@ -10,6 +10,14 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum DisplayTopology {
+    Connected,
+    Disabled,
+    Disconnected,
+    Unknown,
+}
+
 #[derive(Default, Serialize)]
 struct Display {
     state: &'static str,
@@ -17,6 +25,10 @@ struct Display {
     height: Option<u32>,
     refresh_millihz: Option<u32>,
     presented_frames: u64,
+    failures: u64,
+    recoveries: u64,
+    #[serde(skip)]
+    failed: bool,
 }
 
 #[derive(Default, Serialize)]
@@ -31,10 +43,40 @@ struct Device {
     #[serde(skip)]
     failed: bool,
     displays: BTreeMap<String, Display>,
+    #[serde(skip)]
+    topology: Option<BTreeMap<String, DisplayTopology>>,
 }
 
 #[derive(Clone)]
 pub(super) struct DeviceMetrics(Rc<RefCell<Device>>);
+
+fn connector_name(name: &str) -> &str {
+    // Secondary wl_output names may append a GPU suffix to avoid duplicates.
+    name.split_once('@')
+        .map_or(name, |(connector, _)| connector)
+}
+
+fn topology_state(
+    topology: Option<&BTreeMap<String, DisplayTopology>>,
+    connector: &str,
+) -> DisplayTopology {
+    match topology {
+        Some(topology) => topology
+            .get(connector_name(connector))
+            .copied()
+            .unwrap_or(DisplayTopology::Disconnected),
+        None => DisplayTopology::Unknown,
+    }
+}
+
+fn fallback_state(topology: DisplayTopology, failed: bool) -> &'static str {
+    match topology {
+        DisplayTopology::Disabled => "disabled",
+        DisplayTopology::Disconnected => "disconnected",
+        _ if failed => "failed",
+        _ => "notConfigured",
+    }
+}
 
 impl DeviceMetrics {
     pub fn error(&self, error: &anyhow::Error) {
@@ -77,9 +119,54 @@ impl DeviceMetrics {
         } else {
             "paused"
         };
+        let Device {
+            displays, topology, ..
+        } = &mut *device;
+        for (name, display) in displays {
+            display.state = fallback_state(topology_state(topology.as_ref(), name), display.failed);
+        }
     }
     pub fn active(&self) -> bool {
         self.0.borrow().state == "ready"
+    }
+    pub fn update_display_topology(&self, topology: BTreeMap<String, DisplayTopology>) {
+        let mut device = self.0.borrow_mut();
+        for (connector, display) in &mut device.displays {
+            if matches!(
+                topology_state(Some(&topology), connector),
+                DisplayTopology::Disabled | DisplayTopology::Disconnected
+            ) {
+                // A removed/disabled output does not complete a recovery.
+                display.failed = false;
+            }
+        }
+        for (connector, state) in &topology {
+            if *state == DisplayTopology::Disabled
+                && !device
+                    .displays
+                    .keys()
+                    .any(|name| connector_name(name) == connector)
+            {
+                device
+                    .displays
+                    .insert(connector.clone(), Display::default());
+            }
+        }
+        device.topology = Some(topology);
+    }
+    pub fn display_failed(&self, connector: &str) {
+        let mut device = self.0.borrow_mut();
+        if matches!(
+            topology_state(device.topology.as_ref(), connector),
+            DisplayTopology::Disabled | DisplayTopology::Disconnected
+        ) {
+            return;
+        }
+        let display = device.displays.entry(connector.to_owned()).or_default();
+        if !display.failed {
+            display.failed = true;
+            display.failures = display.failures.saturating_add(1);
+        }
     }
     pub fn presented(&self, connector: &str) {
         let mut device = self.0.borrow_mut();
@@ -95,6 +182,9 @@ impl DeviceMetrics {
                 .expect("registered display")
         };
         display.presented_frames = display.presented_frames.saturating_add(1);
+        if std::mem::take(&mut display.failed) {
+            display.recoveries = display.recoveries.saturating_add(1);
+        }
     }
     pub fn display(
         &self,
@@ -105,18 +195,21 @@ impl DeviceMetrics {
         active: bool,
     ) {
         let mut device = self.0.borrow_mut();
-        let display = {
-            if !device.displays.contains_key(connector) {
-                device
-                    .displays
-                    .insert(connector.to_owned(), Display::default());
-            }
-            device
-                .displays
-                .get_mut(connector)
-                .expect("registered display")
+        let topology = topology_state(device.topology.as_ref(), connector);
+        if matches!(
+            topology,
+            DisplayTopology::Disabled | DisplayTopology::Disconnected
+        ) {
+            return;
+        }
+        let display = device.displays.entry(connector.to_owned()).or_default();
+        display.state = if display.failed {
+            "failed"
+        } else if active {
+            "active"
+        } else {
+            "inactive"
         };
-        display.state = if active { "active" } else { "inactive" };
         display.width = Some(width);
         display.height = Some(height);
         display.refresh_millihz = refresh;
@@ -275,6 +368,9 @@ impl Monitor {
             device.failed = false;
             device.loss_observed = false;
             device.state = "ready";
+            for display in device.displays.values_mut() {
+                display.failed = false;
+            }
         }
         metrics
     }
@@ -291,7 +387,7 @@ impl Monitor {
             // Only live devices sampled below replace this absent marker.
             device.state = "absent";
             for display in device.displays.values_mut() {
-                display.state = "notConfigured";
+                display.state = "disconnected";
                 display.width = None;
                 display.height = None;
                 display.refresh_millihz = None;
@@ -470,4 +566,43 @@ fn input_delay_bins_measure_elapsed_time_and_skip_invalid_timestamps() {
     assert_eq!(latency.bins[0], 2);
     assert_eq!(latency.bins[1], 1);
     assert_eq!(latency.bins[INPUT_DELAY_EDGES_US.len()], 1);
+}
+
+#[cfg(test)]
+#[test]
+fn display_failures_distinguish_recovery_from_unplug_and_disable() {
+    let metrics = DeviceMetrics(Rc::new(RefCell::new(Device::default())));
+    let set_topology = |state| {
+        metrics.update_display_topology(BTreeMap::from([("DP-3".to_owned(), state)]));
+    };
+    let sample = |expected_state, failures, recoveries| {
+        metrics.sample_gpu(false, true);
+        metrics.display("DP-3", 3840, 2160, Some(120_000), true);
+        let device = metrics.0.borrow();
+        let display = &device.displays["DP-3"];
+        assert_eq!(display.state, expected_state);
+        assert_eq!(
+            (display.failures, display.recoveries),
+            (failures, recoveries)
+        );
+    };
+    set_topology(DisplayTopology::Connected);
+    sample("active", 0, 0);
+    metrics.display_failed("DP-3");
+    metrics.display_failed("DP-3");
+    sample("failed", 1, 0);
+    metrics.presented("DP-3");
+    sample("active", 1, 1);
+    set_topology(DisplayTopology::Disconnected);
+    metrics.display_failed("DP-3");
+    sample("disconnected", 1, 1);
+    set_topology(DisplayTopology::Disabled);
+    metrics.display_failed("DP-3");
+    sample("disabled", 1, 1);
+    set_topology(DisplayTopology::Connected);
+    metrics.display_failed("DP-3");
+    set_topology(DisplayTopology::Disconnected);
+    set_topology(DisplayTopology::Connected);
+    metrics.presented("DP-3");
+    sample("active", 2, 1);
 }

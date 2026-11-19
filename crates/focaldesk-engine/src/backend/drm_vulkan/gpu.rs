@@ -399,7 +399,7 @@ pub(super) fn discover_device(
             match event {
                 DrmEvent::VBlank(crtc) => {
                     if let Some(desktop) = gpu.desktop.as_mut() {
-                        if let Err(error) = desktop.page_flip(crtc, &gpu.device.metrics) {
+                        if let Err(error) = desktop.page_flip(crtc, &gpu.device) {
                             gpu.failed = true;
                             flog_warn!("secondary desktop page flip failed: {error:#}");
                         }

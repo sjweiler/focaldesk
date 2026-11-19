@@ -3,7 +3,7 @@
 
 import argparse
 from bisect import bisect_left, bisect_right
-from collections import OrderedDict
+from collections import OrderedDict, deque
 import csv
 from pathlib import Path
 import re
@@ -18,7 +18,10 @@ import time
 
 
 INVENTORY = runpy.run_path(str(Path(__file__).with_name("focaldesk-monitor-inventory.py")))
-INTEGER, OCTETS, GAUGE, TICKS, COUNTER64 = 2, 4, 66, 67, 70
+INTEGER, OCTETS, OID, GAUGE, TICKS, COUNTER64 = 2, 4, 6, 66, 67, 70
+TRAP_OID = (1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0)
+COMPOSITOR_STALE_MS = 30_000
+MAX_GAUGE32 = (1 << 32) - 1
 NO_OBJECT, NO_INSTANCE, END_OF_VIEW = 128, 129, 130
 STATUS = {"ok": 1, "unsupported": 2, "unavailable": 3, "stale": 4}
 GPU_STATE = {"ready": 1, "recovering": 2, "failed": 3, "absent": 4, "unknown": 5, "paused": 6}
@@ -45,6 +48,7 @@ DISPLAY_COLUMNS = {
     6: (GAUGE, "width"), 7: (GAUGE, "height"), 8: (GAUGE, "refresh_millihz"),
     10: (COUNTER64, "presented_frames"), 17: (INTEGER, "sample_status"),
     18: (GAUGE, "sample_age_seconds"),
+    19: (COUNTER64, "failures"), 20: (COUNTER64, "recoveries"),
 }
 
 
@@ -100,7 +104,7 @@ class NvidiaSampler:
 
 
 def leaf_prefixes(root):
-    return {root + (1, column) for column in (1, 2, 7, *INPUT_COUNTERS)} | {
+    return {root + (1, column) for column in (1, 2, 7, 12, *INPUT_COUNTERS)} | {
         root + (table, 1, column)
         for table, columns in ((2, GPU_COLUMNS.keys() | SENSOR_COLUMNS.keys()), (3, DISPLAY_COLUMNS))
         for column in columns
@@ -113,6 +117,9 @@ def objects(root, snapshot, sensors=None):
         root + (1, 2, 0): (OCTETS, snapshot["producer_epoch"].encode()),
         root + (1, 7, 0): (OCTETS, bytes.fromhex(snapshot["inventory_epoch"])),
     }
+    age = snapshot.get("sample_age_seconds")
+    if age is not None:
+        values[root + (1, 12, 0)] = GAUGE, age
     if snapshot.get("sample_status") == "ok":
         input_series = snapshot.get("input_dispatch_delay", {}).get("series", {})
         for column, (kind, field) in INPUT_COUNTERS.items():
@@ -125,7 +132,7 @@ def objects(root, snapshot, sensors=None):
     ):
         for row in rows:
             for column, (syntax, field) in columns.items():
-                value = row[field]
+                value = row.get(field)
                 if value is None:
                     continue
                 if field == "state":
@@ -167,6 +174,8 @@ def pack_varbind(oid, syntax, value):
     payload = struct.pack("!HH", syntax, 0) + pack_oid(oid)
     if syntax == OCTETS:
         return payload + pack_octets(value)
+    if syntax == OID:
+        return payload + pack_oid(value)
     if syntax == COUNTER64:
         return payload + struct.pack("!Q", value)
     if syntax in (INTEGER, GAUGE, TICKS):
@@ -238,20 +247,197 @@ def send(peer, kind, session, transaction, packet, payload):
     peer.sendall(struct.pack("!4B4I", 1, kind, 16, 0, session, transaction, packet, len(payload)) + payload)
 
 
+def exchange(peer, kind, session, packet_id, payload):
+    send(peer, kind, session, 0, packet_id, payload)
+    reply, _, order, response_session, transaction, packet, body = receive(peer)
+    _, error, index = struct.unpack_from(order + "IHH", body)
+    if (reply != 18 or transaction != 0 or packet != packet_id or error or index
+            or (session and response_session != session) or not response_session):
+        raise ValueError(f"AgentX request {kind} failed (error {error}, index {index})")
+    return response_session
+
+
+def open_session(peer, description):
+    return exchange(peer, 1, 0, 1, bytes((5, 0, 0, 0)) + pack_oid(()) + pack_octets(description))
+
+
 def register(peer, root):
-    exchanges = (
-        (1, 0, bytes((5, 0, 0, 0)) + pack_oid(()) + pack_octets(b"FocalDesk Vulkan inventory")),
-        (3, None, bytes((5, 127, 0, 0)) + pack_oid(root)),
+    session = open_session(peer, b"FocalDesk Vulkan inventory")
+    return exchange(peer, 3, session, 2, bytes((5, 127, 0, 0)) + pack_oid(root))
+
+
+class GpuFailureTracker:
+    def __init__(self):
+        self.epoch = None
+        self.states = {}
+        self.recent = {}
+
+    def observe(self, snapshot, now_ms):
+        epoch = snapshot["producer_epoch"]
+        states = {identity: device["state"] for identity, device in snapshot["gpus"].items()}
+        self.recent = {key: until for key, until in self.recent.items() if until > now_ms}
+        failed = []
+        if epoch == self.epoch:
+            for identity, state in states.items():
+                if (state == "failed" and self.states.get(identity) not in (None, "failed")
+                        and identity not in self.recent):
+                    self.recent[identity] = now_ms + 30_000
+                    failed.append(identity)
+        self.epoch, self.states = epoch, states
+        return failed
+
+
+def gpu_failure_payload(objects_root, notification_oid, epoch, row):
+    instance = (row["index"],)
+    gpu_entry = objects_root + (2, 1)
+    bindings = (
+        (TRAP_OID, OID, notification_oid),
+        (gpu_entry + (2,) + instance, OCTETS, row["identity"].encode()),
+        (gpu_entry + (4,) + instance, INTEGER, GPU_STATE["failed"]),
+        (gpu_entry + (6,) + instance, COUNTER64, row["rebuild_attempts"]),
+        (gpu_entry + (7,) + instance, COUNTER64, row["rebuild_successes"]),
+        (objects_root + (1, 2, 0), OCTETS, epoch.encode()),
     )
-    session = 0
-    for packet_id, (kind, session_override, payload) in enumerate(exchanges, start=1):
-        send(peer, kind, session if session_override is None else session_override, 0, packet_id, payload)
-        reply, _, order, response_session, transaction, packet, body = receive(peer)
-        _, error, index = struct.unpack_from(order + "IHH", body)
-        if reply != 18 or transaction != 0 or packet != packet_id or error or index:
-            raise ValueError(f"AgentX registration failed (error {error})")
-        session = response_session
-    return session
+    return b"".join(pack_varbind(*binding) for binding in bindings)
+
+
+class CompositorTracker:
+    def __init__(self):
+        self.epoch = None
+        self.timestamp = None
+        self.last_sample_ms = None
+        self.stale = False
+
+    def observe(self, fresh, now_ms):
+        if fresh is not None:
+            epoch, timestamp, age_ms = fresh
+            if (epoch, timestamp) != (self.epoch, self.timestamp):
+                restarted = self.epoch is not None and epoch != self.epoch
+                recovered = self.stale
+                self.epoch, self.timestamp = epoch, timestamp
+                self.last_sample_ms = now_ms - age_ms
+                self.stale = False
+                if recovered or restarted:
+                    return 6, epoch, age_ms, restarted
+        if self.last_sample_ms is not None and not self.stale:
+            age_ms = now_ms - self.last_sample_ms
+            if age_ms >= COMPOSITOR_STALE_MS:
+                self.stale = True
+                return 5, self.epoch, age_ms, None
+        return None
+
+
+def compositor_payload(objects_root, suffix, epoch, age_ms, restarted):
+    bindings = [
+        (TRAP_OID, OID, objects_root[:-1] + (0, suffix)),
+        (objects_root + (1, 2, 0), OCTETS, epoch.encode()),
+        (objects_root + (1, 12, 0), GAUGE, min(age_ms // 1000, MAX_GAUGE32)),
+    ]
+    if restarted is not None:
+        bindings.append((objects_root + (1, 13, 0), INTEGER, 1 if restarted else 2))
+    return b"".join(pack_varbind(*binding) for binding in bindings)
+
+
+class DisplayTracker:
+    def __init__(self):
+        self.epoch = None
+        self.counts = {}
+
+    def observe(self, snapshot):
+        epoch = snapshot["producer_epoch"]
+        if epoch != self.epoch:
+            self.epoch = epoch
+            self.counts.clear()
+        events = {}
+        for gpu, device in snapshot["gpus"].items():
+            for connector, display in device["displays"].items():
+                key = (gpu, connector)
+                counts = display.get("failures"), display.get("recoveries")
+                if None in counts:
+                    continue
+                previous = self.counts.get(key)
+                self.counts[key] = counts
+                if previous is not None:
+                    changed = tuple(suffix for suffix, before, after in zip((7, 8), previous, counts)
+                                    if after > before)
+                    if changed:
+                        events[key] = changed
+        return events
+
+
+def display_payload(objects_root, suffix, epoch, row):
+    index = row["index"]
+    entry = objects_root + (3, 1)
+    bindings = (
+        (TRAP_OID, OID, objects_root[:-1] + (0, suffix)),
+        (entry + (2, index), OCTETS, row["identity"].encode()),
+        (entry + (5, index), INTEGER, DISPLAY_STATE["failed" if suffix == 7 else "active"]),
+        (entry + (19, index), COUNTER64, row["failures"]),
+        (entry + (20, index), COUNTER64, row["recoveries"]),
+        (objects_root + (1, 2, 0), OCTETS, epoch.encode()),
+    )
+    return b"".join(pack_varbind(*binding) for binding in bindings)
+
+
+def watch_notifications(args):
+    gpu_tracker = GpuFailureTracker()
+    compositor = CompositorTracker()
+    displays = DisplayTracker()
+    pending = deque(maxlen=32)
+
+    def enqueue(payload):
+        if len(pending) == pending.maxlen:
+            print("FocalDesk AgentX: notification queue full", file=sys.stderr)
+        pending.append((payload, 0))
+
+    while True:
+        fresh = None
+        monotonic_ms = time.monotonic_ns() // 1_000_000
+        try:
+            source = INVENTORY["read_snapshot"](args.snapshot)
+            now_ms = time.time_ns() // 1_000_000
+            age_ms = now_ms - source["sample_unix_ms"]
+            if 0 <= age_ms < args.stale_after * 1000:
+                fresh = source["producer_epoch"], source["sample_unix_ms"], age_ms
+                failed_gpus = (
+                    gpu_tracker.observe(source, monotonic_ms) if args.gpu_failure_notification else ()
+                )
+                display_events = displays.observe(source) if args.display_notifications else {}
+                if failed_gpus or display_events:
+                    snapshot = INVENTORY["indexed_snapshot"](
+                        source, args.registry, args.stale_after, now_ms
+                    )
+                    epoch = snapshot["producer_epoch"]
+                    gpu_ids = {row["index"]: row["identity"] for row in snapshot["gpus"]}
+                    for row in snapshot["gpus"]:
+                        if row["identity"] in failed_gpus:
+                            enqueue(gpu_failure_payload(args.root, args.gpu_failure_notification, epoch, row))
+                    for row in snapshot["displays"]:
+                        key = (gpu_ids[row["scanout_gpu_index"]], row["connector"])
+                        for suffix in display_events.get(key, ()):
+                            enqueue(display_payload(args.root, suffix, epoch, row))
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, sqlite3.Error) as exc:
+            print(f"FocalDesk AgentX notification snapshot: {exc}", file=sys.stderr, flush=True)
+        if args.compositor_notifications:
+            event = compositor.observe(fresh, monotonic_ms)
+            if event is not None:
+                enqueue(compositor_payload(args.root, *event))
+        if pending:
+            payload, attempts = pending.popleft()
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+                    peer.settimeout(2)
+                    peer.connect(str(args.socket))
+                    session = open_session(peer, b"FocalDesk notifications")
+                    exchange(peer, 12, session, 2, payload)
+            except (OSError, ValueError, struct.error) as exc:
+                if attempts < 2:
+                    pending.append((payload, attempts + 1))
+                else:
+                    print(f"FocalDesk AgentX dropped notification: {exc}", file=sys.stderr, flush=True)
+        time.sleep(1)
 
 
 def serve(peer, args, sensors=None):
@@ -320,10 +506,18 @@ def main():
     parser.add_argument("--registry", required=True, type=Path)
     parser.add_argument("--stale-after", type=int, default=5)
     parser.add_argument("--nvidia-smi", metavar="PATH", help="enable background NVIDIA GPU sensors")
+    parser.add_argument("--gpu-failure-notification", type=parse_root, metavar="OID",
+                        help="enable GPU recovery failure notifications at this numeric OID")
+    parser.add_argument("--compositor-notifications", action="store_true",
+                        help="send snapshot-stale and recovery notifications under the product root")
+    parser.add_argument("--display-notifications", action="store_true",
+                        help="send per-connector failure and recovery notifications")
     args = parser.parse_args()
     if args.stale_after < 1:
         parser.error("--stale-after must be positive")
     sensors = NvidiaSampler(args.nvidia_smi) if args.nvidia_smi else None
+    if args.gpu_failure_notification or args.compositor_notifications or args.display_notifications:
+        Thread(target=watch_notifications, args=(args,), name="agentx-notifications", daemon=True).start()
     while True:
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:

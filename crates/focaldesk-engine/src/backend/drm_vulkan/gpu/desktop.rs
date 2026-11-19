@@ -78,7 +78,8 @@ impl SecondaryDesktop {
             .state
             .trial_display_outputs()
             .map(|outputs| outputs.to_vec());
-        let mut configs = select_outputs_for_device(&device.drm, overrides.as_deref(), false)?;
+        let mut configs =
+            select_outputs_for_device(&device.drm, overrides.as_deref(), false, &device.metrics)?;
         // Unconfigured displays extend the desktop to the right. Saved layouts,
         // including deliberately overlapping control panels, retain their origin.
         let mut next_x = data
@@ -260,15 +261,18 @@ impl SecondaryDesktop {
         Ok(())
     }
 
-    pub fn page_flip(&mut self, crtc: crtc::Handle, metrics: &metrics::DeviceMetrics) -> Result<()> {
+    pub fn page_flip(&mut self, crtc: crtc::Handle, device: &VulkanDevice) -> Result<()> {
         let Some(output) = self.outputs.iter_mut().find(|output| output.crtc == crtc) else {
             return Ok(());
         };
         if !output.frame_pending {
             return Ok(());
         }
-        output.scanout.frame_submitted()?;
-        metrics.presented(&output.name);
+        if let Err(error) = output.scanout.frame_submitted() {
+            record_display_failure(device, output);
+            return Err(error.into());
+        }
+        device.metrics.presented(&output.name);
         output.frame_pending = false;
         output.present_started_at = None;
         if std::mem::take(&mut output.log_first_present_state) {
@@ -348,6 +352,7 @@ impl SecondaryDesktop {
                     .present_started_at
                     .is_some_and(|started| started.elapsed() >= KMS_PRESENT_TIMEOUT)
                 {
+                    record_display_failure(device, output);
                     return Err(anyhow!("secondary KMS timeout on {}", output.name));
                 }
                 continue;
@@ -359,6 +364,7 @@ impl SecondaryDesktop {
                     .bridge_started
                     .is_some_and(|started| started.elapsed() >= KMS_PRESENT_TIMEOUT)
             {
+                record_display_failure(device, output);
                 return Err(anyhow!("secondary rendering timeout on {}", output.name));
             }
             if let Some(fence) = frame.ready_fence.as_ref() {

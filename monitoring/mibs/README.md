@@ -69,7 +69,7 @@ For a standalone lab process, run `scripts/focaldesk-monitor-agentx.py` with
 to the master and subagent. The subagent reconnects after a master restart,
 retains a bounded cache of per-request snapshots, and returns no rows when
 its input cannot be read. Stale snapshots remain readable with stale status.
-Notifications are pending.
+GPU recovery failure notifications are opt-in.
 
 See the [OpenNMS collection profile](../opennms/README.md) for polling the lab.
 
@@ -83,3 +83,56 @@ older than 15 seconds. Unsupported values and stale compositor rows have
 no sensor instance. The values describe the whole GPU, including applications
 outside FocalDesk. The Intel GPU continues to expose its normal inventory and
 recovery metrics.
+
+### GPU recovery failure INFORM
+
+The optional `fdGpuRecoveryFailed` notification is
+`.1.3.6.1.4.1.67726.1.0.4`. It carries the indexed GPU identity, state,
+rebuild attempts and successes, and compositor epoch. The adapter observes
+fresh snapshots independently of SNMP polling. Its first snapshot in each
+producer epoch establishes the baseline. An observed transition into
+`failed` can emit one notification per GPU every 30 seconds.
+
+Enable the adapter with `--gpu-failure-notification .1.3.6.1.4.1.67726.1.0.4`
+after configuring the master with an SNMPv3 authPriv INFORM destination.
+Use a private Net-SNMP `trapsess -Ci -v3` configuration with the receiver's
+USM user, matching authentication and privacy settings, and bounded retries.
+A successful AgentX response acknowledges the local handoff. The manager's
+INFORM response acknowledges network delivery. Polling and thresholding
+continue to cover missed notifications.
+
+Test the full sender path against a disposable local receiver without
+touching the compositor or OpenNMS:
+
+```sh
+bash monitoring/mibs/test-gpu-notification.sh
+```
+
+### Compositor freshness notifications
+
+Enable `--compositor-notifications` to observe the compositor independently
+of polling. After the first fresh snapshot, 30 seconds without a new sample
+produces `fdCompositorMetricsStale` (`.1.3.6.1.4.1.67726.1.0.5`). This
+covers an unreadable or missing snapshot as well as an old file. It reports
+loss of telemetry rather than determining the process exit reason.
+
+A new fresh sample after an interruption, or a new producer epoch, produces
+`fdCompositorMetricsResumed` (`.1.3.6.1.4.1.67726.1.0.6`). The final
+varbind indicates whether a new producer epoch was observed. A master
+notification filter needs to allow both OIDs. The loopback test above also
+checks these transitions.
+
+### Display failure and recovery
+
+Enable `--display-notifications` to send `fdDisplayFailed`
+(`.1.3.6.1.4.1.67726.1.0.7`) and `fdDisplayRecovered`
+(`.1.3.6.1.4.1.67726.1.0.8`). Each carries the indexed display identity,
+state, failure and recovery counts, and compositor epoch. The first snapshot
+for a display establishes the counter baseline. The counters preserve an
+incident even when the output recovers between two samples. Unplug and disable
+events do not increment either counter. Older compositor builds omit both
+counters, so they cannot generate these notifications.
+
+Re-import the updated OpenNMS event file, allow both OIDs in the master
+notification filter, and enable the adapter flag after deploying the
+updated compositor.

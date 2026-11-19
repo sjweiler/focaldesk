@@ -775,17 +775,11 @@ fn resume_vulkan_session(data: &mut VulkanDrmData, reason: &str) -> Result<()> {
     Ok(())
 }
 
-fn select_outputs(
-    drm: &DrmDevice,
-    overrides: Option<&[focaldesk_settings_core::OutputConfig]>,
-) -> Result<Vec<OutputConfig>> {
-    select_outputs_for_device(drm, overrides, true)
-}
-
 fn select_outputs_for_device(
     drm: &DrmDevice,
     overrides: Option<&[focaldesk_settings_core::OutputConfig]>,
     write_inventory: bool,
+    metrics: &metrics::DeviceMetrics,
 ) -> Result<Vec<OutputConfig>> {
     let resources = drm.resource_handles().context("query DRM resources")?;
     let configured = load_display_config_with_override(overrides);
@@ -803,15 +797,22 @@ fn select_outputs_for_device(
         .collect::<HashMap<_, _>>();
     let mut used_crtcs = HashSet::new();
     let mut outputs = Vec::new();
+    let mut topology = std::collections::BTreeMap::new();
     let mut next_x = 0;
     for handle in resources.connectors() {
         let info = drm
             .get_connector(*handle, true)
             .context("query DRM connector")?;
+        let name = format!("{}-{}", info.interface().as_str(), info.interface_id());
+        let state = match info.state() {
+            connector::State::Connected => metrics::DisplayTopology::Connected,
+            connector::State::Disconnected => metrics::DisplayTopology::Disconnected,
+            connector::State::Unknown => metrics::DisplayTopology::Unknown,
+        };
+        topology.insert(name.clone(), state);
         if info.state() != connector::State::Connected || info.modes().is_empty() {
             continue;
         }
-        let name = format!("{}-{}", info.interface().as_str(), info.interface_id());
         let saved = configured.iter().find(|display| display.name == name);
         let edid = connector_edid(drm, *handle);
         let hdr_support = hdr_detection::connector_hdr_support(drm, *handle, edid.as_deref());
@@ -826,6 +827,7 @@ fn select_outputs_for_device(
         if saved.is_some_and(|display| !display.enabled)
             || saved_monitor.is_some_and(|display| !display.enabled)
         {
+            topology.insert(name.clone(), metrics::DisplayTopology::Disabled);
             flog(format!(
                 "Raw Vulkan DRM leaving configured-disabled output {name} off"
             ));
@@ -963,6 +965,7 @@ fn select_outputs_for_device(
             role,
         });
     }
+    metrics.update_display_topology(topology);
     if outputs.is_empty() && !write_inventory {
         return Ok(outputs);
     }
@@ -1666,6 +1669,17 @@ fn initialize_vulkan_outputs(
     Ok(outputs)
 }
 
+fn record_display_failure(device: &VulkanDevice, output: &VulkanOutput) {
+    // Confirm the connector is still attached without forcing a link probe.
+    if device
+        .drm
+        .get_connector(output.connector, false)
+        .is_ok_and(|info| info.state() == connector::State::Connected)
+    {
+        device.metrics.display_failed(&output.name);
+    }
+}
+
 fn vulkan_connector_set_changed(data: &VulkanDrmData) -> Result<bool> {
     let resources = data
         .primary_gpu
@@ -1732,9 +1746,11 @@ fn rebuild_vulkan_outputs(data: &mut VulkanDrmData) -> Result<bool> {
         "vulkan".into(),
         super::drm::connected_output_inventory(&data.primary_gpu.drm)?,
     );
-    let output_configs = match select_outputs(
+    let output_configs = match select_outputs_for_device(
         &data.primary_gpu.drm,
         data.desktop.state.trial_display_outputs(),
+        true,
+        &data.primary_gpu.metrics,
     ) {
         Ok(configs) => configs,
         Err(error) => {
@@ -2322,7 +2338,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         "vulkan".into(),
         super::drm::connected_output_inventory(&drm)?,
     );
-    let output_configs = select_outputs(&drm, None)?;
+    let mut metrics = metrics::Monitor::new();
+    let primary_metrics = metrics.register_device(node);
+    let output_configs = select_outputs_for_device(&drm, None, true, &primary_metrics)?;
     let outputs =
         initialize_vulkan_outputs(&mut desktop, &renderer, &mut drm, &fd, output_configs)?;
     advertise_dmabuf(&mut desktop, &renderer, node)?;
@@ -2350,8 +2368,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let mut input_session = session.clone();
     let udev = UdevBackend::new(session.seat())
         .map_err(|error| anyhow!("initialize udev backend: {error}"))?;
-    let mut metrics = metrics::Monitor::new();
-    let primary_metrics = metrics.register_device(node);
     let mut data = VulkanDrmData {
         metrics,
         desktop,
@@ -2542,6 +2558,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 }
                 Err(error) => {
                     let output = &data.outputs[index];
+                    if data.session_active && !data.resume_pending {
+                        record_display_failure(&data.primary_gpu, output);
+                        data.metrics.request_sample();
+                    }
                     data.fatal_error = Some(anyhow!(
                         "complete Vulkan DRM frame on {}: {error}",
                         output.name
@@ -2762,13 +2782,16 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 finish_vulkan_capture(&mut data, capture);
             }
         }
-        if let Some(output_name) = data.outputs.iter().find_map(|output| {
-            (output.frame_pending
+        if let Some(output) = data.outputs.iter().find(|output| {
+            output.frame_pending
                 && output
                     .present_started_at
-                    .is_some_and(|started| started.elapsed() >= KMS_PRESENT_TIMEOUT))
-            .then(|| output.name.clone())
+                    .is_some_and(|started| started.elapsed() >= KMS_PRESENT_TIMEOUT)
         }) {
+            if data.session_active && !data.resume_pending {
+                record_display_failure(&data.primary_gpu, output);
+            }
+            let output_name = &output.name;
             flog_warn!(
                 "Vulkan KMS present on {} exceeded {} ms; recreating renderer and scanout",
                 output_name,
@@ -3193,6 +3216,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 match fence.wait_timeout(KMS_PRESENT_TIMEOUT) {
                     Ok(true) => None,
                     Ok(false) => {
+                        record_display_failure(&data.primary_gpu, &data.outputs[index]);
                         data.desktop.state.mark_output_full_damage(
                             output_id,
                             crate::core::desktop::DamageSource::Unknown,
@@ -3211,6 +3235,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                             output_id,
                             crate::core::desktop::DamageSource::Unknown,
                         );
+                        record_display_failure(&data.primary_gpu, &data.outputs[index]);
                         let error = anyhow!("wait for NVIDIA Vulkan submission: {error}");
                         recover_vulkan_renderer(&mut data, &error)
                             .context("recover from NVIDIA implicit-sync wait failure")?;

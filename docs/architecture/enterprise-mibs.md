@@ -163,6 +163,7 @@ direct Vulkan allocations; accounting must follow successful allocate/free paths
 | 15 | fdDisplayDiscontinuityTime | TimeTicks; last counter discontinuity |
 | 16 | fdDisplayCapabilities | BITS; mode(0), hdr(1), presentation(2), cpuRenderTiming(3) |
 | 17, 18 | fdDisplaySampleStatus, fdDisplaySampleAge | Shared status enum; Gauge32 seconds |
+| 19, 20 | fdDisplayFailures, fdDisplayRecoveries | Optional Counter64 counters for output failure incidents and first completed presentations afterward |
 
 CPU render-submission timing ends when submission returns; it is not GPU execution
 or scanout latency. Hardware timestamp timing needs separate future objects and
@@ -228,6 +229,11 @@ Allocate notification suffixes under each product's `.0` branch:
 | Desk / 1 | fdGpuDeviceLost | Indexed GPU identity, state, loss count; service epoch |
 | Desk / 2 | fdGpuRecoveryChanged | Indexed GPU identity, state, rebuild attempt/success counts |
 | Desk / 3 | fdDisplayStateChanged | Indexed display identity, state, HDR state |
+| Desk / 4 | fdGpuRecoveryFailed | Indexed GPU identity, state, rebuild attempt/success counts, compositor epoch |
+| Desk / 5 | fdCompositorMetricsStale | Producer epoch and sample age |
+| Desk / 6 | fdCompositorMetricsResumed | Producer epoch, sample age, and whether a new epoch was observed |
+| Desk / 7 | fdDisplayFailed | Indexed display identity and state, failure/recovery counters, producer epoch |
+| Desk / 8 | fdDisplayRecovered | Indexed display identity and state, failure/recovery counters, producer epoch |
 | Vector / 1 | fvDatabaseFailed | Indexed database identity and failure count |
 | Vector / 2 | fvCheckpointFailed | Indexed database identity and checkpoint failure count |
 | Common / 1 | focalServiceHealthChanged | Indexed service kind, health, epoch |

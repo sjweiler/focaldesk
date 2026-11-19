@@ -102,3 +102,22 @@ for keyboard and mouse motion. Intervals without events have no line. Changes
 in the compositor epoch mark counter discontinuities. Re-import the production
 collection source when adding the four input counter columns to an existing
 OpenNMS installation.
+
+## GPU recovery failure event
+
+Upload [focaldesk-events.xml](focaldesk-events.xml) through the OpenNMS
+[Event Configuration](https://docs.opennms.com/horizon/36/operation/deep-dive/events/event-configuration.html)
+page. Add a dedicated SNMPv3 receiver user with security level authPriv,
+SHA-256, and AES in **Integrations → Trap Configuration**, then configure
+the Net-SNMP master to send INFORMs to that listener. The monitoring
+[notification instructions](../mibs/README.md#gpu-recovery-failure-inform)
+describe how to enable the adapter and run its isolated test.
+
+Look for `uei.opennms.org/vendor/FocalDesk/traps/gpuRecoveryFailed` in
+**Events**. The existing GPU threshold remains responsible for the alarm
+lifecycle, including clearing the alarm when a fresh healthy sample arrives.
+
+Re-import the same event file to enable the compositor snapshot events.
+`compositorMetricsStale` reports a 30-second interruption, and
+`compositorMetricsResumed` carries a restart flag derived from the producer
+epoch. The same authPriv receiver can process all three FocalDesk INFORMs.

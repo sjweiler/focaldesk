@@ -18,6 +18,7 @@ def main():
     root = (1, 3, 6, 1, 3, 42)
     verify_sensor_mapping(agent, root)
     verify_input_timing(agent, root)
+    verify_compositor_tracking(agent)
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory)
         snapshot = path / "snapshot.json"
@@ -39,7 +40,7 @@ def main():
             snapshot.write_text(json.dumps(sample))
             verify_session(agent, args, session, sample)
     print("Verified registration, Counter64, sparse values, stale status, GETBULK, "
-          "transaction consistency, denied SET, a second session, GPU sensors, and input timing.")
+          "transaction consistency, denied SET, a second session, GPU sensors, input timing, and compositor health transitions.")
 
 def verify_sensor_mapping(agent, root):
     sensors = agent["nvidia_sensors"](
@@ -86,6 +87,18 @@ def verify_input_timing(agent, root):
     assert values[pointer_count] == values[pointer_total] == (70, 0)
     snapshot["sample_status"] = "stale"
     assert key_count not in agent["objects"](root, snapshot)
+
+
+def verify_compositor_tracking(agent):
+    tracker = agent["CompositorTracker"]()
+    assert tracker.observe(None, 100_000) is None
+    assert tracker.observe(("first", 100, 200), 101_000) is None
+    assert tracker.observe(None, 130_799) is None
+    assert tracker.observe(None, 130_800) == (5, "first", 30_000, None)
+    assert tracker.observe(None, 150_000) is None
+    assert tracker.observe(("first", 101, 0), 151_000) == (6, "first", 0, False)
+    assert tracker.observe(("second", 102, 10), 152_000) == (6, "second", 10, True)
+    assert tracker.observe(("second", 102, 20), 152_010) is None
 
 
 def verify_session(agent, args, session, sample):
