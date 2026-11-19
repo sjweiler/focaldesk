@@ -95,3 +95,10 @@ storage. Select a time range that includes recent polls.
 Optional NVIDIA busy and VRAM graphs appear for GPU rows with supported
 sensor values. Import the updated production collection source to collect
 the three additional columns, and enable the AgentX NVIDIA sampler.
+
+The FocalDesk Input Dispatch Delay graph uses the increase in accumulated
+delay divided by the increase in event count to report milliseconds per event
+for keyboard and mouse motion. Intervals without events have no line. Changes
+in the compositor epoch mark counter discontinuities. Re-import the production
+collection source when adding the four input counter columns to an existing
+OpenNMS installation.

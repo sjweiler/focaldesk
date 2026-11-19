@@ -12,7 +12,7 @@ focalDeskMib MODULE-IDENTITY
     CONTACT-INFO "FocalDesk project maintainers"
     DESCRIPTION "Read-only Vulkan compositor inventory and presentation metrics."
     REVISION "202611190000Z"
-    DESCRIPTION "Added optional device utilization and framebuffer memory."
+    DESCRIPTION "Added optional GPU sensors and compositor input timing."
     REVISION "202611180000Z"
     DESCRIPTION "Initial draft."
     ::= { focalModules 4 }
@@ -43,6 +43,42 @@ fdInventoryEpoch OBJECT-TYPE
     STATUS current
     DESCRIPTION "Inventory registry UUID in binary form. A change requires rediscovery of table indexes."
     ::= { fdCompositor 7 }
+
+fdKeyboardSamples OBJECT-TYPE
+    SYNTAX Counter64
+    UNITS "events"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Keyboard events measured at compositor dispatch in the current
+        compositor epoch. The instance is absent without a fresh timing snapshot."
+    ::= { fdCompositor 8 }
+
+fdKeyboardDelayUs OBJECT-TYPE
+    SYNTAX Counter64
+    UNITS "microseconds"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Accumulated keyboard event-to-dispatch time in the current
+        compositor epoch. The instance is absent without a fresh timing snapshot."
+    ::= { fdCompositor 9 }
+
+fdPointerSamples OBJECT-TYPE
+    SYNTAX Counter64
+    UNITS "events"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Pointer motion events measured at compositor dispatch in the current
+        compositor epoch. The instance is absent without a fresh timing snapshot."
+    ::= { fdCompositor 10 }
+
+fdPointerDelayUs OBJECT-TYPE
+    SYNTAX Counter64
+    UNITS "microseconds"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Accumulated pointer motion event-to-dispatch time in the current
+        compositor epoch. The instance is absent without a fresh timing snapshot."
+    ::= { fdCompositor 11 }
 
 fdGpuTable OBJECT-TYPE
     SYNTAX SEQUENCE OF FdGpuEntry
@@ -288,6 +324,12 @@ fdGpuSensorsGroup OBJECT-GROUP
     DESCRIPTION "Optional device-wide utilization and framebuffer memory sensors."
     ::= { fdGroups 2 }
 
+fdInputTimingGroup OBJECT-GROUP
+    OBJECTS { fdKeyboardSamples, fdKeyboardDelayUs, fdPointerSamples, fdPointerDelayUs }
+    STATUS current
+    DESCRIPTION "Optional compositor input event counts and cumulative dispatch delay."
+    ::= { fdGroups 3 }
+
 fdInventoryCompliance MODULE-COMPLIANCE
     STATUS current
     DESCRIPTION "Compliance for the Vulkan inventory profile."
@@ -295,6 +337,8 @@ fdInventoryCompliance MODULE-COMPLIANCE
         MANDATORY-GROUPS { fdInventoryGroup }
         GROUP fdGpuSensorsGroup
         DESCRIPTION "Present when a supported GPU provides these sensors."
+        GROUP fdInputTimingGroup
+        DESCRIPTION "Present when the compositor exports input dispatch timing."
     ::= { fdCompliances 1 }
 
 END

@@ -17,6 +17,7 @@ def main():
     # The synthetic tree is confined to this anonymous socket pair.
     root = (1, 3, 6, 1, 3, 42)
     verify_sensor_mapping(agent, root)
+    verify_input_timing(agent, root)
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory)
         snapshot = path / "snapshot.json"
@@ -38,7 +39,7 @@ def main():
             snapshot.write_text(json.dumps(sample))
             verify_session(agent, args, session, sample)
     print("Verified registration, Counter64, sparse values, stale status, GETBULK, "
-          "transaction consistency, denied SET, a second session, and GPU sensor mapping.")
+          "transaction consistency, denied SET, a second session, GPU sensors, and input timing.")
 
 def verify_sensor_mapping(agent, root):
     sensors = agent["nvidia_sensors"](
@@ -63,6 +64,28 @@ def verify_sensor_mapping(agent, root):
     row["sample_status"] = "stale"
     values = agent["objects"](root, snapshot, sensors)
     assert root + (2, 1, 15, 1) not in values
+
+
+def verify_input_timing(agent, root):
+    snapshot = {
+        "uptime_seconds": 1, "producer_epoch": "test", "inventory_epoch": "00" * 16,
+        "sample_status": "ok", "gpus": [], "displays": [],
+    }
+    key_count = root + (1, 8, 0)
+    key_total = root + (1, 9, 0)
+    pointer_count = root + (1, 10, 0)
+    pointer_total = root + (1, 11, 0)
+    assert key_count not in agent["objects"](root, snapshot)
+    snapshot["input_dispatch_delay"] = {"series": {
+        "keyboard": {"samples": 7, "total_us": 1 << 40},
+        "pointer_motion": {"samples": 0, "total_us": 0},
+    }}
+    values = agent["objects"](root, snapshot)
+    assert values[key_count] == (70, 7)
+    assert values[key_total] == (70, 1 << 40)
+    assert values[pointer_count] == values[pointer_total] == (70, 0)
+    snapshot["sample_status"] = "stale"
+    assert key_count not in agent["objects"](root, snapshot)
 
 
 def verify_session(agent, args, session, sample):

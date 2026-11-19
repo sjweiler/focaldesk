@@ -26,6 +26,12 @@ DISPLAY_STATE = {
     "active": 1, "disabled": 2, "disconnected": 3, "failed": 4,
     "unknown": 5, "inactive": 6, "notConfigured": 7, "not_configured": 7,
 }
+INPUT_COUNTERS = {
+    8: ("keyboard", "samples"),
+    9: ("keyboard", "total_us"),
+    10: ("pointer_motion", "samples"),
+    11: ("pointer_motion", "total_us"),
+}
 GPU_COLUMNS = {
     2: (OCTETS, "identity"), 4: (INTEGER, "state"),
     5: (COUNTER64, "device_losses"), 6: (COUNTER64, "rebuild_attempts"),
@@ -94,7 +100,7 @@ class NvidiaSampler:
 
 
 def leaf_prefixes(root):
-    return {root + (1, column) for column in (1, 2, 7)} | {
+    return {root + (1, column) for column in (1, 2, 7, *INPUT_COUNTERS)} | {
         root + (table, 1, column)
         for table, columns in ((2, GPU_COLUMNS.keys() | SENSOR_COLUMNS.keys()), (3, DISPLAY_COLUMNS))
         for column in columns
@@ -107,6 +113,12 @@ def objects(root, snapshot, sensors=None):
         root + (1, 2, 0): (OCTETS, snapshot["producer_epoch"].encode()),
         root + (1, 7, 0): (OCTETS, bytes.fromhex(snapshot["inventory_epoch"])),
     }
+    if snapshot.get("sample_status") == "ok":
+        input_series = snapshot.get("input_dispatch_delay", {}).get("series", {})
+        for column, (kind, field) in INPUT_COUNTERS.items():
+            value = input_series.get(kind, {}).get(field)
+            if type(value) is int and 0 <= value < 1 << 64:
+                values[root + (1, column, 0)] = COUNTER64, value
     for table, rows, columns, states in (
         (2, snapshot["gpus"], GPU_COLUMNS, GPU_STATE),
         (3, snapshot["displays"], DISPLAY_COLUMNS, DISPLAY_STATE),

@@ -114,6 +114,7 @@ before formal MIB publication.
 | 1.4 | fdWaylandSurfaces | Gauge32; existing wl_surface objects |
 | 1.5 | fdResidentBytes | CounterBasedGauge64; process RSS bytes |
 | 1.6 | fdInventoryGeneration | Counter64; increments on topology changes |
+| 1.8–1.11 | fdKeyboardSamples, fdKeyboardDelayUs, fdPointerSamples, fdPointerDelayUs | Optional Counter64 pairs for event count and cumulative input dispatch delay in microseconds |
 | 2 | fdGpuTable | INDEX fdGpuIndex; device-level state, all vendors |
 | 3 | fdDisplayTable | INDEX fdDisplayIndex; connector/output state |
 

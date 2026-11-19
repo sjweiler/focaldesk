@@ -11,6 +11,10 @@
     <mibObj oid="@FD_OBJECTS@.1.1" instance="0" alias="fdUptime" type="gauge"/>
     <mibObj oid="@FD_OBJECTS@.1.2" instance="0" alias="fdProducerEpoch" type="string"/>
     <mibObj oid="@FD_OBJECTS@.1.7" instance="0" alias="fdInventoryEpoch" type="string"/>
+    <mibObj oid="@FD_OBJECTS@.1.8" instance="0" alias="fdKeyboardSamples" type="Counter64"/>
+    <mibObj oid="@FD_OBJECTS@.1.9" instance="0" alias="fdKeyboardDelayUs" type="Counter64"/>
+    <mibObj oid="@FD_OBJECTS@.1.10" instance="0" alias="fdPointerSamples" type="Counter64"/>
+    <mibObj oid="@FD_OBJECTS@.1.11" instance="0" alias="fdPointerDelayUs" type="Counter64"/>
   </group>
   <group name="focaldesk-gpu" ifType="all">
     <mibObj oid="@FD_OBJECTS@.2.1.2" instance="focalDeskGpuIndex" alias="fdGpuIdentity" type="string"/>

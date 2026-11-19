@@ -16,6 +16,8 @@ and column instances end in the persistent row's `index`.
 | `fdCompositorUptime` | `uptime_seconds * 100`, modulo 2^32 |
 | `fdCompositorEpoch` | UTF-8 bytes of `producer_epoch` |
 | `fdInventoryEpoch` | Decode the hex `inventory_epoch` into 16 bytes |
+| `fdKeyboardSamples`, `fdKeyboardDelayUs` | Keyboard `samples` and `total_us` from `input_dispatch_delay.series` as Counter64 |
+| `fdPointerSamples`, `fdPointerDelayUs` | Pointer motion `samples` and `total_us` from the same series as Counter64 |
 | `fdGpuIndex`, `fdGpuIdentity`, `fdGpuState` | GPU `index`, UTF-8 `identity`, and `state` mapped to its named enum |
 | `fdGpuDeviceLosses`, `fdGpuRebuildAttempts`, `fdGpuRebuildSuccesses` | `device_losses`, `rebuild_attempts`, `rebuild_successes` as Counter64 |
 | `fdDisplayIndex`, `fdDisplayIdentity`, `fdDisplayScanoutGpuIndex` | Display `index`, UTF-8 `identity`, and `scanout_gpu_index` |
