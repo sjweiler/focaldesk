@@ -1,0 +1,17 @@
+[Unit]
+Description=FocalDesk SNMPv3 on the private OpenNMS Podman bridge
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+UMask=0077
+RuntimeDirectory=focaldesk-snmp-67726
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/podman unshare --rootless-netns /usr/bin/bash %S/focaldesk/snmp-67726/run.sh %S/focaldesk/snmp-67726 %t/focaldesk-snmp-67726 %t/focaldesk-vulkan-metrics.json
+Restart=on-failure
+RestartSec=5s
+KillMode=mixed
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=default.target

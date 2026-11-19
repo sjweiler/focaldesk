@@ -1,0 +1,11 @@
+<!-- Insert into ReportsList in ksc-performance-reports.xml. Choose a free report ID and substitute the node source, foreign ID, IP and row indexes. -->
+<Report id="0" title="FocalDesk GPU and SNMP" show_timespan_button="true" show_graphtype_button="false" graphs_per_line="2">
+  <Graph title="NVIDIA GPU utilization" resourceId="nodeSource[FOCAL-LAB:focaldesk-lab].focalDeskGpuIndex[1]" timespan="1_hour" graphtype="focaldesk.gpu.busy"/>
+  <Graph title="NVIDIA GPU VRAM" resourceId="nodeSource[FOCAL-LAB:focaldesk-lab].focalDeskGpuIndex[1]" timespan="1_hour" graphtype="focaldesk.gpu.vram"/>
+  <Graph title="Keyboard and mouse dispatch delay" resourceId="nodeSource[FOCAL-LAB:focaldesk-lab].nodeSnmp[]" timespan="1_hour" graphtype="focaldesk.input.dispatch"/>
+  <Graph title="Display 1 presentation FPS" resourceId="nodeSource[FOCAL-LAB:focaldesk-lab].focalDeskDisplayIndex[1]" timespan="1_hour" graphtype="focaldesk.display.presentations"/>
+  <Graph title="Display 2 presentation FPS" resourceId="nodeSource[FOCAL-LAB:focaldesk-lab].focalDeskDisplayIndex[2]" timespan="1_hour" graphtype="focaldesk.display.presentations"/>
+  <Graph title="Display 3 presentation FPS" resourceId="nodeSource[FOCAL-LAB:focaldesk-lab].focalDeskDisplayIndex[3]" timespan="1_hour" graphtype="focaldesk.display.presentations"/>
+  <Graph title="SNMP service status" resourceId="nodeSource[FOCAL-LAB:focaldesk-lab].status[10.89.1.1]" timespan="1_hour" graphtype="status.snmp"/>
+  <Graph title="SNMP response time" resourceId="nodeSource[FOCAL-LAB:focaldesk-lab].responseTime[10.89.1.1]" timespan="1_hour" graphtype="snmp"/>
+</Report>

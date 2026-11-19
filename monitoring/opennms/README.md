@@ -121,3 +121,22 @@ Re-import the same event file to enable the compositor snapshot events.
 `compositorMetricsStale` reports a 30-second interruption, and
 `compositorMetricsResumed` carries a restart flag derived from the producer
 epoch. The same authPriv receiver can process all three FocalDesk INFORMs.
+
+## Reproduce the installed OpenNMS setup
+
+1. Install the [persistent SNMP user service](../systemd/README.md).
+2. Import the [production collection source](focaldesk-production.xml) into
+   the node's collection profile, and [the event definitions](focaldesk-events.xml)
+   into Event Configuration. Set the polling interface and SNMPv3 credentials.
+   For notifications, also configure the SNMPv3 trap receiver.
+3. Install the [graph definitions](focaldesk-graph.properties) and add the
+   [Graph Collection fragment](graph-collection.fragment.xml) to
+   `ksc-performance-reports.xml`. Use the actual requisition and foreign ID,
+   node interface, and GPU and display row indexes.
+4. Merge the [threshold group](thresholds.fragment.xml) into `thresholds.xml`
+   and the [threshold package](threshd-package.fragment.xml) into
+   `threshd-configuration.xml`. If needed, apply the SNMP response-time
+   settings in [Resource graphs](#resource-graphs).
+5. Reload OpenNMS and verify a fresh collection, the graph panes, and the
+   notification receiver. The [isolated INFORM test](../mibs/README.md#gpu-recovery-failure-inform)
+   exercises synthetic failures without interrupting the desktop.

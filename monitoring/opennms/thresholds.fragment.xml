@@ -1,0 +1,5 @@
+<!-- Append this group inside thresholding-config in thresholds.xml. -->
+<group name="focaldesk-vulkan" rrdRepository="/opt/opennms/share/rrd/snmp/">
+  <threshold description="FocalDesk GPU metrics stale" type="high" ds-type="focalDeskGpuIndex" ds-name="fdGpuSampleAge" ds-label="fdGpuIdentity" value="31.0" rearm="10.0" trigger="1" filterOperator="OR"/>
+  <expression description="FocalDesk reports a failed GPU" type="high" ds-type="focalDeskGpuIndex" ds-label="fdGpuIdentity" expr-label="FocalDesk GPU failure" value="1.0" rearm="0.0" trigger="1" filterOperator="OR" expression="fdGpuSampleStatus == 1 ? (fdGpuState == 3 ? 1 : 0) : 0.5"/>
+</group>
