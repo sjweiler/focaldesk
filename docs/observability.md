@@ -1,5 +1,11 @@
 # Local AI observability
 
+For the proposed shared SNMP namespace, per-GPU/display tables, and staged
+FocalDesk/FocalVector implementation, see the
+[enterprise MIB design](architecture/enterprise-mibs.md). This is a planning
+specification; the SNMP agent is not implemented. The local Vulkan metrics slice
+is described below.
+
 The AI console and `focaldesk-server` support opt-in OpenTelemetry traces and operation metrics over
 OTLP HTTP/protobuf. Start the local Collector and Jaeger from the repository root:
 
@@ -105,8 +111,8 @@ To return to packaged binaries and disable tracing, remove only the three
 `systemctl --user disable --now focaldesk-observability.service` to disable stack
 autostart. Other user service overrides remain in place.
 
-Hardware metrics, OTel log export, and a native FocalDesk dashboard remain future work.
-The compositor is not instrumented.
+Vendor hardware sensors, OTel log export, and a native FocalDesk dashboard remain
+future work. The Vulkan compositor supports the opt-in local snapshot below.
 
 Stop the supervised local stack with:
 
@@ -358,3 +364,92 @@ benchmark; the result confirms negligible warm loading cost while identifying
 token generation as the largest remaining component. Both request traces carried
 the phase fields, all 18 dashboard queries passed, and 139 AI plus ten
 logging/telemetry unit tests passed.
+
+
+## Local Vulkan GPU and display snapshots
+
+The `drm-vulkan` compositor now collects process-lifetime per-GPU device-loss
+incidents, logical-device rebuild attempts/successes, and per-connector completed
+KMS presentation counts. These counters live outside `AshDrmRenderer`, survive
+renderer and output replacement, and remain in a process-local registry across
+secondary GPU removal/re-addition. They reset on compositor restart; snapshots
+include a producer epoch, uptime, schema version, and wall-clock sample timestamp.
+This slice exports JSON independently of OTLP; it does not add SNMP or hardware
+sensor polling.
+
+To enable export, set this variable in the environment that launches a newly
+built Vulkan compositor (use the existing private user runtime directory):
+
+```sh
+export FOCALDESK_METRICS_PATH="$XDG_RUNTIME_DIR/focaldesk-vulkan-metrics.json"
+```
+
+The destination must be absolute and its parent must already exist. This setting
+is independent of `FOCALDESK_OTEL`; unset it to disable file export. No current
+service is restarted or configured by this source change. Inspect the snapshot:
+
+```sh
+python3 -m json.tool "$XDG_RUNTIME_DIR/focaldesk-vulkan-metrics.json"
+```
+
+A worker writes owner-only files via atomic rename, about once per second while
+normal event-loop progress continues. Rendering never waits for the writer; a
+bounded queue drops snapshots under backpressure and increments
+`dropped_snapshots`. Failed recovery requests an immediate best-effort snapshot;
+process termination can still lose queued data. The file remains after exit, so
+check `sample_unix_ms` for freshness and `producer_epoch` for restarts. This file
+is for local inspection, not a durable event log or a crash-reporting mechanism.
+
+`gpus` is keyed by canonical sysfs device path (PCI topology on PCI devices), with
+an explicitly recognizable `drm:major:minor` fallback if identity resolution fails.
+Nested `displays` use connector names scoped to their GPU; primary and secondary
+names cannot collide. Identity/index persistence across compositor restarts and
+UUID-based identity are future work for the SNMP inventory model.
+
+GPU states are `ready`, `paused`, `failed`, or `absent`. A device-loss incident
+means a typed `VK_ERROR_DEVICE_LOST` error, deduplicated until a replacement device
+is created. Allocation pressure and suspend/resume rebuilds do not increment loss
+counts. Rebuild success means logical-device creation succeeded, independently
+of later scanout initialization. These are not driver/hardware reset counters.
+
+Each configured display reports width/height and selected mode refresh in
+millihertz (currently derived from DRM's integer-Hz mode value). Test-pattern
+outputs report unknown refresh as JSON `null`. Display state is `active`,
+`inactive` (paused/failed device), or `notConfigured` (previously observed but no
+longer configured); the last state does not distinguish unplugged from disabled.
+Retired rows retain counts but clear mode fields to `null`. Presented-frame counts
+advance only after successful KMS page-flip completion for an outstanding frame,
+not on render submission or cleanup. Compute observed per-output FPS from count
+and sample-time deltas within one producer epoch.
+
+This first slice does not expose GPU memory/utilization, HDR state, CPU/GPU render
+latency, or percentile estimates. These require additional measurements and
+capability contracts before the SNMP adapter is implemented.
+
+Verify without a running compositor or real device reset:
+
+```sh
+cargo test -p focaldesk-engine --features drm-vulkan --offline backend::drm_vulkan --lib
+```
+
+### Persistent monitoring inventory
+
+Read the snapshot and assign stable, positive Integer32 indexes with:
+
+```sh
+python3 scripts/focaldesk-monitor-inventory.py
+```
+
+The reader emits separate GPU and display rows. Each display references its
+scanout GPU by index, and its identity combines the snapshot GPU key and
+connector name. Indexes persist in
+`${XDG_STATE_HOME:-$HOME/.local/state}/focaldesk/monitor-inventory.sqlite3`
+across compositor restarts and temporary removal. If the database is reset,
+the inventory epoch changes and consumers must rediscover indexes. The
+compositor's producer epoch independently marks counter resets.
+
+Sample age is derived from the exporter timestamp. Rows become `stale` at five
+seconds by default, or at the threshold set by `--stale-after`. A future
+timestamp yields `unavailable` with a null age. Missing or unreadable snapshots
+produce an error and no inventory output. Use `--snapshot` and `--registry`
+to inspect a capture with a separate registry.

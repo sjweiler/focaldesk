@@ -63,8 +63,7 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Default)]
 struct WgpuShellAssets {
-    wallpaper_path: Option<String>,
-    wallpaper: Option<WgpuWallpaper>,
+    wallpapers: HashMap<focaldesk_types::OutputId, OutputWallpaper>,
     icons: HashMap<IconId, WgpuIcon>,
     unavailable_icons: HashSet<IconId>,
     font_atlas_initialized: bool,
@@ -74,6 +73,12 @@ struct WgpuShellAssets {
     /// is the first shell text after an idle period.
     font_atlas_was_referenced: bool,
     lock_screen_was_active: bool,
+}
+
+#[derive(Default)]
+struct OutputWallpaper {
+    path: Option<String>,
+    asset: Option<WgpuWallpaper>,
 }
 
 struct WgpuSceneDesktop<'a> {
@@ -106,6 +111,24 @@ pub(crate) struct VulkanSceneBuilder {
 }
 
 impl VulkanSceneBuilder {
+    #[cfg(feature = "drm-vulkan")]
+    pub(crate) fn prepare_ash_wallpapers(
+        &mut self,
+        renderer: &mut focaldesk_render::AshDrmRenderer,
+    ) {
+        for wallpaper in self.assets.wallpapers.values_mut() {
+            let Some(asset) = wallpaper.asset.as_ref() else {
+                continue;
+            };
+            if !renderer.keep_uploaded_texture(asset.cache_key) && asset.pending_pixels.is_none() {
+                // The renderer dropped this upload. Resolve the current path and
+                // rebuild the asset when its output next needs a scene.
+                wallpaper.path = None;
+                wallpaper.asset = None;
+            }
+        }
+    }
+
     pub fn build(
         &mut self,
         state: &mut crate::core::desktop::DesktopState,
@@ -1680,9 +1703,13 @@ fn append_wallpaper_quads(
         .filter(|path| !path.trim().is_empty())
         .cloned()
         .or_else(|| theme.wallpaper.path.clone());
-    if assets.wallpaper_path != path {
-        assets.wallpaper_path.clone_from(&path);
-        assets.wallpaper = path.as_deref().and_then(|path| {
+    assets
+        .wallpapers
+        .retain(|id, _| desktop.state.outputs.contains_key(id));
+    let wallpaper = assets.wallpapers.entry(output_id).or_default();
+    if wallpaper.path != path {
+        wallpaper.path.clone_from(&path);
+        wallpaper.asset = path.as_deref().and_then(|path| {
             let image = match image::open(path) {
                 Ok(image) => image,
                 Err(error) => {
@@ -1725,7 +1752,7 @@ fn append_wallpaper_quads(
             })
         });
     }
-    let Some(asset) = assets.wallpaper.as_mut() else {
+    let Some(asset) = wallpaper.asset.as_mut() else {
         return;
     };
     let Some(layout) = desktop.state.chrome_layout_for_output(output_id) else {

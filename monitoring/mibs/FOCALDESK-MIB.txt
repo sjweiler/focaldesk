@@ -1,0 +1,263 @@
+FOCALDESK-MIB DEFINITIONS ::= BEGIN
+
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, Integer32, Gauge32, Counter64, TimeTicks
+        FROM SNMPv2-SMI
+    OBJECT-GROUP, MODULE-COMPLIANCE FROM SNMPv2-CONF
+    focalDesk, focalModules FROM FOCAL-ROOT-MIB;
+
+focalDeskMib MODULE-IDENTITY
+    LAST-UPDATED "202611180000Z"
+    ORGANIZATION "FocalDesk"
+    CONTACT-INFO "FocalDesk project maintainers"
+    DESCRIPTION "Read-only Vulkan compositor inventory and presentation metrics."
+    REVISION "202611180000Z"
+    DESCRIPTION "Initial draft."
+    ::= { focalModules 4 }
+
+fdObjects     OBJECT IDENTIFIER ::= { focalDesk 1 }
+fdConformance OBJECT IDENTIFIER ::= { focalDesk 2 }
+fdGroups      OBJECT IDENTIFIER ::= { fdConformance 1 }
+fdCompliances OBJECT IDENTIFIER ::= { fdConformance 2 }
+fdCompositor  OBJECT IDENTIFIER ::= { fdObjects 1 }
+
+fdCompositorUptime OBJECT-TYPE
+    SYNTAX TimeTicks
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Compositor process uptime in hundredths of a second, modulo 2^32."
+    ::= { fdCompositor 1 }
+
+fdCompositorEpoch OBJECT-TYPE
+    SYNTAX OCTET STRING (SIZE (1..128))
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Opaque producer epoch. A change marks a discontinuity for all compositor counters."
+    ::= { fdCompositor 2 }
+
+fdInventoryEpoch OBJECT-TYPE
+    SYNTAX OCTET STRING (SIZE (16))
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Inventory registry UUID in binary form. A change requires rediscovery of table indexes."
+    ::= { fdCompositor 7 }
+
+fdGpuTable OBJECT-TYPE
+    SYNTAX SEQUENCE OF FdGpuEntry
+    MAX-ACCESS not-accessible
+    STATUS current
+    DESCRIPTION "Inventory rows for each gpu."
+    ::= { fdObjects 2 }
+
+fdGpuEntry OBJECT-TYPE
+    SYNTAX FdGpuEntry
+    MAX-ACCESS not-accessible
+    STATUS current
+    DESCRIPTION "A gpu inventory row."
+    INDEX { fdGpuIndex }
+    ::= { fdGpuTable 1 }
+
+FdGpuEntry ::= SEQUENCE {
+    fdGpuIndex                     Integer32,
+    fdGpuIdentity                  OCTET STRING,
+    fdGpuState                     INTEGER,
+    fdGpuDeviceLosses              Counter64,
+    fdGpuRebuildAttempts           Counter64,
+    fdGpuRebuildSuccesses          Counter64,
+    fdGpuSampleStatus              INTEGER,
+    fdGpuSampleAge                 Gauge32
+}
+
+fdGpuIndex OBJECT-TYPE
+    SYNTAX Integer32 (1..2147483647)
+    MAX-ACCESS not-accessible
+    STATUS current
+    DESCRIPTION "Persistent index of the GPU."
+    ::= { fdGpuEntry 1 }
+
+fdGpuIdentity OBJECT-TYPE
+    SYNTAX OCTET STRING (SIZE (1..1024))
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Opaque snapshot GPU identity."
+    ::= { fdGpuEntry 2 }
+
+fdGpuState OBJECT-TYPE
+    SYNTAX INTEGER { ready(1), recovering(2), failed(3), absent(4), unknown(5), paused(6) }
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "State reported by the producer."
+    ::= { fdGpuEntry 4 }
+
+fdGpuDeviceLosses OBJECT-TYPE
+    SYNTAX Counter64
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Deduplicated Vulkan device loss incidents in the current producer epoch."
+    ::= { fdGpuEntry 5 }
+
+fdGpuRebuildAttempts OBJECT-TYPE
+    SYNTAX Counter64
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Logical-device rebuild attempts in the current producer epoch."
+    ::= { fdGpuEntry 6 }
+
+fdGpuRebuildSuccesses OBJECT-TYPE
+    SYNTAX Counter64
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Successful logical-device rebuilds in the current producer epoch."
+    ::= { fdGpuEntry 7 }
+
+fdGpuSampleStatus OBJECT-TYPE
+    SYNTAX INTEGER { ok(1), unsupported(2), unavailable(3), stale(4) }
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Freshness of the GPU row."
+    ::= { fdGpuEntry 13 }
+
+fdGpuSampleAge OBJECT-TYPE
+    SYNTAX Gauge32
+    UNITS "seconds"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Whole seconds since the producer sample. The instance is absent when age is unavailable."
+    ::= { fdGpuEntry 14 }
+
+fdDisplayTable OBJECT-TYPE
+    SYNTAX SEQUENCE OF FdDisplayEntry
+    MAX-ACCESS not-accessible
+    STATUS current
+    DESCRIPTION "Inventory rows for each display."
+    ::= { fdObjects 3 }
+
+fdDisplayEntry OBJECT-TYPE
+    SYNTAX FdDisplayEntry
+    MAX-ACCESS not-accessible
+    STATUS current
+    DESCRIPTION "A display inventory row."
+    INDEX { fdDisplayIndex }
+    ::= { fdDisplayTable 1 }
+
+FdDisplayEntry ::= SEQUENCE {
+    fdDisplayIndex                 Integer32,
+    fdDisplayIdentity              OCTET STRING,
+    fdDisplayScanoutGpuIndex       Integer32,
+    fdDisplayState                 INTEGER,
+    fdDisplayWidth                 Gauge32,
+    fdDisplayHeight                Gauge32,
+    fdDisplayRefreshMilliHz        Gauge32,
+    fdDisplayPresentedFrames       Counter64,
+    fdDisplaySampleStatus          INTEGER,
+    fdDisplaySampleAge             Gauge32
+}
+
+fdDisplayIndex OBJECT-TYPE
+    SYNTAX Integer32 (1..2147483647)
+    MAX-ACCESS not-accessible
+    STATUS current
+    DESCRIPTION "Persistent index of the display."
+    ::= { fdDisplayEntry 1 }
+
+fdDisplayIdentity OBJECT-TYPE
+    SYNTAX OCTET STRING (SIZE (1..1024))
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Opaque key derived from the scanout GPU identity and connector."
+    ::= { fdDisplayEntry 2 }
+
+fdDisplayScanoutGpuIndex OBJECT-TYPE
+    SYNTAX Integer32 (1..2147483647)
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Index of the GPU that drives scanout for this display."
+    ::= { fdDisplayEntry 4 }
+
+fdDisplayState OBJECT-TYPE
+    SYNTAX INTEGER { active(1), disabled(2), disconnected(3), failed(4), unknown(5), inactive(6), notConfigured(7) }
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Producer state for this connector. NotConfigured covers previously known connectors without a configured output."
+    ::= { fdDisplayEntry 5 }
+
+fdDisplayWidth OBJECT-TYPE
+    SYNTAX Gauge32
+    UNITS "pixels"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Width of the configured mode. The instance is absent without a mode."
+    ::= { fdDisplayEntry 6 }
+
+fdDisplayHeight OBJECT-TYPE
+    SYNTAX Gauge32
+    UNITS "pixels"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Height of the configured mode. The instance is absent without a mode."
+    ::= { fdDisplayEntry 7 }
+
+fdDisplayRefreshMilliHz OBJECT-TYPE
+    SYNTAX Gauge32
+    UNITS "millihertz"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Refresh of the configured mode. The instance is absent when refresh is unknown."
+    ::= { fdDisplayEntry 8 }
+
+fdDisplayPresentedFrames OBJECT-TYPE
+    SYNTAX Counter64
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Completed KMS presentations in the current producer epoch."
+    ::= { fdDisplayEntry 10 }
+
+fdDisplaySampleStatus OBJECT-TYPE
+    SYNTAX INTEGER { ok(1), unsupported(2), unavailable(3), stale(4) }
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Freshness of the display row."
+    ::= { fdDisplayEntry 17 }
+
+fdDisplaySampleAge OBJECT-TYPE
+    SYNTAX Gauge32
+    UNITS "seconds"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Whole seconds since the producer sample. The instance is absent when age is unavailable."
+    ::= { fdDisplayEntry 18 }
+
+fdInventoryGroup OBJECT-GROUP
+    OBJECTS {
+        fdCompositorUptime,
+        fdCompositorEpoch,
+        fdInventoryEpoch,
+        fdGpuIdentity,
+        fdGpuState,
+        fdGpuDeviceLosses,
+        fdGpuRebuildAttempts,
+        fdGpuRebuildSuccesses,
+        fdGpuSampleStatus,
+        fdGpuSampleAge,
+        fdDisplayIdentity,
+        fdDisplayScanoutGpuIndex,
+        fdDisplayState,
+        fdDisplayWidth,
+        fdDisplayHeight,
+        fdDisplayRefreshMilliHz,
+        fdDisplayPresentedFrames,
+        fdDisplaySampleStatus,
+        fdDisplaySampleAge
+    }
+    STATUS current
+    DESCRIPTION "Objects exposed by the Vulkan inventory profile."
+    ::= { fdGroups 1 }
+
+fdInventoryCompliance MODULE-COMPLIANCE
+    STATUS current
+    DESCRIPTION "Compliance for the Vulkan inventory profile."
+    MODULE
+        MANDATORY-GROUPS { fdInventoryGroup }
+    ::= { fdCompliances 1 }
+
+END

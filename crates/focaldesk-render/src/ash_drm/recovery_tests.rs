@@ -594,6 +594,33 @@ fn hung_device_latches_process_exit_and_never_attempts_destruction_or_replacemen
     assert_eq!(events(), before);
 }
 #[test]
+fn keeping_a_wallpaper_resident_refreshes_only_an_uploaded_texture() {
+    let device = device();
+    let mut current = renderer(&device);
+    current.frame_no = 121;
+    current.texture_cache.insert(
+        1,
+        CachedTexture {
+            resource: TextureResource::null(),
+            width: 1,
+            height: 1,
+            format: FramePixelFormat::Bgra8Srgb,
+            modifier: None,
+            last_used_frame: 0,
+            uploaded: false,
+        },
+    );
+
+    assert!(!current.keep_uploaded_texture(2));
+    assert!(!current.keep_uploaded_texture(1));
+    assert_eq!(current.texture_cache[&1].last_used_frame, 0);
+
+    current.texture_cache.get_mut(&1).unwrap().uploaded = true;
+    assert!(current.keep_uploaded_texture(1));
+    assert_eq!(current.texture_cache[&1].last_used_frame, 121);
+}
+
+#[test]
 fn cache_reclamation_does_not_destroy_resources_referenced_by_queued_frames() {
     let device = device();
     let mut current = renderer(&device);

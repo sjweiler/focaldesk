@@ -47,8 +47,9 @@ use smithay::wayland::drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjState};
 
 use super::common::{
     bootstrap_compositor_core, client_state_from_stream, is_nonfatal_wayland_io_error,
-    physical_size_mm_from_pixels, pump_desktop_services, restart_shell_surfaces_after_gpu_reset,
-    spawn_session_sleep_watch, stop_focaldesk_session_target, NestedDesktop, SessionSleepEvent,
+    physical_size_mm_from_pixels, pump_desktop_services, refresh_portal_services,
+    restart_shell_surfaces_after_gpu_reset, spawn_session_sleep_watch, stop_focaldesk_session_target,
+    NestedDesktop, SessionSleepEvent,
 };
 #[cfg(feature = "xwayland")]
 use super::common::{finish_xwayland_startup, start_xwayland};
@@ -83,6 +84,7 @@ const HDR_SCANOUT_FORMATS: [Fourcc; 4] = [
     Fourcc::Abgr2101010,
 ];
 mod gpu;
+mod metrics;
 
 use gpu::SecondaryGpu;
 
@@ -181,6 +183,7 @@ struct OutputConfig {
 }
 
 struct VulkanOutput {
+    refresh_millihz: u32,
     name: String,
     global: smithay::reexports::wayland_server::backend::GlobalId,
     connector: connector::Handle,
@@ -327,6 +330,7 @@ impl Drop for KmsCursor {
 
 /// Resources tied to exactly one DRM/Vulkan device. Never share these across GPUs.
 struct VulkanDevice {
+    metrics: metrics::DeviceMetrics,
     renderer: AshDrmRenderer,
     drm: DrmDevice,
     drm_fd: DrmDeviceFd,
@@ -335,6 +339,7 @@ struct VulkanDevice {
 }
 
 struct VulkanDrmData {
+    metrics: metrics::Monitor,
     desktop: NestedDesktop,
     #[cfg(feature = "xwayland")]
     xwayland_event_loop: EventLoop<'static, crate::core::desktop::DesktopState>,
@@ -1619,6 +1624,7 @@ fn initialize_vulkan_outputs(
             scanout.format(),
         ));
         outputs.push(VulkanOutput {
+            refresh_millihz: config.mode.vrefresh().saturating_mul(1000),
             name: config.name,
             global,
             connector: config.connector,
@@ -2219,12 +2225,25 @@ fn finish_vulkan_capture(data: &mut VulkanDrmData, capture: AshDrmCapture) {
 }
 
 fn recover_vulkan_renderer(data: &mut VulkanDrmData, reason: &anyhow::Error) -> Result<()> {
+    let result = recover_vulkan_renderer_inner(data, reason);
+    if let Err(error) = &result {
+        data.primary_gpu.metrics.error(error);
+        data.primary_gpu.metrics.failed();
+    }
+    // Capture failed recovery too, before the caller may terminate the session.
+    data.metrics.request_sample();
+    publish_metrics(data);
+    result
+}
+
+fn recover_vulkan_renderer_inner(data: &mut VulkanDrmData, reason: &anyhow::Error) -> Result<()> {
     if AshDrmRenderer::is_allocation_pressure(reason) && data.primary_gpu.renderer.is_usable() {
         data.allocation_reclaim_pending = true;
         data.desktop.state.mark_redraw();
         flog_warn!("Vulkan allocation pressure; retaining scanout and scheduling cache reclamation: {reason:#}; renderer={:?}", data.primary_gpu.renderer);
         return Ok(());
     }
+    data.primary_gpu.metrics.error(reason);
     flog_warn!(
         "recreating raw Vulkan device and scanout: {reason:#}; renderer={:?}; outputs={}",
         data.primary_gpu.renderer,
@@ -2233,6 +2252,7 @@ fn recover_vulkan_renderer(data: &mut VulkanDrmData, reason: &anyhow::Error) -> 
     // Lost/hung devices cannot safely be replaced repeatedly inside this process.
     // A finite drain gates destruction of both the embedded and owning renderer.
     if let Err(error) = data.primary_gpu.renderer.quiesce(Duration::from_secs(5)) {
+        data.primary_gpu.metrics.failed();
         data.primary_gpu.renderer.abandon_device();
         if let Some(shell) = data.vui_shell.as_mut() {
             shell.abandon_ash_renderer();
@@ -2242,8 +2262,10 @@ fn recover_vulkan_renderer(data: &mut VulkanDrmData, reason: &anyhow::Error) -> 
     }
     data.vui_shell = None;
     data.desktop.state.invalidate_gpu_state();
+    data.primary_gpu.metrics.rebuild_started();
     data.primary_gpu.renderer.recreate_quiesced(data.primary_gpu.node.major(), data.primary_gpu.node.minor())
         .inspect_err(|error| flog_warn!("Raw Vulkan replacement failed after old-device cleanup: {error:#}; original failure: {reason:#}"))?;
+    data.primary_gpu.metrics.rebuild_succeeded();
     gpu::primary_renderer_recreated(data);
     data.allocation_backoff.clear();
     data.allocation_poll_backoff = AllocationBackoff::default();
@@ -2328,11 +2350,15 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let mut input_session = session.clone();
     let udev = UdevBackend::new(session.seat())
         .map_err(|error| anyhow!("initialize udev backend: {error}"))?;
+    let mut metrics = metrics::Monitor::new();
+    let primary_metrics = metrics.register_device(node);
     let mut data = VulkanDrmData {
+        metrics,
         desktop,
         #[cfg(feature = "xwayland")]
         xwayland_event_loop,
         primary_gpu: VulkanDevice {
+            metrics: primary_metrics,
             renderer,
             drm,
             drm_fd: fd,
@@ -2462,6 +2488,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     if std::mem::take(&mut output.log_first_present_state) {
                         log_nvidia_display_heads("first-present-completed", &output.name);
                     }
+                    if output.frame_pending {
+                        data.primary_gpu.metrics.presented(&output.name);
+                    }
                     output.frame_pending = false;
                     output.present_started_at = None;
                     if let Some(state) = data.desktop.state.outputs.get_mut(&output.output_id) {
@@ -2528,6 +2557,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         };
         gpu::discover_device(&mut data, &loop_handle, node, &path);
     }
+    refresh_portal_services(&data.desktop.state.client_wayland_display);
     let udev_handle = loop_handle.clone();
     let _udev_token = loop_handle.insert_source(udev, move |event, _, data| {
         if let UdevEvent::Added {
@@ -2613,6 +2643,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
         event_loop.dispatch(Some(FRAME_INTERVAL), &mut data)?;
         gpu::service_secondary_gpus(&mut data, &loop_handle);
+        publish_metrics(&mut data);
         let now = Instant::now();
         let display = data.desktop.display.handle();
         data.retired_output_globals.retain(|(deadline, global)| {
@@ -2821,6 +2852,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 data.outputs[index].height as i32,
             )));
             let software_cursor = data.desktop.state.cursor_manager.software_cursor_needed();
+            data.scene_builder
+                .prepare_ash_wallpapers(&mut data.primary_gpu.renderer);
             let mut scene = data.scene_builder.build_for_output_with_cursor_policy(
                 &mut data.desktop.state,
                 output_id,
@@ -3081,6 +3114,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         continue;
                     }
                 };
+                let portal_transfer = if HDR_SCANOUT_FORMATS.contains(&dmabuf.format().code) {
+                    AshDrmTransfer::SrgbUnorm
+                } else {
+                    AshDrmTransfer::Srgb
+                };
                 let portal_submission = data.primary_gpu.renderer.render(
                     &target,
                     &scene.background,
@@ -3096,7 +3134,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     PORTAL_CAPTURE_STREAM_BASE | output_id.0,
                     None,
                     [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-                    AshDrmTransfer::SrgbUnorm,
+                    portal_transfer,
                     None,
                     None,
                 );
@@ -3421,4 +3459,26 @@ mod allocation_recovery_tests {
         assert!(state.ready(now));
         assert_eq!(state.failed(now), Duration::from_millis(100));
     }
+}
+
+fn publish_metrics(data: &mut VulkanDrmData) {
+    if !data.metrics.due() {
+        return;
+    }
+    data.metrics.begin_sample();
+    data.primary_gpu.metrics.sample_gpu(
+        !data.primary_gpu.renderer.is_usable(),
+        data.session_active,
+    );
+    for output in &data.outputs {
+        data.primary_gpu.metrics.display(
+            &output.name,
+            output.width,
+            output.height,
+            Some(output.refresh_millihz),
+            data.primary_gpu.metrics.active(),
+        );
+    }
+    gpu::sample_metrics(data);
+    data.metrics.publish();
 }

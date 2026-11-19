@@ -1,0 +1,24 @@
+FOCAL-ROOT-MIB DEFINITIONS ::= BEGIN
+
+IMPORTS
+    MODULE-IDENTITY, enterprises FROM SNMPv2-SMI;
+
+focalRootMib MODULE-IDENTITY
+    LAST-UPDATED "202611180000Z"
+    ORGANIZATION "FocalDesk"
+    CONTACT-INFO "FocalDesk project maintainers"
+    DESCRIPTION "Enterprise namespace for Focal products."
+    REVISION "202611180000Z"
+    DESCRIPTION "Initial draft."
+    ::= { focalModules 1 }
+
+-- IANA Private Enterprise Number 67726 is assigned to Steven Weiler.
+focalEnterprise OBJECT IDENTIFIER ::= { enterprises 67726 }
+focalDesk       OBJECT IDENTIFIER ::= { focalEnterprise 1 }
+focalVector     OBJECT IDENTIFIER ::= { focalEnterprise 2 }
+focalPBX        OBJECT IDENTIFIER ::= { focalEnterprise 3 }
+focalAI         OBJECT IDENTIFIER ::= { focalEnterprise 4 }
+focalCommon     OBJECT IDENTIFIER ::= { focalEnterprise 5 }
+focalModules    OBJECT IDENTIFIER ::= { focalEnterprise 6 }
+
+END

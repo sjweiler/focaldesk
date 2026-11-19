@@ -465,7 +465,7 @@ fn encode_pq(scene_linear: vec3<f32>, pixel: vec2<f32>, uv: vec2<f32>) -> vec3<f
     let sampled = textureSample(scene, scene_sampler, in.uv);
     if sampled.a <= 0.0 { return vec4(0.0); }
     let straight = sampled.rgb / sampled.a;
-    if pc.params0.y > 1.5 {
+    if pc.params0.y == 2.0 {
         return vec4(encode_pq(straight, in.position.xy, in.uv) * sampled.a, sampled.a);
     }
     let encoded = encode_color(straight);
@@ -898,6 +898,18 @@ impl fmt::Debug for AshDrmRenderer {
 }
 
 impl AshDrmRenderer {
+    /// Keep a scene asset resident while another output on this GPU renders.
+    pub fn keep_uploaded_texture(&mut self, key: u64) -> bool {
+        let Some(texture) = self.texture_cache.get_mut(&key) else {
+            return false;
+        };
+        if !texture.uploaded {
+            return false;
+        }
+        texture.last_used_frame = self.frame_no;
+        true
+    }
+
     /// Publish this submission's completion fence to a DMA-BUF rendered by
     /// Vulkan.  This is the implicit-sync handoff used by portal/PipeWire
     /// clients; it lets them consume the buffer without forcing the
@@ -4767,6 +4779,7 @@ mod tests {
 
     #[test]
     fn pq_output_pass_tone_maps_and_dithers_for_ten_bit_scanout() {
+        assert!(OUTPUT_SHADER.contains("if pc.params0.y == 2.0 {\n        return vec4(encode_pq("));
         assert!(OUTPUT_SHADER.contains("fn pq_oetf"));
         assert!(OUTPUT_SHADER.contains("fn tone_map_nits"));
         assert!(OUTPUT_SHADER.contains("/ 1023.0"));

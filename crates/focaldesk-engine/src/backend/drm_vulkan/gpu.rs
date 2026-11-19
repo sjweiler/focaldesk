@@ -274,9 +274,11 @@ impl SecondaryGpu {
             self.device.drm.activate(true)?;
             self.device.renderer.quiesce(Duration::from_millis(100))?;
             self.outputs.clear();
+            self.device.metrics.rebuild_started();
             self.device
                 .renderer
                 .recreate_quiesced(self.device.node.major(), self.device.node.minor())?;
+            self.device.metrics.rebuild_succeeded();
             self.outputs = create_test_outputs(&mut self.device)?;
             self.topology = topology_signature(&self.device.drm)?;
             self.reconfigure_at = None;
@@ -284,6 +286,8 @@ impl SecondaryGpu {
         })();
         self.failed = result.is_err();
         if let Err(error) = result {
+            self.device.metrics.error(&error);
+            self.device.metrics.failed();
             flog_warn!("secondary GPU resume failed: {error:#}");
         }
     }
@@ -371,6 +375,7 @@ pub(super) fn discover_device(
         }
         let renderer = AshDrmRenderer::new(node.major(), node.minor())?;
         let mut device = VulkanDevice {
+            metrics: data.metrics.register_device(node),
             renderer,
             drm,
             drm_fd: fd,
@@ -394,7 +399,7 @@ pub(super) fn discover_device(
             match event {
                 DrmEvent::VBlank(crtc) => {
                     if let Some(desktop) = gpu.desktop.as_mut() {
-                        if let Err(error) = desktop.page_flip(crtc) {
+                        if let Err(error) = desktop.page_flip(crtc, &gpu.device.metrics) {
                             gpu.failed = true;
                             flog_warn!("secondary desktop page flip failed: {error:#}");
                         }
@@ -404,6 +409,7 @@ pub(super) fn discover_device(
                     if output.pending_since.is_none() { return; }
                     match output.scanout.frame_submitted() {
                         Ok(_) => {
+                            gpu.device.metrics.presented(&output.name);
                             output.pending_since = None;
                             output.presented = true;
                             flog(format!("Secondary Vulkan SDR test presented: gpu={node:?} output={} {}x{}", output.name, output.width, output.height));
@@ -484,6 +490,8 @@ pub(super) fn service_secondary_gpus(
                                 topology_signature(&gpu.device.drm).unwrap_or(gpu.topology);
                         }
                         Err(error) => {
+                            gpu.device.metrics.error(&error);
+                            gpu.device.metrics.failed();
                             desktop.retire(data, &mut gpu.device);
                             flog_warn!("Secondary hotplug recovery failed: {error:#}");
                         }
@@ -519,6 +527,8 @@ pub(super) fn service_secondary_gpus(
             gpu.service()
         };
         if let Err(error) = result {
+            gpu.device.metrics.error(&error);
+            gpu.device.metrics.failed();
             gpu.failed = true;
             gpu.reconfigure_at = None;
             if let Some(desktop) = gpu.desktop.as_mut() {
@@ -549,6 +559,8 @@ pub(super) fn render_secondary_desktops(data: &mut VulkanDrmData, primary_ready:
         match desktop.render(data, &mut gpu.device, primary_ready) {
             Ok(any) => presented |= any,
             Err(error) => {
+                gpu.device.metrics.error(&error);
+                gpu.device.metrics.failed();
                 gpu.failed = true;
                 gpu.reconfigure_at = None;
                 desktop.retire(data, &mut gpu.device);
@@ -597,6 +609,8 @@ pub(super) fn resume_secondary_gpus(data: &mut VulkanDrmData) {
     for gpu in devices.values_mut() {
         if let Some(desktop) = gpu.desktop.as_mut() {
             if let Err(error) = desktop.resume(data, &mut gpu.device) {
+                gpu.device.metrics.error(&error);
+                gpu.device.metrics.failed();
                 gpu.failed = true;
                 desktop.retire(data, &mut gpu.device);
                 flog_warn!("Secondary desktop resume failed: {error:#}");
@@ -697,5 +711,32 @@ mod tests {
             edge += quad.destination[2];
         }
         assert_eq!(edge, 1366);
+    }
+}
+
+pub(super) fn sample_metrics(data: &VulkanDrmData) {
+    for gpu in data.secondary_gpus.values() {
+        gpu.device.metrics.sample_gpu(gpu.failed, data.session_active);
+        if let Some(desktop) = &gpu.desktop {
+            for output in &desktop.outputs {
+                gpu.device.metrics.display(
+                    &output.name,
+                    output.width,
+                    output.height,
+                    Some(output.refresh_millihz),
+                    gpu.device.metrics.active(),
+                );
+            }
+        } else {
+            for output in &gpu.outputs {
+                gpu.device.metrics.display(
+                    &output.name,
+                    output.width,
+                    output.height,
+                    None,
+                    gpu.device.metrics.active(),
+                );
+            }
+        }
     }
 }

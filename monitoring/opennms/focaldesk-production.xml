@@ -1,0 +1,43 @@
+<datacollection-group xmlns="http://xmlns.opennms.org/xsd/config/datacollection" name="FocalDesk Vulkan">
+  <resourceType name="focalDeskGpuIndex" label="FocalDesk Gpu" resourceLabel="${fdGpuIdentity} (index ${index})">
+    <persistenceSelectorStrategy class="org.opennms.netmgt.collection.support.PersistAllSelectorStrategy"/>
+    <storageStrategy class="org.opennms.netmgt.collection.support.IndexStorageStrategy"/>
+  </resourceType>
+  <resourceType name="focalDeskDisplayIndex" label="FocalDesk Display" resourceLabel="${fdDisplayIdentity} (index ${index})">
+    <persistenceSelectorStrategy class="org.opennms.netmgt.collection.support.PersistAllSelectorStrategy"/>
+    <storageStrategy class="org.opennms.netmgt.collection.support.IndexStorageStrategy"/>
+  </resourceType>
+  <group name="focaldesk-compositor" ifType="all">
+    <mibObj oid=".1.3.6.1.4.1.67726.1.1.1.1" instance="0" alias="fdUptime" type="gauge"/>
+    <mibObj oid=".1.3.6.1.4.1.67726.1.1.1.2" instance="0" alias="fdProducerEpoch" type="string"/>
+    <mibObj oid=".1.3.6.1.4.1.67726.1.1.1.7" instance="0" alias="fdInventoryEpoch" type="string"/>
+  </group>
+  <group name="focaldesk-gpu" ifType="all">
+    <mibObj oid=".1.3.6.1.4.1.67726.1.1.2.1.2" instance="focalDeskGpuIndex" alias="fdGpuIdentity" type="string"/>
+    <mibObj oid=".1.3.6.1.4.1.67726.1.1.2.1.4" instance="focalDeskGpuIndex" alias="fdGpuState" type="gauge"/>
+    <mibObj oid=".1.3.6.1.4.1.67726.1.1.2.1.5" instance="focalDeskGpuIndex" alias="fdGpuLosses" type="Counter64"/>
+    <mibObj oid=".1.3.6.1.4.1.67726.1.1.2.1.6" instance="focalDeskGpuIndex" alias="fdGpuAttempts" type="Counter64"/>
+    <mibObj oid=".1.3.6.1.4.1.67726.1.1.2.1.7" instance="focalDeskGpuIndex" alias="fdGpuSuccesses" type="Counter64"/>
+    <mibObj oid=".1.3.6.1.4.1.67726.1.1.2.1.13" instance="focalDeskGpuIndex" alias="fdGpuSampleStatus" type="gauge"/>
+    <mibObj oid=".1.3.6.1.4.1.67726.1.1.2.1.14" instance="focalDeskGpuIndex" alias="fdGpuSampleAge" type="gauge"/>
+  </group>
+  <group name="focaldesk-display" ifType="all">
+    <mibObj oid=".1.3.6.1.4.1.67726.1.1.3.1.2" instance="focalDeskDisplayIndex" alias="fdDisplayIdentity" type="string"/>
+    <mibObj oid=".1.3.6.1.4.1.67726.1.1.3.1.4" instance="focalDeskDisplayIndex" alias="fdScanoutGpu" type="gauge"/>
+    <mibObj oid=".1.3.6.1.4.1.67726.1.1.3.1.5" instance="focalDeskDisplayIndex" alias="fdDisplayState" type="gauge"/>
+    <mibObj oid=".1.3.6.1.4.1.67726.1.1.3.1.6" instance="focalDeskDisplayIndex" alias="fdDisplayWidth" type="gauge"/>
+    <mibObj oid=".1.3.6.1.4.1.67726.1.1.3.1.7" instance="focalDeskDisplayIndex" alias="fdDisplayHeight" type="gauge"/>
+    <mibObj oid=".1.3.6.1.4.1.67726.1.1.3.1.8" instance="focalDeskDisplayIndex" alias="fdDisplayMilliHz" type="gauge"/>
+    <mibObj oid=".1.3.6.1.4.1.67726.1.1.3.1.10" instance="focalDeskDisplayIndex" alias="fdPresentedFrames" type="Counter64"/>
+    <mibObj oid=".1.3.6.1.4.1.67726.1.1.3.1.17" instance="focalDeskDisplayIndex" alias="fdDisplaySampleStat" type="gauge"/>
+    <mibObj oid=".1.3.6.1.4.1.67726.1.1.3.1.18" instance="focalDeskDisplayIndex" alias="fdDisplaySampleAge" type="gauge"/>
+  </group>
+  <systemDef name="FocalDesk Vulkan">
+    <sysoid>.1.3.6.1.4.1.67726.1.1</sysoid>
+    <collect>
+      <includeGroup>focaldesk-compositor</includeGroup>
+      <includeGroup>focaldesk-gpu</includeGroup>
+      <includeGroup>focaldesk-display</includeGroup>
+    </collect>
+  </systemDef>
+</datacollection-group>

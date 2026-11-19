@@ -248,9 +248,11 @@ impl SecondaryDesktop {
         device.drm.activate(true)?;
         device.renderer.quiesce(Duration::from_millis(100))?;
         self.retire(data, device);
+        device.metrics.rebuild_started();
         device
             .renderer
             .recreate_quiesced(device.node.major(), device.node.minor())?;
+        device.metrics.rebuild_succeeded();
         self.sample_formats = device.renderer.sample_formats().into_iter().collect();
         self.feedback = secondary_feedback(data, device)?;
         self.initialize(data, device)?;
@@ -258,7 +260,7 @@ impl SecondaryDesktop {
         Ok(())
     }
 
-    pub fn page_flip(&mut self, crtc: crtc::Handle) -> Result<()> {
+    pub fn page_flip(&mut self, crtc: crtc::Handle, metrics: &metrics::DeviceMetrics) -> Result<()> {
         let Some(output) = self.outputs.iter_mut().find(|output| output.crtc == crtc) else {
             return Ok(());
         };
@@ -266,6 +268,7 @@ impl SecondaryDesktop {
             return Ok(());
         }
         output.scanout.frame_submitted()?;
+        metrics.presented(&output.name);
         output.frame_pending = false;
         output.present_started_at = None;
         if std::mem::take(&mut output.log_first_present_state) {
@@ -395,6 +398,7 @@ impl SecondaryDesktop {
                 }
                 continue;
             }
+            self.builder.prepare_ash_wallpapers(&mut device.renderer);
             let bridged = frame.bridge_pixels.is_some();
             let mut scene = if let Some(texture) = frame.bridge_pixels.take() {
                 scene_from_bridge(texture, output)
@@ -626,6 +630,8 @@ fn submit_bridge(
             _buffer: buffer,
         });
     }
+    data.scene_builder
+        .prepare_ash_wallpapers(&mut data.primary_gpu.renderer);
     let mut scene = data.scene_builder.build_for_output_with_cursor_policy(
         &mut data.desktop.state,
         output.output_id,
