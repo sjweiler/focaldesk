@@ -7,10 +7,12 @@ IMPORTS
     focalDesk, focalModules FROM FOCAL-ROOT-MIB;
 
 focalDeskMib MODULE-IDENTITY
-    LAST-UPDATED "202611180000Z"
+    LAST-UPDATED "202611190000Z"
     ORGANIZATION "FocalDesk"
     CONTACT-INFO "FocalDesk project maintainers"
     DESCRIPTION "Read-only Vulkan compositor inventory and presentation metrics."
+    REVISION "202611190000Z"
+    DESCRIPTION "Added optional device utilization and framebuffer memory."
     REVISION "202611180000Z"
     DESCRIPTION "Initial draft."
     ::= { focalModules 4 }
@@ -65,7 +67,10 @@ FdGpuEntry ::= SEQUENCE {
     fdGpuRebuildAttempts           Counter64,
     fdGpuRebuildSuccesses          Counter64,
     fdGpuSampleStatus              INTEGER,
-    fdGpuSampleAge                 Gauge32
+    fdGpuSampleAge                 Gauge32,
+    fdGpuBusyPercent               Gauge32,
+    fdGpuVramUsedMiB               Gauge32,
+    fdGpuVramTotalMiB              Gauge32
 }
 
 fdGpuIndex OBJECT-TYPE
@@ -124,6 +129,30 @@ fdGpuSampleAge OBJECT-TYPE
     STATUS current
     DESCRIPTION "Whole seconds since the producer sample. The instance is absent when age is unavailable."
     ::= { fdGpuEntry 14 }
+
+fdGpuBusyPercent OBJECT-TYPE
+    SYNTAX Gauge32 (0..100)
+    UNITS "percent"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Device-wide GPU busy time over the driver sampling window. The instance is absent when the sensor is unsupported or no recent sample is available."
+    ::= { fdGpuEntry 15 }
+
+fdGpuVramUsedMiB OBJECT-TYPE
+    SYNTAX Gauge32
+    UNITS "MiB"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Current device-wide used framebuffer memory reported by the GPU driver, in mebibytes. The instance is absent when unavailable."
+    ::= { fdGpuEntry 16 }
+
+fdGpuVramTotalMiB OBJECT-TYPE
+    SYNTAX Gauge32
+    UNITS "MiB"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Total framebuffer memory available as reported by the GPU driver, in mebibytes. The instance is absent when unavailable."
+    ::= { fdGpuEntry 17 }
 
 fdDisplayTable OBJECT-TYPE
     SYNTAX SEQUENCE OF FdDisplayEntry
@@ -253,11 +282,19 @@ fdInventoryGroup OBJECT-GROUP
     DESCRIPTION "Objects exposed by the Vulkan inventory profile."
     ::= { fdGroups 1 }
 
+fdGpuSensorsGroup OBJECT-GROUP
+    OBJECTS { fdGpuBusyPercent, fdGpuVramUsedMiB, fdGpuVramTotalMiB }
+    STATUS current
+    DESCRIPTION "Optional device-wide utilization and framebuffer memory sensors."
+    ::= { fdGroups 2 }
+
 fdInventoryCompliance MODULE-COMPLIANCE
     STATUS current
     DESCRIPTION "Compliance for the Vulkan inventory profile."
     MODULE
         MANDATORY-GROUPS { fdInventoryGroup }
+        GROUP fdGpuSensorsGroup
+        DESCRIPTION "Present when a supported GPU provides these sensors."
     ::= { fdCompliances 1 }
 
 END

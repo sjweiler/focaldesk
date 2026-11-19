@@ -26,8 +26,8 @@ use smithay::backend::drm::{
     DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, GbmBufferedSurface, PlaneClaim,
 };
 use smithay::backend::input::{
-    InputEvent as SmithayInputEvent, KeyState as SmithayKeyState, KeyboardKeyEvent, SwitchState,
-    SwitchToggleEvent,
+    Event as _, InputEvent as SmithayInputEvent, KeyState as SmithayKeyState, KeyboardKeyEvent,
+    SwitchState, SwitchToggleEvent,
 };
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::sync::{Fence, Interrupted, SyncPoint};
@@ -2427,6 +2427,24 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let _input_token = loop_handle.insert_source(input_backend, move |event, _, data| {
+        let timing = match &event {
+            SmithayInputEvent::Keyboard { event, .. } => {
+                Some((metrics::InputKind::Keyboard, event.time()))
+            }
+            SmithayInputEvent::PointerMotion { event, .. } => {
+                Some((metrics::InputKind::PointerMotion, event.time()))
+            }
+            SmithayInputEvent::PointerMotionAbsolute { event, .. } => {
+                Some((metrics::InputKind::PointerMotion, event.time()))
+            }
+            SmithayInputEvent::PointerButton { event, .. } => {
+                Some((metrics::InputKind::PointerButton, event.time()))
+            }
+            _ => None,
+        };
+        if let Some((kind, timestamp)) = timing {
+            data.metrics.input_dispatched(kind, timestamp);
+        }
         match &event {
             SmithayInputEvent::DeviceAdded { device } => {
                 if device.has_capability(smithay::reexports::input::DeviceCapability::Touch) {

@@ -123,6 +123,61 @@ impl DeviceMetrics {
     }
 }
 
+// Upper edges in microseconds. The last bin counts samples above the final edge.
+const INPUT_DELAY_EDGES_US: [u64; 10] = [
+    250, 500, 1000, 2000, 4000, 8000, 16000, 32000, 64000, 128000,
+];
+
+#[derive(Clone, Copy)]
+pub(super) enum InputKind {
+    Keyboard,
+    PointerMotion,
+    PointerButton,
+}
+
+#[derive(Default, Serialize)]
+struct InputLatency {
+    samples: u64,
+    total_us: u64,
+    max_us: Option<u64>,
+    bins: [u64; INPUT_DELAY_EDGES_US.len() + 1],
+}
+
+impl InputLatency {
+    fn observe(&mut self, event_us: u64, callback_us: u64) {
+        if event_us == 0 {
+            return;
+        }
+        let Some(delay_us) = callback_us.checked_sub(event_us) else {
+            return;
+        };
+        let bin = INPUT_DELAY_EDGES_US.partition_point(|&edge| edge < delay_us);
+        self.samples = self.samples.saturating_add(1);
+        self.total_us = self.total_us.saturating_add(delay_us);
+        self.max_us = Some(self.max_us.unwrap_or_default().max(delay_us));
+        self.bins[bin] = self.bins[bin].saturating_add(1);
+    }
+}
+
+#[derive(Default, Serialize)]
+struct InputDispatch {
+    keyboard: InputLatency,
+    pointer_motion: InputLatency,
+    pointer_button: InputLatency,
+}
+
+fn monotonic_microseconds() -> Option<u64> {
+    let mut timestamp = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: timestamp is valid writable storage for clock_gettime.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut timestamp) } != 0 {
+        return None;
+    }
+    Some((timestamp.tv_sec as u64) * 1_000_000 + (timestamp.tv_nsec as u64) / 1000)
+}
+
 pub(super) struct Monitor {
     devices: BTreeMap<String, DeviceMetrics>,
     started: Instant,
@@ -130,6 +185,7 @@ pub(super) struct Monitor {
     next_sample: Instant,
     writer: Option<SyncSender<serde_json::Value>>,
     dropped_snapshots: u64,
+    input_dispatch: InputDispatch,
 }
 
 impl Monitor {
@@ -183,8 +239,24 @@ impl Monitor {
             next_sample: Instant::now(),
             writer,
             dropped_snapshots: 0,
+            input_dispatch: InputDispatch::default(),
         }
     }
+    pub fn input_dispatched(&mut self, kind: InputKind, event_us: u64) {
+        if self.writer.is_none() {
+            return;
+        }
+        let Some(callback_us) = monotonic_microseconds() else {
+            return;
+        };
+        let series = match kind {
+            InputKind::Keyboard => &mut self.input_dispatch.keyboard,
+            InputKind::PointerMotion => &mut self.input_dispatch.pointer_motion,
+            InputKind::PointerButton => &mut self.input_dispatch.pointer_button,
+        };
+        series.observe(event_us, callback_us);
+    }
+
     pub fn register_device(&mut self, node: DrmNode) -> DeviceMetrics {
         let identity = std::fs::canonicalize(format!(
             "/sys/dev/char/{}:{}/device",
@@ -242,6 +314,10 @@ impl Monitor {
             "uptime_seconds": self.started.elapsed().as_secs(),
             "sample_unix_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
             "dropped_snapshots": self.dropped_snapshots, "gpus": devices,
+            "input_dispatch_delay": {
+                "bin_upper_edges_us": INPUT_DELAY_EDGES_US,
+                "series": self.input_dispatch,
+            },
         })
     }
     pub fn publish(&mut self) {
@@ -312,6 +388,7 @@ mod tests {
             next_sample: Instant::now(),
             writer: None,
             dropped_snapshots: 0,
+            input_dispatch: InputDispatch::default(),
         };
         let device = DeviceMetrics(Rc::new(RefCell::new(Device::default())));
         monitor
@@ -374,4 +451,23 @@ mod snapshot_tests {
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
+}
+
+#[cfg(test)]
+#[test]
+fn input_delay_bins_measure_elapsed_time_and_skip_invalid_timestamps() {
+    let mut latency = InputLatency::default();
+    assert_eq!(latency.max_us, None);
+    latency.observe(0, 1_000_000);
+    latency.observe(1_000_001, 1_000_000);
+    latency.observe(1_000_000, 1_000_000);
+    latency.observe(999_750, 1_000_000);
+    latency.observe(999_749, 1_000_000);
+    latency.observe(1_000_000, 1_200_000);
+    assert_eq!(latency.samples, 4);
+    assert_eq!(latency.total_us, 200_501);
+    assert_eq!(latency.max_us, Some(200_000));
+    assert_eq!(latency.bins[0], 2);
+    assert_eq!(latency.bins[1], 1);
+    assert_eq!(latency.bins[INPUT_DELAY_EDGES_US.len()], 1);
 }

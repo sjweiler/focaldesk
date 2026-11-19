@@ -70,3 +70,28 @@ node's SNMP address and the ad hoc collector host to that gateway, with
 UDP port `11661`. In the example, the gateway is `10.89.1.1` on
 `opennms-net`. The lab binds only that bridge address inside the rootless
 network namespace and uses the same temporary SNMPv3 credentials.
+
+## Resource graphs
+
+Install [focaldesk-graph.properties](focaldesk-graph.properties) in
+`${OPENNMS_HOME}/etc/snmp-graph.properties.d/`. On the FocalDesk node's
+**Resource Graphs** page, select a GPU or display resource to find its graphs.
+
+To enable the built-in SNMP response-time graph, add the response repository
+and base name parameters to the active SNMP service's poller package. Use
+the same response repository as the package's ICMP monitor:
+
+```xml
+<parameter key="rrd-repository" value="/opt/opennms/share/rrd/response" />
+<parameter key="rrd-base-name" value="snmp" />
+<parameter key="ds-name" value="snmp" />
+```
+
+Reload the poller configuration or restart OpenNMS. On the node's resource
+graphs, use the interface response and service status resources respectively.
+Response time history begins with the first successful poll after enabling
+storage. Select a time range that includes recent polls.
+
+Optional NVIDIA busy and VRAM graphs appear for GPU rows with supported
+sensor values. Import the updated production collection source to collect
+the three additional columns, and enable the AgentX NVIDIA sampler.

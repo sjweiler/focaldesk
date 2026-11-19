@@ -16,6 +16,7 @@ def main():
     ))
     # The synthetic tree is confined to this anonymous socket pair.
     root = (1, 3, 6, 1, 3, 42)
+    verify_sensor_mapping(agent, root)
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory)
         snapshot = path / "snapshot.json"
@@ -37,7 +38,31 @@ def main():
             snapshot.write_text(json.dumps(sample))
             verify_session(agent, args, session, sample)
     print("Verified registration, Counter64, sparse values, stale status, GETBULK, "
-          "transaction consistency, denied SET and a second session.")
+          "transaction consistency, denied SET, a second session, and GPU sensor mapping.")
+
+def verify_sensor_mapping(agent, root):
+    sensors = agent["nvidia_sensors"](
+        "00000000:01:00.0, 0, 10240, 24564\n00000000:02:00.0, N/A, N/A, 50000"
+    )
+    snapshot = {
+        "uptime_seconds": 1, "producer_epoch": "test", "inventory_epoch": "00" * 16,
+        "gpus": [], "displays": [],
+    }
+    row = {
+        "index": 1, "identity": "/sys/devices/pci0000:00/0000:01:00.0",
+        "state": "ready", "device_losses": 0, "rebuild_attempts": 0, "rebuild_successes": 0,
+        "sample_status": "ok", "sample_age_seconds": 0,
+    }
+    snapshot["gpus"] = [row, dict(row, index=2, identity="/sys/devices/0000:02:00.0")]
+    values = agent["objects"](root, snapshot, sensors)
+    assert values[root + (2, 1, 15, 1)] == (66, 0)
+    assert values[root + (2, 1, 16, 1)] == (66, 10240)
+    assert values[root + (2, 1, 17, 1)] == (66, 24564)
+    assert root + (2, 1, 15, 2) not in values
+    assert values[root + (2, 1, 17, 2)] == (66, 50000)
+    row["sample_status"] = "stale"
+    values = agent["objects"](root, snapshot, sensors)
+    assert root + (2, 1, 15, 1) not in values
 
 
 def verify_session(agent, args, session, sample):

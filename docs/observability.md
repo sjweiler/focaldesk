@@ -453,3 +453,23 @@ seconds by default, or at the threshold set by `--stale-after`. A future
 timestamp yields `unavailable` with a null age. Missing or unreadable snapshots
 produce an error and no inventory output. Use `--snapshot` and `--registry`
 to inspect a capture with a separate registry.
+
+### Input dispatch delay
+
+The opt-in Vulkan snapshot includes `input_dispatch_delay` for keyboard
+events (presses and releases), pointer motion, and pointer buttons. Each
+series contains the process-lifetime count, total microseconds, maximum, and
+histogram bins. The timer measures from the libinput event timestamp to the
+start of the compositor callback. It does not include client delivery or
+display presentation. Libinput may backdate synthesized touchpad clicks,
+which is why button timing is reported separately from pointer motion.
+
+Record a snapshot before and after each trial while performing comparable
+typing and pointer motion. Wait for a fresh snapshot before recording
+the end of a trial. Compare samples within the same `producer_epoch`.
+Subtract both the count and total across snapshots to compute interval mean
+delay. Subtract each histogram bin to compare the proportion over 8 ms,
+16 ms, and 32 ms, or to estimate a percentile. Bin edges are inclusive
+upper bounds, and the last bin contains values above 128 ms. The maximum
+is cumulative, so use histogram deltas to compare trial intervals.
+The metrics contain no key codes or pointer coordinates.

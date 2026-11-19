@@ -135,6 +135,8 @@ before formal MIB publication.
 | 12 | fdGpuCapabilities | BITS; deviceLoss(0), rebuild(1), driverReset(2), ownedMemory(3), memoryBudget(4) |
 | 13 | fdGpuSampleStatus | INTEGER; shared sample-status enum |
 | 14 | fdGpuSampleAge | Gauge32; seconds since producer sample |
+| 15 | fdGpuBusyPercent | Gauge32; optional device-wide busy percentage |
+| 16, 17 | fdGpuVramUsedMiB, fdGpuVramTotalMiB | Gauge32; optional driver-reported framebuffer use and size in MiB |
 
 GPU rebuilds are not hardware resets. Increment loss once per incident, not once
 per failed API call. Allocation-pressure reclamation is not device loss. Track

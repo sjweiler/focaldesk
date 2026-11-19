@@ -22,13 +22,13 @@ and column instances end in the persistent row's `index`.
 | `fdDisplayState` | Display `state` mapped to its named enum |
 | `fdDisplayWidth`, `fdDisplayHeight`, `fdDisplayRefreshMilliHz` | `width`, `height`, and `refresh_millihz` as Gauge32 |
 | `fdDisplayPresentedFrames` | `presented_frames` as Counter64 |
+| `fdGpuBusyPercent`, `fdGpuVramUsedMiB`, `fdGpuVramTotalMiB` | Optional device-driver samples matched to the GPU by PCI address |
 | GPU/display sample status and age | `sample_status` mapped to its named enum and `sample_age_seconds` as Gauge32 |
 
 Null fields have no instance. A compositor epoch change invalidates counter
 deltas. An inventory epoch change requires table rediscovery. The scanout GPU
 comes from the connector's owner. The render-GPU column stays reserved pending
-measurement of the actual render path. Hardware sensors, render timing,
-service health, and notifications are outside this first draft.
+measurement of the actual render path. Render timing, service health, and notifications remain pending.
 
 ## Offline validation
 
@@ -70,3 +70,14 @@ its input cannot be read. Stale snapshots remain readable with stale status.
 Notifications are pending.
 
 See the [OpenNMS collection profile](../opennms/README.md) for polling the lab.
+
+### NVIDIA device sensors
+
+Pass `--nvidia-smi /usr/bin/nvidia-smi` to the subagent to poll NVIDIA GPU busy
+percentage and used/total VRAM in MiB. The subprocess runs in a background
+worker and never blocks compositor rendering or the AgentX request handler.
+The sampler runs approximately every five seconds and drops sensor values
+older than 15 seconds. Unsupported values and stale compositor rows have
+no sensor instance. The values describe the whole GPU, including applications
+outside FocalDesk. The Intel GPU continues to expose its normal inventory and
+recovery metrics.
