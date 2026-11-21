@@ -224,7 +224,7 @@ async fn handle_conn(mut stream: UnixStream, shared: Shared) -> std::io::Result<
     let access = match peer_access(cred.uid(), service_uid) {
         Some(access) => access,
         None => {
-            log::warn!("ipc: rejecting cross-uid peer (uid {})", cred.uid());
+            log::warn!("ipc: rejecting cross-uid peer");
             return Ok(());
         }
     };

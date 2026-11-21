@@ -266,10 +266,7 @@ fn run_cloud_calendar(connector: &ConnectorStatus, provider: CalendarProvider) -
         .into_iter()
         .filter(|account| account.enabled && account.provider == provider);
     let http = focaldesk_calendar::CalendarHttpClient::new()?;
-    let token_client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
+    let token_client = calendar_token_client()?;
     let store = CALENDAR_STORE.get().context("calendar store unavailable")?;
     let mut delivered = 0;
     for account in accounts {
@@ -485,11 +482,16 @@ fn check_calendar_preferences(
     Ok(())
 }
 
-fn calendar_access_token(account: &CalendarAccount) -> Result<Zeroizing<String>> {
-    let client = reqwest::blocking::Client::builder()
+fn calendar_token_client() -> Result<reqwest::blocking::Client> {
+    Ok(reqwest::blocking::Client::builder()
+        .https_only(true)
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
-        .build()?;
+        .build()?)
+}
+
+fn calendar_access_token(account: &CalendarAccount) -> Result<Zeroizing<String>> {
+    let client = calendar_token_client()?;
     let handle = format!("calendar/{}/refresh-token", account.id);
     let refresh = focaldesk_secrets_client::get(&handle)?;
     let tokens = refresh_access_token(&client, account, &refresh)?;
@@ -1034,7 +1036,7 @@ fn complete_google_oauth(
     let request = std::str::from_utf8(&bytes[..count])?;
     let code = authorization_code_from_loopback_callback(request, redirect_uri, csrf)
         .context("Google OAuth callback validation failed")?;
-    let client = reqwest::blocking::Client::new();
+    let client = calendar_token_client()?;
     let mut form = vec![
         ("client_id", account.client_id.as_str()),
         ("code", code.as_str()),
@@ -1122,7 +1124,7 @@ fn complete_microsoft_oauth(
     let request = std::str::from_utf8(&bytes[..count])?;
     let code = authorization_code_from_loopback_callback(request, redirect_uri, csrf)
         .context("Microsoft OAuth callback validation failed")?;
-    let client = reqwest::blocking::Client::new();
+    let client = calendar_token_client()?;
     let endpoint = format!(
         "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
         account.tenant

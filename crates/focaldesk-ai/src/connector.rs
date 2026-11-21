@@ -840,17 +840,18 @@ mod tests {
         let registry = ConnectorRegistry::memory();
         registry.install(external_manifest(), false).unwrap();
         registry.set_enabled("test-calendar", true, false).unwrap();
+        let secret = rand::random::<[u8; 32]>();
         let request = sign_connector_event(
             "test-calendar".into(),
             crate::EventSource::Calendar,
             unix_now(),
-            "0123456789abcdef".into(),
+            format!("{:032x}", rand::random::<u128>()),
             json!({"event":"meeting soon"}),
-            b"test secret",
+            &secret,
         )
         .unwrap();
-        registry.verify_signed(&request, b"test secret").unwrap();
-        assert!(registry.verify_signed(&request, b"test secret").is_err());
+        registry.verify_signed(&request, &secret).unwrap();
+        assert!(registry.verify_signed(&request, &secret).is_err());
     }
 
     #[test]

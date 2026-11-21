@@ -5,7 +5,7 @@
 //! systemd service credential). Writes are atomic
 //! (tempfile + fsync + rename). Secret values are zeroized on drop.
 
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{Aead, AeadCore, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -368,11 +368,9 @@ impl Store {
             )));
         }
         let cipher = ChaCha20Poly1305::new(&self.key);
-        let mut nonce_bytes = [0u8; 12];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = ChaCha20Poly1305::generate_nonce(rand::rngs::OsRng);
         let ct = cipher
-            .encrypt(nonce, plain.as_slice())
+            .encrypt(&nonce, plain.as_slice())
             .map_err(|e| std::io::Error::other(format!("encrypt: {e}")))?;
         plain.zeroize();
         drop(plain);
@@ -396,7 +394,7 @@ impl Store {
             // Stream the fixed header and ciphertext directly instead of
             // retaining a second full encrypted-store buffer in locked memory.
             f.write_all(MAGIC)?;
-            f.write_all(&nonce_bytes)?;
+            f.write_all(&nonce)?;
             f.write_all(&ct)?;
             f.sync_all()?;
         }
@@ -549,7 +547,7 @@ mod tests {
     fn encrypted_store_roundtrips_with_private_files() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("secrets.db");
-        let key = [7u8; 32];
+        let key = rand::random::<[u8; 32]>();
         {
             let mut store = Store::open(&path, &key).unwrap();
             store
@@ -592,7 +590,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("legacy/secrets.db");
         let destination = directory.path().join("state/secrets.db");
-        let key = [9u8; 32];
+        let key = rand::random::<[u8; 32]>();
         {
             let mut store = Store::open(&source, &key).unwrap();
             store
@@ -625,7 +623,7 @@ mod tests {
         let store_directory = directory.path().join("active");
         let moved_directory = directory.path().join("moved");
         let path = store_directory.join("secrets.db");
-        let key = [11u8; 32];
+        let key = rand::random::<[u8; 32]>();
         let mut store = Store::open(&path, &key).unwrap();
         store
             .transaction(|transaction| {
@@ -664,7 +662,8 @@ mod tests {
     fn item_limit_is_enforced_before_commit() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("secrets.db");
-        let mut store = Store::open(&path, &[13; 32]).unwrap();
+        let key = rand::random::<[u8; 32]>();
+        let mut store = Store::open(&path, &key).unwrap();
         store
             .transaction(|transaction| {
                 for index in 0..MAX_STORE_ITEMS {

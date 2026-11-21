@@ -326,7 +326,8 @@ mod tests {
     fn apply_is_idempotent_without_heuristic_mapping() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("secrets.db");
-        let mut store = Store::open(&path, &[7; 32]).unwrap();
+        let key = rand::random::<[u8; 32]>();
+        let mut store = Store::open(&path, &key).unwrap();
         let item = || ImportedItem {
             source_path: "/org/freedesktop/secrets/collection/login/1".into(),
             label: "OpenAI API key".into(),

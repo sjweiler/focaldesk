@@ -88,9 +88,8 @@ impl SessionCipher {
         match &self.aes_key {
             None => (Vec::new(), plaintext.to_vec()),
             Some(key) => {
-                let mut iv = [0u8; 16];
-                rand::rngs::OsRng.fill_bytes(&mut iv);
-                let ct = Aes128CbcEnc::new(key.into(), &iv.into())
+                let iv = Aes128CbcEnc::generate_iv(rand::rngs::OsRng);
+                let ct = Aes128CbcEnc::new(key.into(), &iv)
                     .encrypt_padded_vec_mut::<Pkcs7>(plaintext);
                 (iv.to_vec(), ct)
             }
