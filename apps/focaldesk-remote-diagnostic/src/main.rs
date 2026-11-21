@@ -42,7 +42,7 @@ fn main() -> Result<()> {
                 ..
             } => {
                 active_session = Some(session_id);
-                eprintln!("capture session {session_id} started at {width}x{height}");
+                eprintln!("capture session started at {width}x{height}");
             }
             Event::FrameReady {
                 len,
