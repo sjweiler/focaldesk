@@ -564,10 +564,12 @@ mod tests {
             smtp_security: Security::StartTls,
             ..Default::default()
         };
-        assert!(smtp(&p, "secret-password")
+        let password = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .test_connection()
-            .is_err());
+            .as_nanos()
+            .to_string();
+        assert!(smtp(&p, &password).unwrap().test_connection().is_err());
         worker.join().unwrap();
     }
     #[test]
