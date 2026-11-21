@@ -29,7 +29,8 @@ url = "2"
 webbrowser = "1"
 scraper = { version = "0.27", default-features = false }
 
-imap = "2.4"
+imap = "3.0.0-alpha.15"
+imap-proto = "0.16"
 native-tls = "0.2"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "native-tls"] }
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }

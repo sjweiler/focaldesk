@@ -7,8 +7,10 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use imap::types::{Flag, NameAttribute};
+use imap::types::Flag;
+use imap_proto::{NameAttribute, Response, Status};
 use std::{
+    io::{BufRead, BufReader, Read, Write},
     net::{TcpStream, ToSocketAddrs},
     sync::{atomic::AtomicBool, Arc},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -75,11 +77,47 @@ fn session(p: &Profile, password: &str) -> Result<Session> {
     } else {
         let mut c = imap::Client::new(stream);
         c.read_greeting()?;
-        c.secure(&p.host, &tls)?
+        let stream = start_tls(c.into_inner()?)?;
+        imap::Client::new(
+            tls.connect(&p.host, stream)
+                .context("Incoming STARTTLS handshake failed")?,
+        )
     };
     client
         .login(username(p), password)
         .map_err(|(error, _)| login_error(error))
+}
+fn start_tls(mut stream: TcpStream) -> Result<TcpStream> {
+    stream.write_all(b"a1 STARTTLS\r\n")?;
+    let mut reader = BufReader::new(stream).take(64 * 1024);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        anyhow::ensure!(
+            reader.read_until(b'\n', &mut line)? > 0,
+            "Missing IMAP STARTTLS response"
+        );
+        let (remaining, response) = Response::from_bytes(&line)
+            .map_err(|_| anyhow::anyhow!("Invalid IMAP STARTTLS response"))?;
+        anyhow::ensure!(remaining.is_empty(), "Invalid IMAP STARTTLS response");
+        match response {
+            Response::Done {
+                tag,
+                status: Status::Ok,
+                ..
+            } if tag.0 == "a1" => {
+                return Ok(reader.into_inner().into_inner());
+            }
+            Response::Done { .. }
+            | Response::Data {
+                status: Status::Bye,
+                ..
+            } => {
+                anyhow::bail!("Incoming mail server refused STARTTLS");
+            }
+            _ => {}
+        }
+    }
 }
 fn login_error(error: imap::error::Error) -> anyhow::Error {
     match error {
@@ -147,16 +185,13 @@ fn folder(name: &str, attrs: &[NameAttribute<'_>]) -> String {
         return "Inbox".into();
     }
     for (special, label) in [
-        ("\\Sent", "Sent"),
-        ("\\Trash", "Trash"),
-        ("\\Junk", "Spam"),
-        ("\\Drafts", "Server Drafts"),
-        ("\\Archive", "Archive"),
+        (NameAttribute::Sent, "Sent"),
+        (NameAttribute::Trash, "Trash"),
+        (NameAttribute::Junk, "Spam"),
+        (NameAttribute::Drafts, "Server Drafts"),
+        (NameAttribute::Archive, "Archive"),
     ] {
-        if attrs
-            .iter()
-            .any(|a| matches!(a,NameAttribute::Custom(s) if s.eq_ignore_ascii_case(special)))
-        {
+        if attrs.contains(&special) {
             return label.into();
         }
     }
@@ -175,14 +210,12 @@ fn destination(name: &str, attrs: &[NameAttribute<'_>], target: &str) -> bool {
         return false;
     }
     let special = match target {
-        "Archive" => "\\Archive",
-        "Trash" => "\\Trash",
-        "Sent" => "\\Sent",
+        "Archive" => NameAttribute::Archive,
+        "Trash" => NameAttribute::Trash,
+        "Sent" => NameAttribute::Sent,
         _ => return false,
     };
-    attrs
-        .iter()
-        .any(|a| matches!(a, NameAttribute::Custom(s) if s.eq_ignore_ascii_case(special)))
+    attrs.contains(&special)
         || match target {
             "Archive" => matches!(name.to_ascii_lowercase().as_str(), "archive" | "archives"),
             "Trash" => matches!(
@@ -450,7 +483,7 @@ pub fn send(p: &Profile, draft: &Draft, raw: &[u8], cancel: &AtomicBool) -> Resu
             .iter()
             .find(|n| destination(n.name(), n.attributes(), "Sent"))
             .context("Sent folder unavailable")?;
-        session.append_with_flags(sent.name(), raw, &[Flag::Seen])?;
+        session.append(sent.name(), raw).flag(Flag::Seen).finish()?;
         let _ = session.logout();
         Ok(())
     })();
@@ -478,11 +511,7 @@ mod tests {
         assert_eq!(decoded.uid, 42);
         assert!(!destination("Clients", &[], "Archive"));
         assert!(destination("Archives", &[], "Archive"));
-        assert!(destination(
-            "Localized",
-            &[NameAttribute::Custom("\\Trash".into())],
-            "Trash"
-        ));
+        assert!(destination("Localized", &[NameAttribute::Trash], "Trash"));
         assert!(!destination("Trash", &[NameAttribute::NoSelect], "Trash"));
     }
     #[test]
@@ -530,7 +559,18 @@ mod tests {
             "test",
         )));
         assert!(crate::service::is_network_error(&timeout));
-        let rejected = login_error(imap::error::Error::No("AUTHENTICATIONFAILED".into()));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        server
+            .write_all(b"a1 NO [AUTHENTICATIONFAILED] Rejected\r\n")
+            .unwrap();
+        let client = imap::Client::new(&mut stream);
+        let (error, _) = client.login("test", "test").unwrap_err();
+        let rejected = login_error(error);
         assert!(rejected.is::<crate::service::ReconnectRequired>());
     }
     #[test]
