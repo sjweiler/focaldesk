@@ -716,7 +716,9 @@ mod tests {
 
 pub(super) fn sample_metrics(data: &VulkanDrmData) {
     for gpu in data.secondary_gpus.values() {
-        gpu.device.metrics.sample_gpu(gpu.failed, data.session_active);
+        gpu.device
+            .metrics
+            .sample_gpu(gpu.failed, data.session_active);
         if let Some(desktop) = &gpu.desktop {
             for output in &desktop.outputs {
                 gpu.device.metrics.display(

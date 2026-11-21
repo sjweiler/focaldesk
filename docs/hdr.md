@@ -16,6 +16,25 @@ link depth, connector colorspace, and HDR static metadata. Vulkan WSI colorspace
 extensions are not involved because KMS, rather than a Vulkan swapchain, owns
 presentation.
 
+## Wallpaper HDR
+
+On the raw Vulkan DRM backend, activating HDR on an output automatically
+enhances SDR wallpapers on that output. A background job sends a reduced
+wallpaper preview to local Ollama at `127.0.0.1:11434`. The vision model scores
+regions for highlight enhancement, and FocalDesk caches the resulting FP16
+wallpaper in memory. SDR outputs use their SDR wallpaper, and native HDR
+wallpapers bypass this analysis.
+
+The default model is `gemma4:12b`. Set `FOCALDESK_WALLPAPER_HDR_MODEL` in the
+session environment to use a different installed Ollama vision model.
+FocalDesk uses conservative Vulkan Auto HDR while analysis is pending or when
+Ollama cannot supply a usable treatment grid.
+
+With info logging enabled, run `journalctl -b -t focaldesk -f | rg --line-buffered 'wallpaper HDR:'`
+and select an SDR wallpaper on an HDR output. The `selected AI-enhanced texture`
+message includes the output name. The `using shader fallback` message includes
+the reason Ollama analysis could not be used.
+
 ## Game Auto HDR
 
 The raw-Ash Vulkan renderer has an opt-in inverse tone-mapping path for SDR

@@ -4228,10 +4228,16 @@ fn persist_theme_editor_document(
     let path = theme_editor_toml_path(path);
     let document = draft.borrow().document();
     let expected = if path.exists() {
-        Some(focaldesk_settings::theme_editor::file_hash(&path).map_err(|error| error.to_string())?)
-    } else { None };
-    let document = focaldesk_settings::theme_editor::save_document(&document, &path, expected.as_deref())
-        .map_err(|error| error.to_string())?;
+        Some(
+            focaldesk_settings::theme_editor::file_hash(&path)
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
+    let document =
+        focaldesk_settings::theme_editor::save_document(&document, &path, expected.as_deref())
+            .map_err(|error| error.to_string())?;
     draft.borrow_mut().wallpaper = document.wallpaper.clone();
     *saved_document.borrow_mut() = document;
     *current_path.borrow_mut() = Some(path);
@@ -5550,7 +5556,9 @@ fn theme_editor_page() -> adw::NavigationPage {
             let dialog = gtk::FileDialog::new();
             dialog.set_title("Save FocalDesk Theme");
             dialog.set_initial_name(Some("theme.toml"));
-            if let Ok(path) = focaldesk_settings::theme_editor::default_save_path(&draft.borrow().document()) {
+            if let Ok(path) =
+                focaldesk_settings::theme_editor::default_save_path(&draft.borrow().document())
+            {
                 if let Some(parent) = path.parent() {
                     if std::fs::create_dir_all(parent).is_ok() {
                         dialog.set_initial_folder(Some(&gtk::gio::File::for_path(parent)));
@@ -5716,14 +5724,19 @@ fn theme_editor_page() -> adw::NavigationPage {
         let current_path = current_path.clone();
         let file_message = file_message.clone();
         save_theme.connect_clicked(move |_| {
-            let path = current_path.borrow().clone().map(Ok).unwrap_or_else(||
-                focaldesk_settings::theme_editor::default_save_path(&draft.borrow().document()));
+            let path = current_path.borrow().clone().map(Ok).unwrap_or_else(|| {
+                focaldesk_settings::theme_editor::default_save_path(&draft.borrow().document())
+            });
             let path = match path {
                 Ok(path) => path,
-                Err(error) => { file_message.set_text(&format!("Save failed: {error}")); return; }
+                Err(error) => {
+                    file_message.set_text(&format!("Save failed: {error}"));
+                    return;
+                }
             };
             if current_path.borrow().is_none() && path.exists() {
-                file_message.set_text("A theme with this name already exists. Open it or choose Save As.");
+                file_message
+                    .set_text("A theme with this name already exists. Open it or choose Save As.");
                 return;
             }
             match persist_theme_editor_document(&draft, &saved_document, &current_path, path) {

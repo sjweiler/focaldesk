@@ -396,11 +396,15 @@ fn role_connectors_from_inventory(
         if configured.iter().any(|saved| saved.connector == name) {
             continue;
         }
-        let discovered_role = if output.get("role").and_then(serde_json::Value::as_str) == Some("ControlPanel") {
-            OutputRole::ControlPanel
-        } else { OutputRole::Normal };
+        let discovered_role =
+            if output.get("role").and_then(serde_json::Value::as_str) == Some("ControlPanel") {
+                OutputRole::ControlPanel
+            } else {
+                OutputRole::Normal
+            };
         if output.get("enabled").and_then(serde_json::Value::as_bool) == Some(true)
-            && discovered_role == role && !connectors.iter().any(|connector| connector == name)
+            && discovered_role == role
+            && !connectors.iter().any(|connector| connector == name)
         {
             connectors.push(name.to_string());
         }
@@ -6092,20 +6096,29 @@ fn rgba(color: [f32; 4]) -> String {
 mod tests {
     #[test]
     fn control_panel_follows_inventory_when_its_gpu_connector_changes() {
-        let configured: Vec<focaldesk_settings_core::OutputConfig> = serde_json::from_value(serde_json::json!([{
-            "connector": "HDMI-A-5", "enabled": true, "role": "ControlPanel",
-            "x": 5, "y": 0, "width": 1920, "height": 1080,
-            "refresh_mhz": 60000, "scale": 1.0, "primary": false
-        }])).unwrap();
+        let configured: Vec<focaldesk_settings_core::OutputConfig> =
+            serde_json::from_value(serde_json::json!([{
+                "connector": "HDMI-A-5", "enabled": true, "role": "ControlPanel",
+                "x": 5, "y": 0, "width": 1920, "height": 1080,
+                "refresh_mhz": 60000, "scale": 1.0, "primary": false
+            }]))
+            .unwrap();
         let inventory = serde_json::json!([
             {"name": "HDMI-A-5", "enabled": false, "role": "ControlPanel"},
             {"name": "HDMI-A-1", "enabled": true, "role": "ControlPanel"},
             {"name": "DP-3", "enabled": true, "role": "Normal"}
         ]);
-        let companions = super::role_connectors_from_inventory(&configured, Some(&inventory), focaldesk_settings_core::OutputRole::ControlPanel);
+        let companions = super::role_connectors_from_inventory(
+            &configured,
+            Some(&inventory),
+            focaldesk_settings_core::OutputRole::ControlPanel,
+        );
         assert!(companions.iter().any(|connector| connector == "HDMI-A-1"));
         assert!(!companions.iter().any(|connector| connector == "DP-3"));
-        assert_eq!(super::normal_connectors_from_inventory(&configured, Some(&inventory)), vec!["DP-3"]);
+        assert_eq!(
+            super::normal_connectors_from_inventory(&configured, Some(&inventory)),
+            vec!["DP-3"]
+        );
     }
 
     #[test]

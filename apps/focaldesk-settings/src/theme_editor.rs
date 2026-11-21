@@ -232,29 +232,47 @@ pub fn save_document(
 ) -> Result<ThemeDocument> {
     validate(document)?;
     // Check conflicts before creating any assets.
-    let current = if path.exists() { Some(file_hash(path)?) } else { None };
+    let current = if path.exists() {
+        Some(file_hash(path)?)
+    } else {
+        None
+    };
     if current.as_deref() != expected {
         bail!("The destination changed or already exists. Reopen it before overwriting.");
     }
     let parent = path.parent().context("Missing destination directory")?;
     let mut saved = document.clone();
-    if document.wallpaper.path.is_some() {
+    if let Some(wallpaper_path) = &document.wallpaper.path {
         let package = ThemePackage::from_document(document)?;
         let asset = &package.assets[0];
-        let extension = Path::new(&asset.path).extension().unwrap().to_str().unwrap();
+        let extension = Path::new(&asset.path)
+            .extension()
+            .unwrap()
+            .to_str()
+            .unwrap();
         // Content-addressed names keep a failed or stale save from changing the
         // wallpaper referenced by the previous document.
         let destination = parent.join(format!("wallpaper-{}.{}", asset.sha256, extension));
         fs::create_dir_all(parent)?;
-        let bytes = fs::read(document.wallpaper.path.as_ref().unwrap())?;
-        if bytes.len() as u64 != asset.size || format!("{:x}", Sha256::digest(&bytes)) != asset.sha256 {
+        let bytes = fs::read(wallpaper_path)?;
+        if bytes.len() as u64 != asset.size
+            || format!("{:x}", Sha256::digest(&bytes)) != asset.sha256
+        {
             bail!("The wallpaper changed while saving. Try again.");
         }
-        match fs::OpenOptions::new().write(true).create_new(true).open(&destination) {
-            Ok(mut file) => { file.write_all(&bytes)?; file.sync_all()?; }
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination)
+        {
+            Ok(mut file) => {
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 if fs::symlink_metadata(&destination)?.file_type().is_symlink()
-                    || fs::read(&destination)? != bytes {
+                    || fs::read(&destination)? != bytes
+                {
                     bail!("The saved wallpaper asset was modified.");
                 }
             }
@@ -395,7 +413,9 @@ pub fn file_action(action: FileAction) -> Result<EditorDocument> {
                 .context("The user data directory is unavailable")?
                 .join("focaldesk/themes");
             if root.join(&package.slug).exists() && !overwrite {
-                bail!("A theme with this package name is already installed. Confirm replacement to continue.");
+                bail!(
+                    "A theme with this package name is already installed. Confirm replacement to continue."
+                );
             }
             let installed = package.install(&root)?;
             file_action(FileAction::Open {
@@ -415,9 +435,25 @@ pub fn runtime(command: Option<ThemeEditorCommand>) -> Result<RuntimeStatus> {
         },
     };
     match send_desktop_request(&request).map_err(anyhow::Error::msg)? {
-        IpcResponse::ThemeEditorStatus {protocol_version,preview_active,applied_revision,gradient_rendering,semantic_rendering,contrast_issue_count,..} if protocol_version==THEME_EDITOR_PROTOCOL_VERSION=>Ok(RuntimeStatus {preview_active,applied_revision,gradient_rendering,semantic_rendering,contrast_issue_count}),
-        IpcResponse::Error {message}=>bail!(message),
-        _=>bail!("The running compositor does not support this theme editor. Rebuild and restart FocalDesk."),
+        IpcResponse::ThemeEditorStatus {
+            protocol_version,
+            preview_active,
+            applied_revision,
+            gradient_rendering,
+            semantic_rendering,
+            contrast_issue_count,
+            ..
+        } if protocol_version == THEME_EDITOR_PROTOCOL_VERSION => Ok(RuntimeStatus {
+            preview_active,
+            applied_revision,
+            gradient_rendering,
+            semantic_rendering,
+            contrast_issue_count,
+        }),
+        IpcResponse::Error { message } => bail!(message),
+        _ => bail!(
+            "The running compositor does not support this theme editor. Rebuild and restart FocalDesk."
+        ),
     }
 }
 pub fn convert_color(color: ThemeColor, space: ThemeColorSpace) -> Result<ThemeColor> {
@@ -435,11 +471,15 @@ mod tests {
     fn saves_wallpaper_with_theme_and_preserves_previous_assets_on_conflict() {
         let root = tempfile::tempdir().unwrap();
         let original = root.path().join("original.png");
-        image::RgbImage::from_pixel(2, 2, image::Rgb([30, 80, 140])).save(&original).unwrap();
+        image::RgbImage::from_pixel(2, 2, image::Rgb([30, 80, 140]))
+            .save(&original)
+            .unwrap();
         let mut document = default_document().unwrap().document;
         document.name = "My New Theme".into();
         document.wallpaper.path = Some(original.to_string_lossy().into_owned());
-        assert!(default_save_path(&document).unwrap().ends_with("focaldesk/themes/my-new-theme/theme.toml"));
+        assert!(default_save_path(&document)
+            .unwrap()
+            .ends_with("focaldesk/themes/my-new-theme/theme.toml"));
         let path = root.path().join("themes/my-new-theme/theme.toml");
         let saved = save_document(&document, &path, None).unwrap();
         let wallpaper = PathBuf::from(saved.wallpaper.path.as_ref().unwrap());
@@ -449,7 +489,10 @@ mod tests {
         assert_eq!(ThemeDocument::load(&path).unwrap(), saved);
         assert!(save_document(&saved, &path, None).is_err());
         let expected = file_hash(&path).unwrap();
-        assert_eq!(save_document(&saved, &path, Some(&expected)).unwrap(), saved);
+        assert_eq!(
+            save_document(&saved, &path, Some(&expected)).unwrap(),
+            saved
+        );
         let mut without_wallpaper = saved;
         without_wallpaper.wallpaper.path = None;
         save_document(&without_wallpaper, &path, Some(&expected)).unwrap();
@@ -461,10 +504,15 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("preview.png");
         image::RgbImage::from_pixel(2, 2, image::Rgb([30, 80, 140]))
-            .save(&path).unwrap();
+            .save(&path)
+            .unwrap();
         let mut document = default_document().unwrap().document;
         document.wallpaper.path = Some(path.to_string_lossy().into_owned());
-        assert!(project(&document).unwrap().wallpaper.unwrap().starts_with("data:image/jpeg;base64,"));
+        assert!(project(&document)
+            .unwrap()
+            .wallpaper
+            .unwrap()
+            .starts_with("data:image/jpeg;base64,"));
         document.wallpaper.path = None;
         assert!(project(&document).unwrap().wallpaper.is_none());
     }

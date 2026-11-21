@@ -186,7 +186,7 @@ fn public_flow(flow: CalendarOAuthSnapshot, account_id: String, url: bool) -> Pu
         ),
         "error" => (
             "error",
-            flow.message.as_deref().unwrap_or("Sign-in failed or expired. Check your application configuration and try again."),
+            "Sign-in failed or expired. Check your application configuration and try again.",
         ),
         _ => (
             "waiting_for_browser",

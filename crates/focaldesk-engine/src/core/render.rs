@@ -1057,11 +1057,11 @@ impl Default for RenderState {
     }
 }
 
-struct HdrWallpaper {
-    width: u32,
-    height: u32,
+pub(crate) struct HdrWallpaper {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
     /// Native-endian IEEE 754 binary16 RGBA pixels in scene-linear Rec.709.
-    pixels: Vec<u8>,
+    pub(crate) pixels: Vec<u8>,
 }
 
 /// Decode a standards-tagged HDR PNG directly rather than letting a generic
@@ -1070,7 +1070,7 @@ struct HdrWallpaper {
 /// PNG HDR is defined by 16-bit RGB/RGBA samples and cICP PQ or HLG transfer
 /// characteristics. Other PNGs deliberately return `None` so their mature SDR
 /// path remains unchanged.
-fn decode_hdr_wallpaper(path: &str) -> Option<HdrWallpaper> {
+pub(crate) fn decode_hdr_wallpaper(path: &str) -> Option<HdrWallpaper> {
     decode_hdr_png(path)
 }
 

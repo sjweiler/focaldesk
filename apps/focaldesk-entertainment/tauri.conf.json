@@ -1,0 +1,13 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "FocalDesk Entertainment",
+  "version": "0.1.0",
+  "identifier": "com.focaldesk.entertainment",
+  "build": { "frontendDist": "ui" },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [{ "title": "FocalDesk Entertainment", "width": 1320, "height": 900, "minWidth": 420, "minHeight": 540 }],
+    "security": { "csp": "default-src 'self'; img-src 'self'; style-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost" }
+  },
+  "bundle": { "active": false }
+}

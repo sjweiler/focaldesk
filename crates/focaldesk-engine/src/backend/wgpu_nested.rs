@@ -59,6 +59,9 @@ use crate::core::color::{SurfaceColorRenderState, TransferFunction};
 use crate::core::BackendEvent;
 use focaldesk_input::{InputEvent, KeyState, Modifiers, MouseButton, ScrollDelta};
 
+#[cfg(feature = "drm-vulkan")]
+mod wallpaper_hdr;
+
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Default)]
@@ -79,6 +82,16 @@ struct WgpuShellAssets {
 struct OutputWallpaper {
     path: Option<String>,
     asset: Option<WgpuWallpaper>,
+    #[cfg(feature = "drm-vulkan")]
+    hdr: Option<WallpaperHdr>,
+}
+
+#[cfg(feature = "drm-vulkan")]
+struct WallpaperHdr {
+    key: u64,
+    job: Option<std::sync::mpsc::Receiver<Option<Vec<u8>>>>,
+    pixels: Option<Vec<u8>>,
+    uploaded: bool,
 }
 
 struct WgpuSceneDesktop<'a> {
@@ -117,6 +130,9 @@ impl VulkanSceneBuilder {
         renderer: &mut focaldesk_render::AshDrmRenderer,
     ) {
         for wallpaper in self.assets.wallpapers.values_mut() {
+            if let Some(hdr) = wallpaper.hdr.as_mut().filter(|hdr| hdr.uploaded) {
+                hdr.uploaded = renderer.keep_uploaded_texture(hdr.key);
+            }
             let Some(asset) = wallpaper.asset.as_ref() else {
                 continue;
             };
@@ -125,6 +141,32 @@ impl VulkanSceneBuilder {
                 // rebuild the asset when its output next needs a scene.
                 wallpaper.path = None;
                 wallpaper.asset = None;
+            }
+        }
+    }
+
+    #[cfg(feature = "drm-vulkan")]
+    pub(crate) fn poll_wallpaper_hdr(
+        &mut self,
+        state: &mut crate::core::desktop::DesktopState,
+    ) {
+        for (&output_id, wallpaper) in &mut self.assets.wallpapers {
+            let Some(hdr) = wallpaper.hdr.as_mut() else {
+                continue;
+            };
+            match hdr.job.as_ref().map(|job| job.try_recv()) {
+                Some(Ok(pixels)) => {
+                    hdr.job = None;
+                    hdr.pixels = pixels;
+                    if hdr.pixels.is_some() {
+                        state.mark_output_full_damage(
+                            output_id,
+                            crate::core::desktop::DamageSource::Unknown,
+                        );
+                    }
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => hdr.job = None,
+                _ => {}
             }
         }
     }
@@ -1710,6 +1752,20 @@ fn append_wallpaper_quads(
     if wallpaper.path != path {
         wallpaper.path.clone_from(&path);
         wallpaper.asset = path.as_deref().and_then(|path| {
+            #[cfg(feature = "drm-vulkan")]
+            if let Some(native) = crate::core::render::decode_hdr_wallpaper(path) {
+                return Some(WgpuWallpaper {
+                    cache_key: hashed_cache_key(2, &path),
+                    width: native.width,
+                    height: native.height,
+                    pending_pixels: Some(native.pixels),
+                    format: FramePixelFormat::Rgba16FloatLinear,
+                    color_transform: TextureColorTransform {
+                        transfer: FrameTransferFunction::Linear,
+                        ..Default::default()
+                    },
+                });
+            }
             let image = match image::open(path) {
                 Ok(image) => image,
                 Err(error) => {
@@ -1816,6 +1872,73 @@ fn append_wallpaper_quads(
         dim * ((1.0 - tint[3]) + tint[2] * tint[3]),
         1.0,
     ];
+    #[cfg(feature = "drm-vulkan")]
+    let mut enhanced = None;
+    #[cfg(not(feature = "drm-vulkan"))]
+    let mut enhanced: Option<WgpuWallpaper> = None;
+    #[cfg(feature = "drm-vulkan")]
+    let mut fallback = None;
+    #[cfg(not(feature = "drm-vulkan"))]
+    let fallback: Option<AutoHdrParams> = None;
+    #[cfg(feature = "drm-vulkan")]
+    if output_state.hdr_requested
+        && output_state.hdr_supported
+        && output_state.hdr_kms_applied
+        && asset.format == FramePixelFormat::Rgba8Srgb
+    {
+        let appearance = output_state.hdr_appearance.validate().unwrap_or_default();
+        let max_gain = (appearance.peak_nits / appearance.reference_white_nits).clamp(1.0, 2.0);
+        if max_gain > 1.0 {
+            let key = hashed_cache_key(12, &(output_id, asset.cache_key, max_gain.to_bits()));
+            if wallpaper.hdr.as_ref().is_none_or(|hdr| hdr.key != key) {
+                wallpaper.hdr = Some(WallpaperHdr {
+                    key,
+                    job: path.clone().and_then(|path| {
+                        wallpaper_hdr::start(path, (asset.width, asset.height), max_gain)
+                    }),
+                    pixels: None,
+                    uploaded: false,
+                });
+            }
+            let hdr = wallpaper.hdr.as_mut().unwrap();
+            if let Some(pixels) = hdr.pixels.as_ref() {
+                enhanced = Some(WgpuWallpaper {
+                    cache_key: hdr.key,
+                    width: asset.width,
+                    height: asset.height,
+                    pending_pixels: (!hdr.uploaded).then(|| pixels.clone()),
+                    format: FramePixelFormat::Rgba16FloatLinear,
+                    color_transform: TextureColorTransform {
+                        transfer: FrameTransferFunction::Linear,
+                        source_peak_nits: appearance.reference_white_nits * max_gain,
+                        ..Default::default()
+                    },
+                });
+                if !hdr.uploaded && !blits.is_empty() {
+                    info!(
+                        target: "focaldesk",
+                        output = %output_state.handle.name(),
+                        wallpaper = path.as_deref().unwrap_or_default(),
+                        "wallpaper HDR: selected AI-enhanced texture"
+                    );
+                    hdr.uploaded = true;
+                }
+            } else {
+                fallback = Some(AutoHdrParams {
+                    sdr_nits: appearance.reference_white_nits,
+                    target_nits: appearance.reference_white_nits * max_gain.min(1.3),
+                    scene_reference_nits: appearance.reference_white_nits,
+                    gamut_wideness: 0.0,
+                });
+            }
+        }
+    }
+    let asset = enhanced.as_mut().unwrap_or(asset);
+    let mut color_transform = asset.color_transform;
+    if let Some(fallback) = fallback {
+        color_transform.auto_hdr = Some(fallback);
+        color_transform.source_peak_nits = fallback.target_nits;
+    }
     let upload_pending = asset.pending_pixels.is_some();
     for (index, blit) in blits.into_iter().enumerate() {
         let destination = Rectangle::<i32, Logical>::from_loc_and_size(
@@ -1840,7 +1963,7 @@ fn append_wallpaper_quads(
                 },
             ),
             format: asset.format,
-            color_transform: asset.color_transform,
+            color_transform,
             dmabuf: None,
             damage: if index == 0 && upload_pending {
                 vec![[0, 0, asset.width, asset.height]]
@@ -1897,7 +2020,7 @@ fn append_wallpaper_quads(
                         },
                     ),
                     format: asset.format,
-                    color_transform: asset.color_transform,
+                    color_transform,
                     dmabuf: None,
                     damage: Vec::new(),
                     destination: [
@@ -1928,7 +2051,7 @@ fn append_wallpaper_quads(
                         },
                     ),
                     format: asset.format,
-                    color_transform: asset.color_transform,
+                    color_transform,
                     dmabuf: None,
                     damage: Vec::new(),
                     destination: [

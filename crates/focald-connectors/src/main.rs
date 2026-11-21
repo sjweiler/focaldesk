@@ -1156,7 +1156,9 @@ fn complete_microsoft_oauth(
                 Some(format!("{code}: {description}"))
             })
             .unwrap_or_else(|| "Microsoft did not provide an error description".into());
-        Err(anyhow!("Microsoft token request failed ({status}): {detail}"))
+        Err(anyhow!(
+            "Microsoft token request failed ({status}): {detail}"
+        ))
     };
     let token = match token_result {
         Ok(token) => token,

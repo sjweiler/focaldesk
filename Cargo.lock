@@ -406,8 +406,6 @@ version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f3f79755c74fd155000314eb349864caa787c6592eace6c6882dad873d9c39"
 dependencies = [
- "async-fs 2.2.0",
- "async-net",
  "enumflags2",
  "futures-channel",
  "futures-util",
@@ -608,17 +606,6 @@ dependencies = [
  "event-listener 5.4.1",
  "event-listener-strategy",
  "pin-project-lite",
-]
-
-[[package]]
-name = "async-net"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b948000fad4873c1c9339d60f2623323a0cfd3816e5181033c6a5cb68b2accf7"
-dependencies = [
- "async-io 2.6.0",
- "blocking",
- "futures-lite 2.6.1",
 ]
 
 [[package]]
@@ -3497,6 +3484,7 @@ dependencies = [
  "accesskit_unix 0.22.1",
  "anyhow",
  "ash",
+ "base64 0.22.1",
  "bitflags 2.11.0",
  "calloop 0.12.4",
  "chrono",
@@ -3543,6 +3531,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "ureq",
  "vui-ash",
  "vui-core",
  "vui-text",
@@ -3554,6 +3543,15 @@ dependencies = [
  "winit 0.30.13",
  "zbus 3.15.2",
  "zeroize",
+]
+
+[[package]]
+name = "focaldesk-entertainment"
+version = "0.1.0"
+dependencies = [
+ "tauri",
+ "tauri-build",
+ "url",
 ]
 
 [[package]]

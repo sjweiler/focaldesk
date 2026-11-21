@@ -48,8 +48,8 @@ use smithay::wayland::drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjState};
 use super::common::{
     bootstrap_compositor_core, client_state_from_stream, is_nonfatal_wayland_io_error,
     physical_size_mm_from_pixels, pump_desktop_services, refresh_portal_services,
-    restart_shell_surfaces_after_gpu_reset, spawn_session_sleep_watch, stop_focaldesk_session_target,
-    NestedDesktop, SessionSleepEvent,
+    restart_shell_surfaces_after_gpu_reset, spawn_session_sleep_watch,
+    stop_focaldesk_session_target, NestedDesktop, SessionSleepEvent,
 };
 #[cfg(feature = "xwayland")]
 use super::common::{finish_xwayland_startup, start_xwayland};
@@ -2848,6 +2848,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         crate::core::portal::remove_dead_portal_sessions(&mut data.desktop.state);
         data.desktop.display.flush_clients()?;
         data.desktop.state.materialize_full_redraw_damage();
+        data.scene_builder.poll_wallpaper_hdr(&mut data.desktop.state);
         gpu::render_secondary_desktops(&mut data, gpu_ready);
         if !gpu_ready {
             continue;
@@ -3509,10 +3510,9 @@ fn publish_metrics(data: &mut VulkanDrmData) {
         return;
     }
     data.metrics.begin_sample();
-    data.primary_gpu.metrics.sample_gpu(
-        !data.primary_gpu.renderer.is_usable(),
-        data.session_active,
-    );
+    data.primary_gpu
+        .metrics
+        .sample_gpu(!data.primary_gpu.renderer.is_usable(), data.session_active);
     for output in &data.outputs {
         data.primary_gpu.metrics.display(
             &output.name,

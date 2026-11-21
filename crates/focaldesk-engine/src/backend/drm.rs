@@ -3877,11 +3877,9 @@ pub(crate) fn translate_backend_input_event_for_output<B: smithay::backend::inpu
     // Do not guess when multiple panels exist: that needs explicit device
     // mapping.
     let output_id = match input {
-        InputEvent::TouchDown { .. } | InputEvent::TouchMotion { .. } => {
-            touch_output
-                .or_else(|| state.sole_control_panel_output())
-                .unwrap_or(pointer_output)
-        }
+        InputEvent::TouchDown { .. } | InputEvent::TouchMotion { .. } => touch_output
+            .or_else(|| state.sole_control_panel_output())
+            .unwrap_or(pointer_output),
         _ => pointer_output,
     };
     let scale = state

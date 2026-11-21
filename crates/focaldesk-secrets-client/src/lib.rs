@@ -37,7 +37,11 @@ pub fn delete(key: &str) -> Result<()> {
     let path = socket_path()?;
     let mut stream = match UnixStream::connect(&path) {
         Ok(stream) => stream,
-        Err(error) => return secret_service_delete(key).context("connect to Focaldesk broker or desktop Secret Service") .map_err(|e| anyhow!("{} (broker socket {}: {})", e, path.display(), error)),
+        Err(error) => {
+            return secret_service_delete(key)
+                .context("connect to Focaldesk broker or desktop Secret Service")
+                .map_err(|e| anyhow!("{} (broker socket {}: {})", e, path.display(), error));
+        }
     };
     let request = Zeroizing::new(serde_json::to_vec(&Request::Delete { key })?);
     write_frame(&mut stream, &request)?;
@@ -166,12 +170,20 @@ fn secret_service_get(key: &str) -> Result<Zeroizing<String>> {
     let output = std::process::Command::new("secret-tool")
         .args(["lookup", "focaldesk-key", key])
         .output()
-        .context("launch secret-tool (install libsecret-tools and enable KDE Wallet Secret Service)")?;
+        .context(
+            "launch secret-tool (install libsecret-tools and enable KDE Wallet Secret Service)",
+        )?;
     if !output.status.success() {
-        bail!("Secret Service lookup failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+        bail!(
+            "Secret Service lookup failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
-    let value = String::from_utf8(output.stdout).context("Secret Service returned non-UTF-8 data")?;
-    Ok(Zeroizing::new(value.trim_end_matches(['\r', '\n']).to_owned()))
+    let value =
+        String::from_utf8(output.stdout).context("Secret Service returned non-UTF-8 data")?;
+    Ok(Zeroizing::new(
+        value.trim_end_matches(['\r', '\n']).to_owned(),
+    ))
 }
 
 fn secret_service_set(key: &str, value: &str, label: &str) -> Result<()> {
@@ -181,12 +193,21 @@ fn secret_service_set(key: &str, value: &str, label: &str) -> Result<()> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .context("launch secret-tool (install libsecret-tools and enable KDE Wallet Secret Service)")?;
+        .context(
+            "launch secret-tool (install libsecret-tools and enable KDE Wallet Secret Service)",
+        )?;
     use std::io::Write as _;
-    child.stdin.take().context("open secret-tool input")?.write_all(value.as_bytes())?;
+    child
+        .stdin
+        .take()
+        .context("open secret-tool input")?
+        .write_all(value.as_bytes())?;
     let output = child.wait_with_output()?;
     if !output.status.success() {
-        bail!("Secret Service store failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+        bail!(
+            "Secret Service store failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     Ok(())
 }
@@ -195,9 +216,14 @@ fn secret_service_delete(key: &str) -> Result<()> {
     let output = std::process::Command::new("secret-tool")
         .args(["clear", "focaldesk-key", key])
         .output()
-        .context("launch secret-tool (install libsecret-tools and enable KDE Wallet Secret Service)")?;
+        .context(
+            "launch secret-tool (install libsecret-tools and enable KDE Wallet Secret Service)",
+        )?;
     if !output.status.success() {
-        bail!("Secret Service delete failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+        bail!(
+            "Secret Service delete failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     Ok(())
 }

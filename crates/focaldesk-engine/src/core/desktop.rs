@@ -11380,10 +11380,18 @@ impl DesktopState {
             #[cfg(feature = "xwayland")]
             PointerFocusTarget::Xwayland(surface) => {
                 let pid = surface.get_client_pid().map_err(|e| e.to_string())?;
-                let server_pid = self.xwayland_client.as_ref()
+                let server_pid = self
+                    .xwayland_client
+                    .as_ref()
                     .ok_or("XWayland client unavailable")?
-                    .get_credentials(&self.display_handle).map_err(|e| e.to_string())?.pid;
-                if pid <= 1 || pid > i32::MAX as u32 || pid == std::process::id() || pid == server_pid as u32 {
+                    .get_credentials(&self.display_handle)
+                    .map_err(|e| e.to_string())?
+                    .pid;
+                if pid <= 1
+                    || pid > i32::MAX as u32
+                    || pid == std::process::id()
+                    || pid == server_pid as u32
+                {
                     return Err("Refusing to terminate a desktop server process".into());
                 }
                 if unsafe { libc::kill(pid as i32, libc::SIGKILL) } != 0 {
@@ -11394,13 +11402,24 @@ impl DesktopState {
                 // Only application windows are selectable; desktop layers are excluded.
                 let mut root = surface.clone();
                 loop {
-                    if self.window_id_for_wl_surface(&root).is_some() { break; }
-                    let Some(parent) = get_parent(&root) else { return Ok(()); };
+                    if self.window_id_for_wl_surface(&root).is_some() {
+                        break;
+                    }
+                    let Some(parent) = get_parent(&root) else {
+                        return Ok(());
+                    };
                     root = parent;
                 }
-                let client = self.display_handle.get_client(surface.id()).map_err(|e| e.to_string())?;
+                let client = self
+                    .display_handle
+                    .get_client(surface.id())
+                    .map_err(|e| e.to_string())?;
                 #[cfg(feature = "xwayland")]
-                if self.xwayland_client.as_ref().is_some_and(|server| server.id() == client.id()) {
+                if self
+                    .xwayland_client
+                    .as_ref()
+                    .is_some_and(|server| server.id() == client.id())
+                {
                     return Err("Refusing to disconnect the XWayland server".into());
                 }
                 self.display_handle.backend_handle().kill_client(
@@ -11607,7 +11626,9 @@ impl DesktopState {
         } = prepared;
 
         if self.kill_selection {
-            if self.lock_screen.active || (sym == keysyms::KEY_Escape && matches!(state, KeyState::Pressed)) {
+            if self.lock_screen.active
+                || (sym == keysyms::KEY_Escape && matches!(state, KeyState::Pressed))
+            {
                 self.kill_selection = false;
                 self.update_pointer_cursor(self.pointer_pos);
             }

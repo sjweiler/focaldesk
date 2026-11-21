@@ -89,8 +89,8 @@ impl SessionCipher {
             None => (Vec::new(), plaintext.to_vec()),
             Some(key) => {
                 let iv = Aes128CbcEnc::generate_iv(rand::rngs::OsRng);
-                let ct = Aes128CbcEnc::new(key.into(), &iv)
-                    .encrypt_padded_vec_mut::<Pkcs7>(plaintext);
+                let ct =
+                    Aes128CbcEnc::new(key.into(), &iv).encrypt_padded_vec_mut::<Pkcs7>(plaintext);
                 (iv.to_vec(), ct)
             }
         }
