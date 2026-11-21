@@ -518,6 +518,8 @@ mod tests {
     fn starttls_refusal_never_transmits_credentials() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        let password = format!("{:032x}", rand::random::<u128>());
+        let expected_password = password.clone();
         let worker = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
@@ -528,13 +530,13 @@ mod tests {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             assert!(line.contains("STARTTLS"));
-            assert!(!line.contains("secret-password"));
+            assert!(!line.contains(&expected_password));
             let tag = line.split_whitespace().next().unwrap();
             writeln!(stream, "{tag} NO TLS unavailable\r").unwrap();
             let mut rest = String::new();
             let _ = reader.read_line(&mut rest);
             assert!(!rest.contains("LOGIN"));
-            assert!(!rest.contains("secret-password"));
+            assert!(!rest.contains(&expected_password));
         });
         let p = Profile {
             email: "me@example.com".into(),
@@ -546,7 +548,7 @@ mod tests {
             smtp_host: "smtp.example.com".into(),
             ..Default::default()
         };
-        assert!(session(&p, "secret-password").is_err());
+        assert!(session(&p, &password).is_err());
         worker.join().unwrap();
     }
     #[test]
