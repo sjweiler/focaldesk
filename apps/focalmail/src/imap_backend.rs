@@ -11,7 +11,7 @@ use imap::types::{Flag, NameAttribute};
 use std::{
     net::{TcpStream, ToSocketAddrs},
     sync::{atomic::AtomicBool, Arc},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 type Session = imap::Session<native_tls::TlsStream<TcpStream>>;
 fn entry(email: &str) -> Result<keyring::Entry> {
@@ -564,7 +564,14 @@ mod tests {
             smtp_security: Security::StartTls,
             ..Default::default()
         };
-        assert!(smtp(&p, "secret-password")
+        let test_password = format!(
+            "pw-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        assert!(smtp(&p, &test_password)
             .unwrap()
             .test_connection()
             .is_err());
