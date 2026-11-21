@@ -5,6 +5,7 @@ umask 077
 state=$1
 runtime=$2
 snapshot=$3
+vector_snapshot=${4:-}
 export SNMP_PERSISTENT_DIR="$state/state"
 test -r "$SNMP_PERSISTENT_DIR/snmpd.conf"
 
@@ -70,11 +71,19 @@ agent=$!
 ) &
 watcher=$!
 
+children=("$master" "$agent" "$watcher")
+if [[ -n "$vector_snapshot" && -r "$state/focal-vector-agentx.py" ]]; then
+    /usr/bin/python3 "$state/focal-vector-agentx.py" \
+        --socket "$runtime/agentx.sock" --snapshot-socket "$vector_snapshot" \
+        --registry "$state/vector-indexes.sqlite3" &
+    children+=("$!")
+fi
+
 cleanup() {
-    kill "$agent" "$master" "$watcher" 2>/dev/null || true
-    wait "$agent" "$master" "$watcher" 2>/dev/null || true
+    kill "${children[@]}" 2>/dev/null || true
+    wait "${children[@]}" 2>/dev/null || true
 }
 trap cleanup EXIT
 trap 'exit 0' TERM INT
-wait -n "$master" "$agent" "$watcher" || true
+wait -n "${children[@]}" || true
 exit 1

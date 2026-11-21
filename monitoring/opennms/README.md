@@ -52,6 +52,19 @@ render a profile with `--sys-object-id`. Keep the lab source in a separate
 profile or replace it during migration, and keep lab collection history
 separate from production history.
 
+## FocalVector collection and graphs
+
+Import [focalvector.xml](focalvector.xml) as a source into the same SNMP
+collection profile as the production FocalDesk source. Both sources match
+the FocalDesk master’s `sysObjectID.0`. Install
+[focalvector-graph.properties](focalvector-graph.properties) in
+`${OPENNMS_HOME}/etc/snmp-graph.properties.d/`.
+
+On the FocalDesk node’s **Resource Graphs** page, select a **FocalVector
+Collection** to see vector count, completed and failed queries per second,
+and average query latency. Rate and latency graphs need consecutive polls.
+Latency is blank during intervals without queries.
+
 ## Rootless Podman bridge
 
 For a bridged OpenNMS container, discover its gateway and start the lab in

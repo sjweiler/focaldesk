@@ -8,6 +8,7 @@ ExecStart=%h/.local/bin/focal-server
 Restart=on-failure
 RestartSec=2
 Environment=FOCAL_VECTOR_SOCKET=%t/focaldesk/focal-vector.sock
+Environment=FOCAL_SNMP_SNAPSHOT_SOCKET=%t/focaldesk/focal-vector-stats.sock
 Environment=FOCAL_DATA_DIR=%h/.local/share/focaldesk/vector
 Environment=RAYON_NUM_THREADS=4
 Environment=FOCAL_MAX_CONCURRENT_OPERATIONS=4

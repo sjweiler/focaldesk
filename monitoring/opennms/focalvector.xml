@@ -1,0 +1,35 @@
+<datacollection-group xmlns="http://xmlns.opennms.org/xsd/config/datacollection" name="FocalVector">
+  <resourceType name="focalVectorCollection" label="FocalVector Collection" resourceLabel="Collection ${index}">
+    <persistenceSelectorStrategy class="org.opennms.netmgt.collection.support.PersistAllSelectorStrategy"/>
+    <storageStrategy class="org.opennms.netmgt.collection.support.IndexStorageStrategy"/>
+  </resourceType>
+  <resourceType name="focalVectorIndex" label="FocalVector Index" resourceLabel="Index ${index}">
+    <persistenceSelectorStrategy class="org.opennms.netmgt.collection.support.PersistAllSelectorStrategy"/>
+    <storageStrategy class="org.opennms.netmgt.collection.support.IndexStorageStrategy"/>
+  </resourceType>
+  <group name="focalvector-daemon" ifType="ignore">
+    <mibObj oid=".1.3.6.1.4.1.67726.2.1.1.1" instance="0" alias="fvUptime" type="gauge"/>
+    <mibObj oid=".1.3.6.1.4.1.67726.2.1.1.2" instance="0" alias="fvEpoch" type="string"/>
+  </group>
+  <group name="focalvector-collection" ifType="all">
+    <mibObj oid=".1.3.6.1.4.1.67726.2.1.2.1.3" instance="focalVectorCollection" alias="fvVectorCount" type="gauge"/>
+    <mibObj oid=".1.3.6.1.4.1.67726.2.1.2.1.4" instance="focalVectorCollection" alias="fvDimensions" type="gauge"/>
+    <mibObj oid=".1.3.6.1.4.1.67726.2.1.2.1.5" instance="focalVectorCollection" alias="fvQueries" type="Counter64"/>
+    <mibObj oid=".1.3.6.1.4.1.67726.2.1.2.1.6" instance="focalVectorCollection" alias="fvFailures" type="Counter64"/>
+    <mibObj oid=".1.3.6.1.4.1.67726.2.1.2.1.7" instance="focalVectorCollection" alias="fvQueryUs" type="Counter64"/>
+    <mibObj oid=".1.3.6.1.4.1.67726.2.1.2.1.8" instance="focalVectorCollection" alias="fvSamples" type="Counter64"/>
+  </group>
+  <group name="focalvector-index" ifType="all">
+    <mibObj oid=".1.3.6.1.4.1.67726.2.1.3.1.4" instance="focalVectorIndex" alias="fvIndexKind" type="gauge"/>
+    <mibObj oid=".1.3.6.1.4.1.67726.2.1.3.1.5" instance="focalVectorIndex" alias="fvIndexState" type="gauge"/>
+    <mibObj oid=".1.3.6.1.4.1.67726.2.1.3.1.10" instance="focalVectorIndex" alias="fvCudaEnabled" type="gauge"/>
+  </group>
+  <systemDef name="FocalVector on FocalDesk">
+    <sysoid>.1.3.6.1.4.1.67726.1.1</sysoid>
+    <collect>
+      <includeGroup>focalvector-daemon</includeGroup>
+      <includeGroup>focalvector-collection</includeGroup>
+      <includeGroup>focalvector-index</includeGroup>
+    </collect>
+  </systemDef>
+</datacollection-group>

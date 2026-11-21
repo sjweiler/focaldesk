@@ -5,4 +5,5 @@ master agentx
 agentXPerms 0600 0700
 view focaldeskView included .1.3.6.1.2.1.1
 view focaldeskView included .1.3.6.1.4.1.67726.1.1
+view focaldeskView included .1.3.6.1.4.1.67726.2.1
 rouser focalLab priv -V focaldeskView

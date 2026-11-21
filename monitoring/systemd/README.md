@@ -65,3 +65,28 @@ systemctl --user status focaldesk-snmp-67726.service
 For startup before login, enable user-manager lingering through systemd if your
 account does not already have it. The compositor must be running before fresh
 metrics are available.
+
+## FocalVector polling
+
+Use a `focal-server` build that supports `FOCAL_SNMP_SNAPSHOT_SOCKET`. The
+packaged FocalVector units set it to `%t/focaldesk/focal-vector-stats.sock`.
+Update the installed FocalVector unit and SNMP launcher and unit, then install
+the adapter from the FocalVector checkout into the same state directory:
+
+```sh
+install -m 600 ../focal-vector/monitoring/focal-vector-agentx.py "$state/"
+```
+
+For an existing SNMP deployment, add the following line to
+`$state/master.conf` using the view assigned to your SNMPv3 polling user:
+
+```text
+view focaldeskView included .1.3.6.1.4.1.67726.2.1
+```
+
+Reload the systemd user units and restart the active FocalVector unit and
+`focaldesk-snmp-67726.service`. Load `FOCALVECTOR-MIB.txt` from the FocalVector
+checkout into the manager alongside `FOCAL-ROOT-MIB.txt`. Using the existing
+SNMPv3 authPriv profile, walk `.1.3.6.1.4.1.67726.2.1`. It exposes daemon
+uptime and restart epoch, collection statistics, and search backend status.
+The adapter persists collection indexes in `$state/vector-indexes.sqlite3`.
