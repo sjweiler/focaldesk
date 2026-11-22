@@ -1,6 +1,8 @@
 use std::os::fd::OwnedFd;
+use std::sync::OnceLock;
 
 use smithay::utils::{Logical, Rectangle};
+use smithay::wayland::compositor::with_states;
 use smithay::wayland::selection::data_device::{
     clear_data_device_selection, current_data_device_selection_userdata,
     request_data_device_client_selection, set_data_device_selection,
@@ -14,12 +16,24 @@ use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState}
 use smithay::xwayland::xwm::{Reorder, ResizeEdge as X11ResizeEdge, WmWindowProperty, XwmId};
 use smithay::xwayland::{X11Surface, X11Wm, XwmHandler};
 use wayland_server::protocol::wl_surface::WlSurface;
+use wayland_server::Resource;
 
 use crate::core::desktop::DesktopState;
 use crate::core::focus::KeyboardFocusTarget;
 use crate::core::wayland::data_device::ClipboardSelectionOwner;
 use focaldesk_logging::session_id;
 use tracing::{debug, info_span, trace};
+
+pub(crate) struct XwaylandColorTrace {
+    pub(crate) xid: u32,
+}
+
+fn color_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FOCALDESK_XWAYLAND_COLOR_TRACE").as_deref() == Ok("1")
+    })
+}
 
 fn constrained_window_geometry(
     fullscreen: bool,
@@ -42,6 +56,17 @@ impl XWaylandShellHandler for DesktopState {
     }
 
     fn surface_associated(&mut self, _xwm: XwmId, wl_surface: WlSurface, surface: X11Surface) {
+        if color_trace_enabled() {
+            let xid = surface.window_id();
+            with_states(&wl_surface, |states| {
+                states.data_map.insert_if_missing(|| XwaylandColorTrace { xid });
+            });
+            focaldesk_logging::flog(format!(
+                "XWayland color trace association xid={xid:#x} root={:?} title={:?}",
+                wl_surface.id(),
+                surface.title()
+            ));
+        }
         let known_window = self.window_id_for_x11_surface(&surface);
         if let Some(window_id) = known_window {
             self.remember_xwayland_surface_association(&wl_surface, window_id);

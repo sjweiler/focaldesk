@@ -5,6 +5,8 @@ use std::fs::OpenOptions;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
+#[cfg(feature = "xwayland")]
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::core::fonts::{FontId, TextStyle};
@@ -34,6 +36,8 @@ use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{DeviceFd, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
+#[cfg(feature = "xwayland")]
+use smithay::wayland::compositor::with_states;
 use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
 use smithay::wayland::dmabuf::{get_dmabuf, DmabufFeedbackBuilder};
 use smithay::wayland::drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjState};
@@ -55,7 +59,11 @@ use super::common::{
     BootstrapOutput, NestedDesktop,
 };
 use super::vui_shell::{QuickSettingsState, VuiShell};
+#[cfg(feature = "xwayland")]
+use crate::core::color::{ColorDescription, SurfaceColorState};
 use crate::core::color::{SurfaceColorRenderState, TransferFunction};
+#[cfg(feature = "xwayland")]
+use crate::core::wayland::xwayland::XwaylandColorTrace;
 use crate::core::BackendEvent;
 use focaldesk_input::{InputEvent, KeyState, Modifiers, MouseButton, ScrollDelta};
 
@@ -2594,6 +2602,17 @@ fn collect_shm_layers(
     }
 }
 
+#[cfg(feature = "xwayland")]
+#[derive(Debug, PartialEq)]
+struct XwaylandColorSample {
+    dmabuf_format: Option<Format>,
+    committed: Option<ColorDescription>,
+    pending: Option<ColorDescription>,
+    effective: ColorDescription,
+    vulkan_transfer: FrameTransferFunction,
+    in_scene: bool,
+}
+
 fn collect_shm_surface_tree(
     root: &WlSurface,
     origin: Point<i32, Logical>,
@@ -2604,6 +2623,13 @@ fn collect_shm_surface_tree(
     surface_colors: &HashMap<RenderElementId, SurfaceColorRenderState>,
     output: &mut Vec<TextureQuad>,
 ) {
+    #[cfg(feature = "xwayland")]
+    let trace_xid = with_states(root, |states| {
+        states
+            .data_map
+            .get::<XwaylandColorTrace>()
+            .map(|trace| trace.xid)
+    });
     with_surface_tree_downward(
         root,
         origin,
@@ -2646,9 +2672,10 @@ fn collect_shm_surface_tree(
                 .map(|rect| [rect.loc.x, rect.loc.y, rect.size.w, rect.size.h])
                 .collect::<Vec<_>>();
             let surface_location = *location + view.offset;
-            let color_transform = surface_colors
+            let surface_color = surface_colors
                 .get(&RenderElementId::from_wayland_resource(surface))
-                .copied()
+                .copied();
+            let color_transform = surface_color
                 .map(texture_color_transform)
                 .unwrap_or_default();
             drop(renderer_state);
@@ -2684,6 +2711,35 @@ fn collect_shm_surface_tree(
                     cpu_dmabuf_fallback,
                 )
             });
+            #[cfg(feature = "xwayland")]
+            if let Some(xid) = trace_xid {
+                let (committed, pending) = {
+                    let mut color = states.cached_state.get::<SurfaceColorState>();
+                    (color.current().description, color.pending().description)
+                };
+                let sample = XwaylandColorSample {
+                    dmabuf_format: get_dmabuf(&buffer).ok().map(|dmabuf| dmabuf.format()),
+                    committed,
+                    pending,
+                    effective: surface_color
+                        .map_or(ColorDescription::SRGB, |color| color.description),
+                    vulkan_transfer: color_transform.transfer,
+                    in_scene: frame.is_some(),
+                };
+                let previous = states
+                    .data_map
+                    .get_or_insert(Mutex::<Option<XwaylandColorSample>>::default);
+                if let Ok(mut previous) = previous.lock() {
+                    if previous.as_ref() != Some(&sample) {
+                        focaldesk_logging::flog(format!(
+                            "XWayland color trace xid={xid:#x} root={:?} surface={:?} {sample:?}",
+                            root.id(),
+                            surface.id()
+                        ));
+                        *previous = Some(sample);
+                    }
+                }
+            }
             if let Some(frame) = frame {
                 output.push(frame);
                 surface_commits.insert(buffer_id, current_commit);
