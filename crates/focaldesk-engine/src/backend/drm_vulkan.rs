@@ -2848,7 +2848,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         crate::core::portal::remove_dead_portal_sessions(&mut data.desktop.state);
         data.desktop.display.flush_clients()?;
         data.desktop.state.materialize_full_redraw_damage();
-        data.scene_builder.poll_wallpaper_hdr(&mut data.desktop.state);
+        data.scene_builder
+            .poll_wallpaper_hdr(&mut data.desktop.state);
         gpu::render_secondary_desktops(&mut data, gpu_ready);
         if !gpu_ready {
             continue;

@@ -116,6 +116,13 @@
               {/each}
             </div>
           </section>
+          <section class="section" aria-labelledby="wallpaper-title">
+            <h2 id="wallpaper-title">Wallpaper</h2>
+            <div class="settings-card"><div class="setting-row">
+              <div><label for="wallpaper-ai-hdr">AI HDR enhancement</label><p>Use a local Ollama vision model to enhance highlights in SDR wallpapers on HDR displays.</p></div>
+              <input id="wallpaper-ai-hdr" class="switch" type="checkbox" role="switch" disabled={busy} bind:checked={draft.wallpaper_ai_hdr} />
+            </div></div>
+          </section>
           <section class="section" aria-labelledby="chrome-title"><h2 id="chrome-title">Desktop surfaces</h2><div class="settings-card">
             <div class="setting-row"><div><label for="shader-chrome">Use shader chrome</label><p>Enable the desktop’s beveled and glass styling.</p></div><input id="shader-chrome" class="switch" type="checkbox" role="switch" disabled={busy} bind:checked={draft.shader_chrome} /></div>
             <div class="setting-row"><div><label for="work-area-glass">Work-area glass</label><p>Add a subtle tint and edge highlight behind windows.</p></div><input id="work-area-glass" class="switch" type="checkbox" role="switch" disabled={busy} bind:checked={draft.work_area_glass} /></div>

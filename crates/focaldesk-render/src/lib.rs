@@ -87,6 +87,14 @@ pub struct AutoHdrParams {
     pub gamut_wideness: f32,
 }
 
+/// Coarse wallpaper treatment and the output-specific exposure limits in stops.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WallpaperHdrParams {
+    pub scores: [u8; 16],
+    pub peak_stops: f32,
+    pub diffuse_stops: f32,
+}
+
 /// Per-texture transform from decoded client RGB into the linear scene gamut.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TextureColorTransform {
@@ -98,6 +106,7 @@ pub struct TextureColorTransform {
     pub source_bits: f32,
     /// Opt-in SDR inverse tone mapping. Native HDR transfer functions ignore it.
     pub auto_hdr: Option<AutoHdrParams>,
+    pub wallpaper_hdr: Option<WallpaperHdrParams>,
 }
 
 impl Default for TextureColorTransform {
@@ -110,6 +119,7 @@ impl Default for TextureColorTransform {
             linear_to_scene_scale: 1.0,
             source_bits: 0.0,
             auto_hdr: None,
+            wallpaper_hdr: None,
         }
     }
 }

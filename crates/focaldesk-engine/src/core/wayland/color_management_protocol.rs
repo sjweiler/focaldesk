@@ -110,7 +110,7 @@ fn client_is_cursor(client: &Client) -> bool {
     is_cursor_executable_name(exe_name.as_ref())
 }
 
-fn client_is_chromium(client: &Client) -> bool {
+pub(crate) fn client_is_chromium(client: &Client) -> bool {
     let Some(client_state) = client.get_data::<ClientState>() else {
         return false;
     };
@@ -775,7 +775,7 @@ fn sanitize_client_color_description(
 ) -> ColorDescription {
     if description.transfer == CoreTransferFunction::St2084Pq {
         flog_warn!(
-            "wp color: surface={:?} tagged PQ; Display-P3 AB24 is normalized to its sRGB raster, 10-bit keeps PQ, FP16 decodes as Rec.709 linear HDR",
+            "wp color: surface={:?} tagged PQ",
             surface.id()
         );
     }

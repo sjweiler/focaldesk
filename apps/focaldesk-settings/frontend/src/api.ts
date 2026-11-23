@@ -7,6 +7,7 @@ export interface Appearance {
   output_focus_glow: boolean;
   shader_chrome: boolean;
   work_area_glass: boolean;
+  wallpaper_ai_hdr: boolean;
   rail_backdrop: 'solid' | 'smoked-glass';
   panel_darkness: number | null;
   task_shelf_visibility: 'always-visible' | 'intelligent-dodge' | 'autohide';
@@ -23,6 +24,7 @@ export function sameAppearance(a: Appearance, b: Appearance): boolean {
   return a.theme === b.theme && a.font_scale === b.font_scale
     && a.glow_strength === b.glow_strength && a.output_focus_glow === b.output_focus_glow
     && a.shader_chrome === b.shader_chrome && a.work_area_glass === b.work_area_glass
+    && a.wallpaper_ai_hdr === b.wallpaper_ai_hdr
     && a.rail_backdrop === b.rail_backdrop && a.panel_darkness === b.panel_darkness
     && a.task_shelf_visibility === b.task_shelf_visibility;
 }

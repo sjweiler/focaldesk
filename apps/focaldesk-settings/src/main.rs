@@ -6880,6 +6880,35 @@ fn appearance_page(
 
     page.add(&tuning_group);
 
+    let wallpaper_group = adw::PreferencesGroup::new();
+    wallpaper_group.set_title("Wallpaper");
+    let wallpaper_ai_hdr_row = adw::ActionRow::new();
+    wallpaper_ai_hdr_row.set_title("AI HDR enhancement");
+    wallpaper_ai_hdr_row.set_subtitle(
+        "Use a local Ollama vision model to enhance highlights in SDR wallpapers on HDR displays",
+    );
+    let wallpaper_ai_hdr_switch = gtk::Switch::new();
+    wallpaper_ai_hdr_switch.set_active(config.borrow().appearance.wallpaper_ai_hdr);
+    wallpaper_ai_hdr_row.add_suffix(&wallpaper_ai_hdr_switch);
+    wallpaper_ai_hdr_row.set_activatable_widget(Some(&wallpaper_ai_hdr_switch));
+    wallpaper_group.add(&wallpaper_ai_hdr_row);
+    page.add(&wallpaper_group);
+    {
+        let config = config.clone();
+        wallpaper_ai_hdr_switch.connect_active_notify(move |toggle| {
+            let active = toggle.is_active();
+            if config.borrow().appearance.wallpaper_ai_hdr == active {
+                return;
+            }
+            config.borrow_mut().appearance.wallpaper_ai_hdr = active;
+            persist_config_key(
+                &config.borrow(),
+                "appearance.wallpaper_ai_hdr",
+                json!(active),
+            );
+        });
+    }
+
     let reset_button = gtk::Button::with_label("Reset to Defaults");
     reset_button.add_css_class("destructive-action");
     reset_button.set_halign(gtk::Align::Start);
@@ -6889,6 +6918,7 @@ fn appearance_page(
         let settings = settings.clone();
         let shader_switch = shader_switch.clone();
         let glass_switch = glass_switch.clone();
+        let wallpaper_ai_hdr_switch = wallpaper_ai_hdr_switch.clone();
         let rail_backdrop_row = rail_backdrop_row.clone();
         let panel_darkness = panel_darkness.clone();
         let panel_darkness_syncing = panel_darkness_syncing.clone();
@@ -6925,6 +6955,8 @@ fn appearance_page(
             };
             set_switch_if_changed(&shader_switch, shader);
             set_switch_if_changed(&glass_switch, glass);
+            let wallpaper_ai_hdr = config.borrow().appearance.wallpaper_ai_hdr;
+            set_switch_if_changed(&wallpaper_ai_hdr_switch, wallpaper_ai_hdr);
             rail_backdrop_row.set_selected(match rail_backdrop {
                 RailBackdrop::Solid => 0,
                 RailBackdrop::SmokedGlass => 1,
@@ -6966,6 +6998,7 @@ fn appearance_page(
         let rx = start_config_watch(&[
             "appearance.shader_chrome",
             "appearance.work_area_glass",
+            "appearance.wallpaper_ai_hdr",
             "appearance.rail_backdrop",
             "appearance.panel_darkness",
             "appearance.output_focus_glow",
@@ -6977,6 +7010,7 @@ fn appearance_page(
         let config = config.clone();
         let shader_switch = shader_switch.clone();
         let glass_switch = glass_switch.clone();
+        let wallpaper_ai_hdr_switch = wallpaper_ai_hdr_switch.clone();
         let rail_backdrop_row = rail_backdrop_row.clone();
         let panel_darkness = panel_darkness.clone();
         let panel_darkness_syncing = panel_darkness_syncing.clone();
@@ -7000,6 +7034,12 @@ fn appearance_page(
                         if let Some(active) = event.value.as_bool() {
                             config.borrow_mut().appearance.work_area_glass = active;
                             set_switch_if_changed(&glass_switch, active);
+                        }
+                    }
+                    "appearance.wallpaper_ai_hdr" => {
+                        if let Some(active) = event.value.as_bool() {
+                            config.borrow_mut().appearance.wallpaper_ai_hdr = active;
+                            set_switch_if_changed(&wallpaper_ai_hdr_switch, active);
                         }
                     }
                     "appearance.rail_backdrop" => {

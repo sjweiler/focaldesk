@@ -451,8 +451,8 @@ pub enum ClientBufferEncoding {
     Float16,
 }
 
-/// Normalize client descriptions only when the buffer representation is known
-/// to contradict the tag.
+/// Normalize Chromium's known mismatches between its tags and buffer encoding.
+/// Other clients' explicit color descriptions remain authoritative.
 ///
 /// Chromium currently retags its Display-P3 window as PQ or extended sRGB when
 /// it enters an HDR output while continuing to submit the same 8-bit AB24
@@ -466,7 +466,11 @@ pub enum ClientBufferEncoding {
 pub fn sanitize_tagged_client_description(
     description: ColorDescription,
     buffer: ClientBufferEncoding,
+    is_chromium: bool,
 ) -> ColorDescription {
+    if !is_chromium {
+        return description;
+    }
     match buffer {
         ClientBufferEncoding::Unorm8
             if matches!(
@@ -1167,39 +1171,48 @@ mod tests {
     #[test]
     fn pq_tagged_chrome_buffers_match_their_actual_encoding() {
         let claimed = ColorDescription::bt2020_pq_hdr(409.0, 400.0);
-        let fp16 = sanitize_tagged_client_description(claimed, ClientBufferEncoding::Float16);
+        let fp16 = sanitize_tagged_client_description(claimed, ClientBufferEncoding::Float16, true);
         assert!(!fp16.is_windows_scrgb());
         assert_eq!(fp16, ColorDescription::SCRGB_LINEAR_HDR);
         assert_eq!(fp16.primaries, ColorPrimaries::Srgb);
         assert_eq!(fp16.transfer, TransferFunction::Linear);
         close(fp16.linear_to_scene_scale(), 1.0, 0.0);
 
-        let pq10 = sanitize_tagged_client_description(claimed, ClientBufferEncoding::Unorm10);
+        let pq10 = sanitize_tagged_client_description(claimed, ClientBufferEncoding::Unorm10, true);
         assert_eq!(pq10.transfer, TransferFunction::St2084Pq);
         assert_eq!(pq10.primaries, ColorPrimaries::Bt2020);
 
-        let unorm8 = sanitize_tagged_client_description(claimed, ClientBufferEncoding::Unorm8);
+        let unorm8 = sanitize_tagged_client_description(claimed, ClientBufferEncoding::Unorm8, true);
         assert_eq!(unorm8.transfer, TransferFunction::St2084Pq);
         assert_eq!(unorm8.primaries, ColorPrimaries::Bt2020);
         assert!(!unorm8.is_windows_scrgb());
 
         let p3_pq = ColorDescription::display_p3_pq_hdr(450.0, 203.0);
-        let chrome = sanitize_tagged_client_description(p3_pq, ClientBufferEncoding::Unorm8);
+        let chrome = sanitize_tagged_client_description(p3_pq, ClientBufferEncoding::Unorm8, true);
         assert_eq!(chrome, ColorDescription::DISPLAY_P3_SRGB);
 
-        let p3_pq10 = sanitize_tagged_client_description(p3_pq, ClientBufferEncoding::Unorm10);
+        let p3_pq10 = sanitize_tagged_client_description(p3_pq, ClientBufferEncoding::Unorm10, true);
         assert_eq!(p3_pq10, p3_pq);
 
         let p3_extended = ColorDescription::DISPLAY_P3_SRGB_HDR;
         let chrome_extended =
-            sanitize_tagged_client_description(p3_extended, ClientBufferEncoding::Unorm8);
+            sanitize_tagged_client_description(p3_extended, ClientBufferEncoding::Unorm8, true);
         assert_eq!(chrome_extended, ColorDescription::DISPLAY_P3_SRGB);
         let p3_extended_fp16 =
-            sanitize_tagged_client_description(p3_extended, ClientBufferEncoding::Float16);
+            sanitize_tagged_client_description(p3_extended, ClientBufferEncoding::Float16, true);
         assert_eq!(p3_extended_fp16, p3_extended);
 
-        let unknown = sanitize_tagged_client_description(claimed, ClientBufferEncoding::Unknown);
+        let unknown = sanitize_tagged_client_description(claimed, ClientBufferEncoding::Unknown, true);
         assert_eq!(unknown, claimed);
+
+        assert_eq!(
+            sanitize_tagged_client_description(claimed, ClientBufferEncoding::Float16, false),
+            claimed
+        );
+        assert_eq!(
+            sanitize_tagged_client_description(p3_pq, ClientBufferEncoding::Unorm8, false),
+            p3_pq
+        );
     }
 
     #[test]
@@ -1219,7 +1232,7 @@ mod tests {
         .with_buffer_encoding(ClientBufferEncoding::Unorm8);
         assert_eq!(gtk.src_bits, 8.0);
 
-        let chrome = sanitize_tagged_client_description(pq, ClientBufferEncoding::Unorm8);
+        let chrome = sanitize_tagged_client_description(pq, ClientBufferEncoding::Unorm8, true);
         let chrome_eight =
             SurfaceColorRenderState::for_description(chrome, RenderingIntent::Relative)
                 .with_buffer_encoding(ClientBufferEncoding::Unorm8);

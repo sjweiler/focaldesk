@@ -19,21 +19,36 @@ presentation.
 ## Wallpaper HDR
 
 On the raw Vulkan DRM backend, activating HDR on an output automatically
-enhances SDR wallpapers on that output. A background job sends a reduced
+enhances SDR wallpapers on that output with a shader. Enable **AI HDR enhancement**
+under **Appearance → Wallpaper** in FocalDesk Settings to use a local vision
+model. The toggle defaults to off. A background job sends a reduced
 wallpaper preview to local Ollama at `127.0.0.1:11434`. The vision model scores
-regions for highlight enhancement, and FocalDesk caches the resulting FP16
-wallpaper in memory. SDR outputs use their SDR wallpaper, and native HDR
+a 4×4 grid for highlight enhancement from a preview up to 768 pixels on its
+longest side. Outputs share successful scores across sessions through the cache
+in `$XDG_CACHE_HOME/focaldesk/wallpaper-hdr` (defaulting to
+`~/.cache/focaldesk/wallpaper-hdr`). Cache keys include the image content,
+model identifier, prompt, and preview preprocessing version. The Vulkan shader
+uses the grid and local image contrast to apply exposure in stops to the
+existing wallpaper texture. Each display supplies its own peak and sustained
+luminance limits. SDR outputs use their SDR wallpaper, and native HDR
 wallpapers bypass this analysis.
 
 The default model is `gemma4:12b`. Set `FOCALDESK_WALLPAPER_HDR_MODEL` in the
 session environment to use a different installed Ollama vision model.
-FocalDesk uses conservative Vulkan Auto HDR while analysis is pending or when
-Ollama cannot supply a usable treatment grid.
+Requests time out after 45 seconds by default. Set
+`FOCALDESK_WALLPAPER_HDR_TIMEOUT_SECS` to a value from 1 to 90 to adjust the
+request budget. FocalDesk cancels the request when all outputs release it and
+asks Ollama to unload the model after inference. Set
+`FOCALDESK_WALLPAPER_HDR_STRENGTH` between `0` and `1` to scale the AI exposure
+in stops. The default is `1`, with up to two stops for isolated highlights
+when the display has enough headroom. A valid all-zero model result or a
+strength of `0` with AI enabled preserves SDR luminance. FocalDesk uses
+conservative Vulkan Auto HDR when the toggle is off, while analysis is
+pending, or when Ollama cannot supply a usable treatment grid.
 
 With info logging enabled, run `journalctl -b -t focaldesk -f | rg --line-buffered 'wallpaper HDR:'`
-and select an SDR wallpaper on an HDR output. The `selected AI-enhanced texture`
-message includes the output name. The `using shader fallback` message includes
-the reason Ollama analysis could not be used.
+and select an SDR wallpaper on an HDR output with AI HDR enhancement enabled.
+The `using shader fallback` message includes the reason analysis failed.
 
 ## Game Auto HDR
 
@@ -42,27 +57,14 @@ game windows. It runs after the client transfer function is decoded and before
 the client gamut is transformed into the FP16 scene. Native PQ, HLG, scRGB, and
 extended-sRGB surfaces always bypass inverse tone mapping.
 
-Auto HDR is disabled unless a window matches `FOCALDESK_AUTO_HDR_APPS`. Entries
-are comma or semicolon separated and match an executable name, Wayland app-id,
-or X11 `WM_CLASS` case-insensitively. For Wine games, list both the launched
-executable and its observed `WM_CLASS` when those names differ. A diagnostic
-`*` entry enables every eligible client window but is not recommended for a
-normal session. For example:
+In **Displays → Auto HDR**, enter one exact XWayland window title per line and
+select **Apply Auto HDR list**. For WoW, enter `World of Warcraft`. The list
+starts empty, is saved in per-user settings, and applies to open windows without
+restarting the session. Clear the list and apply it to remove those opt-ins.
 
-```toml
-[session_environment]
-FOCALDESK_AUTO_HDR_APPS = "game.exe,steam_app_123456"
-FOCALDESK_AUTO_HDR_SDR_NITS = "100"
-FOCALDESK_AUTO_HDR_TARGET_NITS = "600"
-FOCALDESK_AUTO_HDR_GAMUT_WIDENESS = "0.05"
-```
-
-The launch service supplies `DXVK_HDR=1` and `ENABLE_HDR_WSI=1` to matching
-applications. If a game then submits a native HDR surface, its declared transfer
-function wins and Auto HDR stays off. If it continues to submit ordinary SDR,
-the compositor raises highlights toward the target. The target is always capped
-to the active output's configured peak, and the feature activates only after
-KMS HDR has been verified on that output.
+Auto HDR activates only after KMS HDR has been verified on the output and caps
+the target at that output's configured peak. Existing environment-based opt-ins
+remain supported for compatibility.
 
 ## Known working configuration
 

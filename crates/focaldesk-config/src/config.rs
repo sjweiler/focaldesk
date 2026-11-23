@@ -29,6 +29,7 @@ pub struct AppearanceConfig {
     pub output_focus_glow: bool,
     pub shader_chrome: bool,
     pub work_area_glass: bool,
+    pub wallpaper_ai_hdr: bool,
     pub rail_backdrop: RailBackdrop,
     /// A user-selected opacity for both shell backings. `None` keeps the
     /// active theme's independent rail and dock defaults.
@@ -67,6 +68,7 @@ impl Default for AppearanceConfig {
             output_focus_glow: true,
             shader_chrome: true,
             work_area_glass: true,
+            wallpaper_ai_hdr: false,
             rail_backdrop: RailBackdrop::Solid,
             panel_darkness: None,
         }
@@ -385,6 +387,18 @@ pub struct DisplaysConfig {
     pub topbar_on_all_outputs: bool,
     pub sidebar_on_all_outputs: bool,
     pub remember_focused_output: bool,
+    pub auto_hdr_xwayland_titles: Vec<String>,
+}
+
+impl DisplaysConfig {
+    pub fn auto_hdr_for_xwayland_title(&self, title: &str) -> bool {
+        let title = title.trim();
+        !title.is_empty()
+            && self
+                .auto_hdr_xwayland_titles
+                .iter()
+                .any(|entry| entry.trim().eq_ignore_ascii_case(title))
+    }
 }
 
 impl Default for DisplaysConfig {
@@ -393,6 +407,7 @@ impl Default for DisplaysConfig {
             topbar_on_all_outputs: true,
             sidebar_on_all_outputs: true,
             remember_focused_output: true,
+            auto_hdr_xwayland_titles: Vec::new(),
         }
     }
 }
@@ -400,6 +415,17 @@ impl Default for DisplaysConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_hdr_xwayland_titles_are_opt_in_and_match_exactly() {
+        let mut config: DisplaysConfig = toml::from_str("remember_focused_output = false").unwrap();
+        assert!(!config.auto_hdr_for_xwayland_title("World of Warcraft"));
+        config.auto_hdr_xwayland_titles = vec!["World of Warcraft".into(), "*".into()];
+        let config: DisplaysConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert!(config.auto_hdr_for_xwayland_title("world of warcraft"));
+        assert!(!config.auto_hdr_for_xwayland_title("Battle.net"));
+        assert!(!config.auto_hdr_for_xwayland_title("World of Warcraft Launcher"));
+    }
 
     fn test_dir(name: &str) -> PathBuf {
         let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -450,6 +476,7 @@ mod tests {
 
         assert_eq!(config.shell.style, ShellStyle::Attached);
         assert!(config.appearance.work_area_glass);
+        assert!(!config.appearance.wallpaper_ai_hdr);
         assert_eq!(config.panel.position, PanelPosition::Top);
         assert_eq!(config.panel.clock_format, ClockFormat::TwelveHour);
         assert_eq!(config.dock.position, DockPosition::Left);

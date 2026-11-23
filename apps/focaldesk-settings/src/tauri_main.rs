@@ -156,6 +156,28 @@ async fn set_display_trial_calibration_pattern(
 }
 
 #[tauri::command]
+async fn get_auto_hdr_xwayland_titles() -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let value = focaldesk_ipc::send_desktop_get("displays.auto_hdr_xwayland_titles")?;
+        serde_json::from_value(value).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn set_auto_hdr_xwayland_titles(titles: Vec<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        focaldesk_ipc::send_desktop_set(
+            "displays.auto_hdr_xwayland_titles",
+            serde_json::json!(titles),
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 async fn get_display_layout_preferences(
 ) -> Result<focaldesk_settings::displays::LayoutPreferences, String> {
     tauri::async_runtime::spawn_blocking(focaldesk_settings::displays::layout_preferences)
@@ -919,6 +941,8 @@ fn main() {
             set_display_trial_calibration_pattern,
             get_display_layout_preferences,
             apply_display_layout_preferences,
+            get_auto_hdr_xwayland_titles,
+            set_auto_hdr_xwayland_titles,
             get_chrome,
             apply_chrome,
             get_workspaces,

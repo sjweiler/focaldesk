@@ -20,6 +20,7 @@ pub struct Appearance {
     pub output_focus_glow: bool,
     pub shader_chrome: bool,
     pub work_area_glass: bool,
+    pub wallpaper_ai_hdr: bool,
     pub rail_backdrop: RailBackdrop,
     pub panel_darkness: Option<f64>,
     pub task_shelf_visibility: DockVisibility,
@@ -34,6 +35,7 @@ impl Appearance {
             output_focus_glow: config.appearance.output_focus_glow,
             shader_chrome: config.appearance.shader_chrome,
             work_area_glass: config.appearance.work_area_glass,
+            wallpaper_ai_hdr: config.appearance.wallpaper_ai_hdr,
             rail_backdrop: config.appearance.rail_backdrop,
             panel_darkness: config.appearance.panel_darkness,
             task_shelf_visibility: config.dock.visibility,
@@ -366,6 +368,7 @@ fn merge_appearance(
     latest.appearance.output_focus_glow = requested.output_focus_glow;
     latest.appearance.shader_chrome = requested.shader_chrome;
     latest.appearance.work_area_glass = requested.work_area_glass;
+    latest.appearance.wallpaper_ai_hdr = requested.wallpaper_ai_hdr;
     latest.appearance.rail_backdrop = requested.rail_backdrop;
     latest.appearance.panel_darkness = requested.panel_darkness;
     latest.dock.visibility = requested.task_shelf_visibility;

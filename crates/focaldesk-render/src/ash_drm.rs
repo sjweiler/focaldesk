@@ -121,6 +121,7 @@ fn srgb_decode(value: f32) -> f32 {
 
 fn decode_channel(value: f32) -> f32 {
     var mode = pc.params.x;
+    if mode >= 16.0 { mode -= 16.0; }
     if mode >= 8.0 { mode -= 8.0; }
     if mode < 0.5 { return srgb_decode(value); }
     if mode < 1.5 { return value * pc.params.z; }
@@ -157,11 +158,59 @@ fn dither_code_value(color: vec3<f32>, position: vec2<f32>) -> vec3<f32> {
     return clamp(color + vec3((a - b) * code_step), vec3(0.0), vec3(1.0));
 }
 
-fn decode_modulated_color(sampled: vec4<f32>, tint: vec4<f32>, position: vec2<f32>) -> vec4<f32> {
+fn wallpaper_score(cell: vec2<i32>) -> f32 {
+    let bounded = clamp(cell, vec2<i32>(0), vec2<i32>(3));
+    let index = u32(bounded.y * 4 + bounded.x);
+    let packed = u32(select(pc.matrix0.w, pc.matrix1.w, index >= 8u));
+    return f32((packed >> ((index % 8u) * 3u)) & 7u) / 4.0;
+}
+
+fn highlight_signal(rgb: vec3<f32>) -> f32 {
+    let luminance = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+    let peak = max(rgb.r, max(rgb.g, rgb.b));
+    return mix(luminance, peak, 0.55);
+}
+
+fn surrounding_highlight(uv: vec2<f32>) -> f32 {
+    let sample = textureSampleLevel(image, image_sampler, uv, 0.0);
+    let rgb = clamp(sample.rgb / max(sample.a, 0.0001), vec3(0.0), vec3(1.0));
+    return highlight_signal(vec3(srgb_decode(rgb.r), srgb_decode(rgb.g), srgb_decode(rgb.b)));
+}
+
+fn wallpaper_gain(rgb: vec3<f32>, uv: vec2<f32>) -> f32 {
+    let grid = uv * 4.0 - 0.5;
+    let cell = vec2<i32>(floor(grid));
+    let weight = fract(grid);
+    let top = mix(wallpaper_score(cell), wallpaper_score(cell + vec2<i32>(1, 0)), weight.x);
+    let bottom = mix(wallpaper_score(cell + vec2<i32>(0, 1)), wallpaper_score(cell + vec2<i32>(1, 1)), weight.x);
+    let intent = mix(top, bottom, weight.y);
+    let signal = highlight_signal(rgb);
+    if intent <= 0.0 || signal <= 0.25 { return 1.0; }
+
+    let size = vec2<f32>(textureDimensions(image));
+    let offset = max(1.0, min(size.x, size.y) * 0.003) / size;
+    let x = vec2(offset.x, 0.0);
+    let y = vec2(0.0, offset.y);
+    let horizontal = max(surrounding_highlight(uv + x), surrounding_highlight(uv - x));
+    let vertical = max(surrounding_highlight(uv + y), surrounding_highlight(uv - y));
+    // Require darker neighbors on both sides of at least one axis so a
+    // one-sided edge on a broad bright surface does not get peak exposure.
+    let surround = min(horizontal, vertical);
+    let local = smoothstep(0.06, 0.32, signal - surround);
+    let highlight = smoothstep(0.25, 0.85, signal);
+    // Use local contrast for the extra peak headroom. Broad bright regions
+    // are limited by the sustained output profile.
+    let stops = mix(min(pc.matrix2.w, pc.params.z), pc.params.z, local);
+    return exp2(intent * highlight * stops);
+}
+
+fn decode_modulated_color(sampled: vec4<f32>, tint: vec4<f32>, position: vec2<f32>, uv: vec2<f32>) -> vec4<f32> {
     let alpha = sampled.a * tint.a;
     if alpha <= 0.0 { return vec4(0.0); }
     var sampled_straight = sampled.rgb / sampled.a;
     var mode = pc.params.x;
+    let wallpaper_hdr = mode >= 16.0;
+    if wallpaper_hdr { mode -= 16.0; }
     let auto_hdr = mode >= 8.0;
     if auto_hdr { mode -= 8.0; }
     let extended = (mode >= 0.5 && mode < 1.5) || (mode >= 3.5 && mode < 4.5);
@@ -176,6 +225,9 @@ fn decode_modulated_color(sampled: vec4<f32>, tint: vec4<f32>, position: vec2<f3
         let widened = vec3(luminance) + (linear - vec3(luminance)) * (1.0 + pc.params.w);
         let boost = 1.0 + (pc.params.z - 1.0) * pow(clamp(luminance, 0.0, 1.0), 2.0);
         linear = max(widened, vec3(0.0)) * boost * pc.params.y;
+    }
+    if wallpaper_hdr {
+        linear *= wallpaper_gain(sampled_linear, uv);
     }
     let mapped = vec3(dot(pc.matrix0.xyz, linear), dot(pc.matrix1.xyz, linear), dot(pc.matrix2.xyz, linear));
     return vec4(mapped * alpha, alpha);
@@ -197,7 +249,7 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>,
 }
 
 @fragment fn fs_main(in: Out) -> @location(0) vec4<f32> {
-    return decode_modulated_color(textureSample(image, image_sampler, in.uv), in.tint, in.position.xy);
+    return decode_modulated_color(textureSample(image, image_sampler, in.uv), in.tint, in.position.xy, in.uv);
 }
 "#;
 
@@ -2858,7 +2910,27 @@ impl AshDrmRenderer {
         push[12..16].copy_from_slice(&surface.tint);
         let matrix = multiply_3x3(output_matrix, surface.color_transform.client_to_scene);
         write_push_matrix(&mut push[16..28], matrix);
-        let params = texture_color_params(surface.color_transform);
+        let mut params = texture_color_params(surface.color_transform);
+        if let Some(hdr) = surface
+            .color_transform
+            .wallpaper_hdr
+            .filter(|_| surface.color_transform.transfer == crate::FrameTransferFunction::Srgb)
+        {
+            // Eight three-bit scores fit exactly in each float lane. Use the
+            // matrix padding to stay within Vulkan's 128-byte push constant minimum.
+            let packed = |scores: &[u8]| {
+                scores
+                    .iter()
+                    .enumerate()
+                    .fold(0u32, |bits, (index, &score)| {
+                        bits | (u32::from(score.min(4)) << (3 * index))
+                    }) as f32
+            };
+            push[19] = packed(&hdr.scores[..8]);
+            push[23] = packed(&hdr.scores[8..]);
+            push[27] = hdr.diffuse_stops;
+            params = [16.0, 0.0, hdr.peak_stops, 0.0];
+        }
         push[28..].copy_from_slice(&params);
         unsafe {
             self.device.cmd_bind_pipeline(

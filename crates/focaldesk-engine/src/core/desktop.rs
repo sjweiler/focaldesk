@@ -25,9 +25,10 @@ use smithay::wayland::shm::ShmState;
 use crate::core::color::{
     force_linear_surfaces, primaries_wider_than, sanitize_tagged_client_description,
     ClientBufferEncoding, ColorDescription, RenderingIntent, SurfaceColorRenderState,
-    SurfaceColorState,
+    SurfaceColorState, TransferFunction,
 };
 use crate::core::output_store::OutputStore;
+use crate::core::wayland::color_management_protocol::client_is_chromium;
 use crate::core::window_store::WindowStore;
 use crate::core::workspace_store::WorkspaceStore;
 use focaldesk_settings_core::OutputRole;
@@ -2180,19 +2181,19 @@ pub struct ClockPulseFrame {
 fn client_buffer_encoding(
     states: &smithay::wayland::compositor::SurfaceData,
 ) -> ClientBufferEncoding {
-    use smithay::wayland::compositor::{BufferAssignment, SurfaceAttributes};
+    use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
 
-    let mut attrs = states.cached_state.get::<SurfaceAttributes>();
-    if let Some(BufferAssignment::NewBuffer(buffer)) = attrs.pending().buffer.as_ref() {
-        return encoding_from_assigned_buffer(buffer);
-    }
-    if let Some(BufferAssignment::NewBuffer(buffer)) = attrs.current().buffer.as_ref() {
-        return encoding_from_assigned_buffer(buffer);
-    }
-    ClientBufferEncoding::Unknown
+    // Smithay consumes the wl_surface buffer assignment before handle_commit runs.
+    let buffer = states
+        .data_map
+        .get::<RendererSurfaceStateUserData>()
+        .and_then(|renderer| renderer.lock().ok()?.buffer().cloned());
+    buffer
+        .as_deref()
+        .map_or(ClientBufferEncoding::Unknown, encoding_from_client_buffer)
 }
 
-fn encoding_from_assigned_buffer(
+fn encoding_from_client_buffer(
     buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
 ) -> ClientBufferEncoding {
     use smithay::backend::allocator::Buffer as SmithayBuffer;
@@ -2212,13 +2213,12 @@ fn log_client_buffer_fourcc_once(code: Fourcc, encoding: ClientBufferEncoding) {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
 
-    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    let key = format!("{code:?}:{encoding:?}");
+    static SEEN: OnceLock<Mutex<HashSet<Fourcc>>> = OnceLock::new();
     let mut seen = SEEN
         .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
         .unwrap_or_else(|err| err.into_inner());
-    if seen.insert(key) {
+    if seen.insert(code) {
         focaldesk_logging::flog_warn!(
             "wp color client buffer fourcc={code:?} encoding={encoding:?}"
         );
@@ -5011,8 +5011,20 @@ impl DesktopState {
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
     }
 
+    #[cfg(feature = "drm-vulkan")]
+    pub(crate) fn wallpaper_ai_hdr_enabled(&self) -> bool {
+        self.settings_ipc_config.appearance.wallpaper_ai_hdr
+    }
+
     pub(crate) fn work_area_glass_enabled(&self) -> bool {
         self.settings_ipc_config.appearance.work_area_glass
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub(crate) fn auto_hdr_for_xwayland_title(&self, title: &str) -> bool {
+        self.settings_ipc_config
+            .displays
+            .auto_hdr_for_xwayland_title(title)
     }
 
     pub(crate) fn rail_backdrop(&self) -> focaldesk_config::RailBackdrop {
@@ -12778,6 +12790,8 @@ impl DesktopState {
     }
 
     pub fn refresh_surface_color(&mut self, surface: &WlSurface) {
+        struct ChromiumSurface(bool);
+
         let force_linear = force_linear_surfaces();
         let color = with_states(surface, |states| {
             if force_linear {
@@ -12787,20 +12801,29 @@ impl DesktopState {
                 );
             }
             let encoding = client_buffer_encoding(states);
-            let mut surface_color = states.cached_state.get::<SurfaceColorState>();
-            if let Some(desc) = surface_color.pending().description {
-                let desc = sanitize_tagged_client_description(desc, encoding);
-                SurfaceColorRenderState::for_description(desc, surface_color.pending().intent)
-                    .with_buffer_encoding(encoding)
-            } else {
-                // Do not call `effective_surface_render_state` here: it would re-lock the same
-                // `SurfaceColorState` mutex and deadlock the compositor on the first commit.
-                let current = surface_color.current();
-                let desc =
-                    sanitize_tagged_client_description(current.effective_description(), encoding);
-                SurfaceColorRenderState::for_description(desc, current.intent)
-                    .with_buffer_encoding(encoding)
-            }
+            let (description, intent) = {
+                let mut color = states.cached_state.get::<SurfaceColorState>();
+                let pending = *color.pending();
+                if let Some(description) = pending.description {
+                    (description, pending.intent)
+                } else {
+                    let current = color.current();
+                    (current.effective_description(), current.intent)
+                }
+            };
+            let is_chromium = matches!(
+                description.transfer,
+                TransferFunction::St2084Pq | TransferFunction::SrgbHdr
+            ) && states
+                .data_map
+                .get_or_insert(|| {
+                    ChromiumSurface(surface.client().as_ref().is_some_and(client_is_chromium))
+                })
+                .0;
+            let description =
+                sanitize_tagged_client_description(description, encoding, is_chromium);
+            SurfaceColorRenderState::for_description(description, intent)
+                .with_buffer_encoding(encoding)
         });
         let id = Id::from_wayland_resource(surface);
         self.surface_colors.insert(id, color);

@@ -3,6 +3,7 @@
   import DisplayLayoutPreferences from './DisplayLayoutPreferences.svelte';
   import HdrCalibration from './HdrCalibration.svelte';
   import ExclusiveHdr from './ExclusiveHdr.svelte';
+  import AutoHdrApps from './AutoHdrApps.svelte';
   import {invoke} from '@tauri-apps/api/core';
   import { getDisplays, previewDisplays, confirmDisplays, revertDisplays, openExistingSettings } from './api';
   import type { DisplayConfiguration, OutputConfig, DisplayTransform } from './api';
@@ -172,6 +173,7 @@
   {/if}
 {/if}
 <DisplayLayoutPreferences disabled={!!trial||busy||dirty} />
+<AutoHdrApps disabled={!!trial} />
 <footer class="apply-bar"><div><span class="status-dot" class:unsaved={dirty || !!trial}></span>{trial ? 'Compositor recovery is active' : dirty ? 'You have untested display changes' : 'Your displays are up to date'}</div><div class="apply-actions"><button class="quiet" disabled={!dirty || busy || !!trial} onclick={discard}>Discard</button><button class="primary" disabled={!dirty || busy || loading || !!trial || !!loadError || !valid} onclick={testChanges}>{busy ? 'Working…' : 'Test changes'}</button></div></footer>
 
 <style>
