@@ -2,7 +2,7 @@
 
 FocalDesk is currently a solo-developed alpha project. Contributions, bug
 reports, and design feedback may be welcome, but there is no formal maintainer
-team, release process, or guaranteed review timeline yet.
+team or guaranteed review timeline yet.
 
 Participation in project spaces is subject to the
 [Code of Conduct](CODE_OF_CONDUCT.md).
@@ -14,6 +14,10 @@ breaking changes, incomplete features, and architectural churn.
 
 Before contributing, read the [README](README.md) for the current project shape,
 [building guide](docs/building.md), and [roadmap](ROADMAP.md).
+
+The [project charter](docs/project-management/CHARTER.md) introduces the
+project-management documents. The [release plan](docs/project-management/RELEASE_PLAN.md)
+describes how alpha candidates are checked and published.
 
 ## Issues
 
